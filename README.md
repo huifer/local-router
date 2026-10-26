@@ -153,8 +153,14 @@ local-router claude workbuddy/hy3        # 让 Claude Code 走 WorkBuddy
 - **自动签到**：网关会自己盯签到活动，到点未签就代签（默认开；
   `config.json` 里 `"workbuddy_auto_checkin": false` 关掉）。每日 +100 credits
   就不用手动领了。也可手动：`local-router workbuddy checkin`。
-- **需要先登录**：请先在 WorkBuddy 客户端里登录；没有登录态时
-  `local-router workbuddy status` 会直接告诉你原因。
+- **需要先登录**：登录在 WorkBuddy 客户端里完成（打开 WorkBuddy → 右上角
+  登录 → 浏览器 OAuth 回调）。登录完成后运行检查脚本确认：
+
+  ```sh
+  bash scripts/workbuddy-login-check.sh   # 五步检查：客户端/登录态/服务端/接入/真实推理
+  ```
+
+  没有登录态时 `local-router workbuddy status` 会直接告诉你原因。
 - 容器里看不到宿主机的登录态，除非你把会话文件挂进去
   （`LOCAL_ROUTER_WORKBUDDY_SESSION`）。
 
