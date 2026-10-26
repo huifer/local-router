@@ -68,7 +68,55 @@ fn vendor_router(vendor: Vendor) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(vendor_chat))
         .route("/v1/models", get(vendor_models))
+        .route("/v1/images/generations", post(vendor_image_generation))
+        .route("/v1/images/edits", post(vendor_image_edit))
+        .route("/v1/videos", post(vendor_video_create))
+        .route(
+            "/v1/videos/{id}",
+            get(vendor_video_status).delete(vendor_video_delete),
+        )
+        .route("/v1/videos/{id}/content", get(vendor_video_content))
+        // The same media under a different family, for vendors that keep
+        // their media next to their chat endpoint.
+        .route("/v2/images/generations", post(vendor_image_generation))
+        .route("/v2/images/edits", post(vendor_image_edit))
+        .route("/v2/videos/generations", post(vendor_video_create))
         .with_state(vendor)
+}
+
+async fn vendor_image_generation() -> Json<Value> {
+    Json(json!({
+        "created": 1,
+        "data": [{"url": "https://cdn.example/image.png", "revised_prompt": "a test image"}]
+    }))
+}
+
+async fn vendor_image_edit() -> Json<Value> {
+    Json(json!({"created": 1, "data": [{"b64_json": "aGVsbG8="}]}))
+}
+
+async fn vendor_video_create() -> Json<Value> {
+    Json(json!({"id": "video-1", "object": "video", "status": "queued", "model": "video-model"}))
+}
+
+async fn vendor_video_status(axum::extract::Path(id): axum::extract::Path<String>) -> Json<Value> {
+    Json(json!({"id": id, "object": "video", "status": "completed", "progress": 100}))
+}
+
+async fn vendor_video_delete() -> StatusCode {
+    StatusCode::NO_CONTENT
+}
+
+async fn vendor_video_content() -> (
+    StatusCode,
+    [(axum::http::HeaderName, &'static str); 1],
+    &'static str,
+) {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "video/mp4")],
+        "video-bytes",
+    )
 }
 
 /// A second vendor that only speaks Anthropic.
@@ -109,6 +157,12 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         user_agent: None,
         proxy: None,
         group_only: false,
+        auth: None,
+        chat_path: None,
+        stream_only: false,
+        hold_when_exhausted: false,
+        media_models: Vec::new(),
+        media_paths: None,
     }
 }
 
@@ -537,4 +591,273 @@ async fn the_health_endpoint_tells_the_version() {
         .unwrap();
     assert_eq!(body["status"], "ok");
     assert!(body["version"].as_str().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_browser_origin_is_only_allowed_when_the_user_says_so() {
+    // Without the setting, no browser on another site may use the gateway.
+    let mut config = base_config();
+    config.settings.cors_origins = Vec::new();
+    let first = world(config).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/models", first.gateway_addr))
+        .header("origin", "http://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .is_none(),
+        "an origin was allowed without being asked for"
+    );
+
+    // With the setting, the listed origin is allowed.
+    let mut config = base_config();
+    config.settings.cors_origins = vec!["http://example.com".to_string()];
+    let second = world(config).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/models", second.gateway_addr))
+        .header("origin", "http://example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("http://example.com")
+    );
+
+    // An origin that was not listed still is not.
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/models", second.gateway_addr))
+        .header("origin", "http://evil.example")
+        .send()
+        .await
+        .unwrap();
+    assert!(response
+        .headers()
+        .get("access-control-allow-origin")
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_is_generated_through_the_provider() {
+    let world = world(base_config()).await;
+    let client = reqwest::Client::new();
+
+    // The caller needs a key.
+    let response = client
+        .post(format!("{}/v1/images/generations", world.gateway_addr))
+        .json(&json!({"model": "mock/mock-small", "prompt": "a cat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401);
+
+    let response = client
+        .post(format!("{}/v1/images/generations", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .json(&json!({"model": "mock/mock-small", "prompt": "a cat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "the gateway refused: {:?}",
+        response.text().await
+    );
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"][0]["url"], "https://cdn.example/image.png");
+    // The provider's own model id is what goes upstream, not the caller name.
+    assert_eq!(body["data"][0]["revised_prompt"], "a test image");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_is_edited_through_the_provider() {
+    let world = world(base_config()).await;
+    let client = reqwest::Client::new();
+
+    let form = reqwest::multipart::Form::new()
+        .text("model", "mock/mock-small")
+        .text("prompt", "make it blue")
+        .part(
+            "image",
+            reqwest::multipart::Part::bytes(b"fake-png".to_vec())
+                .file_name("cat.png")
+                .mime_str("image/png")
+                .unwrap(),
+        );
+
+    let response = client
+        .post(format!("{}/v1/images/edits", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .multipart(form)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["data"][0]["b64_json"], "aGVsbG8=");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_video_task_lives_until_it_is_deleted() {
+    let world = world(base_config()).await;
+    let client = reqwest::Client::new();
+
+    // Create.
+    let response = client
+        .post(format!("{}/v1/videos", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .json(&json!({"model": "mock/mock-small", "prompt": "a bird"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    let id = body["id"].as_str().unwrap().to_string();
+    assert_eq!(id, "video-1");
+
+    // Status.
+    let response = client
+        .get(format!("{}/v1/videos/{id}", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "completed");
+
+    // Content.
+    let response = client
+        .get(format!("{}/v1/videos/{id}/content", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    assert_eq!(response.text().await.unwrap(), "video-bytes");
+
+    // Delete, then the task is gone.
+    let response = client
+        .delete(format!("{}/v1/videos/{id}", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 204);
+
+    let response = client
+        .get(format!("{}/v1/videos/{id}", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_video_task_is_not_answered() {
+    let world = world(base_config()).await;
+    let response = reqwest::Client::new()
+        .get(format!("{}/v1/videos/nope", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 404);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vendor_outside_the_openai_family_is_asked_where_it_lives() {
+    // A vendor whose media sits under /v2 and which finishes a video
+    // straight away: the gateway must use the vendor's own paths and answer
+    // the status itself.
+    let mut config = base_config();
+    let mock = config.providers.first_mut().unwrap();
+    mock.base_url = Some("http://127.0.0.1:PORT".into());
+    mock.media_models = vec!["mock-image".into()];
+    mock.media_paths = Some(local_router::config::MediaPaths {
+        image_generations: Some("/v2/images/generations".into()),
+        image_edits: Some("/v2/images/edits".into()),
+        video_create: Some("/v2/videos/generations".into()),
+        video_status: None,
+        video_content: None,
+        video_delete: None,
+    });
+
+    let vendor = Vendor::default();
+    let vendor_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let vendor_port = vendor_listener.local_addr().unwrap().port();
+    for provider in &mut config.providers {
+        if let Some(url) = &provider.base_url {
+            provider.base_url = Some(url.replace("PORT", &vendor_port.to_string()));
+        }
+    }
+    let v = vendor.clone();
+    tokio::spawn(async move {
+        axum::serve(vendor_listener, vendor_router(v))
+            .await
+            .unwrap();
+    });
+
+    let dir = std::env::temp_dir().join(format!(
+        "local-router-media-e2e-{}-{}",
+        std::process::id(),
+        unique_n()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Arc::new(Store::at(dir.join(format!("config-{}.json", unique_n()))));
+    store.save(&config).unwrap();
+    let state = AppState::load(store).await.unwrap();
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_port = gateway_listener.local_addr().unwrap().port();
+    let app = gateway::router(gateway::Gateway::new(state));
+    tokio::spawn(async move {
+        axum::serve(gateway_listener, app).await.unwrap();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let client = reqwest::Client::new();
+    let address = format!("http://127.0.0.1:{gateway_port}");
+
+    // The image goes to the vendor's own /v2 path.
+    let response = client
+        .post(format!("{address}/v1/images/generations"))
+        .header("authorization", "Bearer local-router")
+        .json(&json!({"model": "mock/mock-image", "prompt": "a cat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+
+    // The video too.
+    let response = client
+        .post(format!("{address}/v1/videos"))
+        .header("authorization", "Bearer local-router")
+        .json(&json!({"model": "mock/mock-image", "prompt": "a bird"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    let id = body["id"].as_str().unwrap().to_string();
+
+    // The vendor has no task endpoints, so the gateway answers the status
+    // from the answer it already has.
+    let response = client
+        .get(format!("{address}/v1/videos/{id}"))
+        .header("authorization", "Bearer local-router")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 200);
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(body["status"], "queued");
 }

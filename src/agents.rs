@@ -18,6 +18,13 @@ pub struct Gateway {
 
 impl Gateway {
     pub fn new(host: &str, port: u16, key: &str) -> Self {
+        // A gateway bound to every interface is reached on the loopback
+        // address from the machine it runs on.
+        let host = if host == "0.0.0.0" || host == "::" {
+            "127.0.0.1"
+        } else {
+            host
+        };
         Gateway {
             base_url: format!("http://{host}:{port}"),
             key: key.to_string(),
@@ -130,7 +137,14 @@ pub fn set_opencode(gateway: &Gateway, model: Option<&str>) -> anyhow::Result<Pa
             model.unwrap_or("local-router/model"): {"name": model.unwrap_or("local-router/model")}
         },
     });
-    obj.insert("provider".into(), json!({"local-router": provider}));
+    // The other providers stay where they are: only ours is replaced.
+    let mut providers = obj
+        .get("provider")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    providers.insert("local-router".to_string(), provider);
+    obj.insert("provider".to_string(), Value::Object(providers));
     write_json(&path, &root)?;
     Ok(path)
 }

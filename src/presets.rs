@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{new_id, Provider, ProviderKey};
+use crate::config::{AuthKind, Provider, ProviderKey};
 use crate::protocol::ir::Protocol;
 
 const RAW: &str = include_str!("presets.json");
@@ -31,6 +31,23 @@ pub struct Preset {
     pub key_hint: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub docs: Option<String>,
+    /// The provider authenticates with a local app's session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthKind>,
+    /// The path of the chat endpoint, when the vendor does not use the
+    /// protocol's default one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_path: Option<String>,
+    /// The upstream only answers streaming requests.
+    #[serde(default)]
+    pub stream_only: bool,
+    /// The models this vendor offers for image and video work.
+    #[serde(default)]
+    pub media_models: Vec<String>,
+    /// The vendor's native media endpoints, when they are not the OpenAI
+    /// `/v1` family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_paths: Option<crate::config::MediaPaths>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -85,6 +102,12 @@ pub fn to_provider(preset: &Preset, key: Option<&str>) -> Provider {
         user_agent: None,
         proxy: None,
         group_only: false,
+        auth: preset.auth,
+        chat_path: preset.chat_path.clone(),
+        stream_only: preset.stream_only,
+        hold_when_exhausted: false,
+        media_models: preset.media_models.clone(),
+        media_paths: preset.media_paths.clone(),
     }
 }
 
@@ -99,7 +122,7 @@ pub fn custom_provider(
 ) -> Provider {
     let id = slugify(name);
     Provider {
-        id: unique_id(&id),
+        id,
         name: name.to_string(),
         kind: "custom".to_string(),
         enabled: true,
@@ -119,6 +142,12 @@ pub fn custom_provider(
         user_agent: None,
         proxy: None,
         group_only: false,
+        auth: None,
+        chat_path: None,
+        stream_only: false,
+        hold_when_exhausted: false,
+        media_models: Vec::new(),
+        media_paths: None,
     }
 }
 
@@ -137,23 +166,4 @@ fn slugify(name: &str) -> String {
     } else {
         out
     }
-}
-
-fn unique_id(base: &str) -> String {
-    let mut id = base.to_string();
-    let mut n = 2;
-    while std::path::Path::new(&format!(
-        "{}/providers/{}.json",
-        crate::config::config_dir().display(),
-        id
-    ))
-    .exists()
-    {
-        id = format!("{base}-{n}");
-        n += 1;
-    }
-    if id == base {
-        let _ = new_id();
-    }
-    id
 }

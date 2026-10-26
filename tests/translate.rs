@@ -573,3 +573,79 @@ fn url_building_matches_the_protocol() {
         "https://g.co/v1beta/models/m1:generateContent"
     );
 }
+
+#[test]
+fn a_stream_becomes_one_reply_again() {
+    use local_router::protocol::ir::{BlockKind, ChatResponse, StreamEvent};
+
+    // A reply that is only reasoning still carries its thinking.
+    let events = vec![
+        StreamEvent::MessageStart {
+            id: "r-1".into(),
+            model: "m".into(),
+            usage: Default::default(),
+        },
+        StreamEvent::ContentBlockStart {
+            index: 0,
+            kind: BlockKind::Thinking,
+        },
+        StreamEvent::ThinkingDelta {
+            index: 0,
+            text: "thinking".into(),
+        },
+        StreamEvent::ContentBlockStop { index: 0 },
+        StreamEvent::MessageDelta {
+            stop_reason: Some(local_router::protocol::ir::StopReason::MaxTokens),
+            usage: Default::default(),
+        },
+        StreamEvent::MessageStop,
+    ];
+    let reply = ChatResponse::from_events(&events);
+    assert_eq!(reply.content.len(), 1);
+    assert_eq!(reply.text(), "");
+    match &reply.content[0] {
+        local_router::protocol::ir::ContentBlock::Thinking { text, .. } => {
+            assert_eq!(text, "thinking")
+        }
+        other => panic!("expected a thinking block, got {other:?}"),
+    }
+
+    // Text and reasoning in the same reply both survive.
+    let events = vec![
+        StreamEvent::MessageStart {
+            id: "r-2".into(),
+            model: "m".into(),
+            usage: Default::default(),
+        },
+        StreamEvent::ContentBlockStart {
+            index: 0,
+            kind: BlockKind::Thinking,
+        },
+        StreamEvent::ThinkingDelta {
+            index: 0,
+            text: "why ".into(),
+        },
+        StreamEvent::ContentBlockStop { index: 0 },
+        StreamEvent::ContentBlockStart {
+            index: 1,
+            kind: BlockKind::Text,
+        },
+        StreamEvent::TextDelta {
+            index: 1,
+            text: "hello".into(),
+        },
+        StreamEvent::ContentBlockStop { index: 1 },
+        StreamEvent::MessageDelta {
+            stop_reason: Some(local_router::protocol::ir::StopReason::EndTurn),
+            usage: Default::default(),
+        },
+        StreamEvent::MessageStop,
+    ];
+    let reply = ChatResponse::from_events(&events);
+    assert_eq!(reply.text(), "hello");
+    assert_eq!(reply.content.len(), 2);
+    assert_eq!(
+        reply.stop_reason,
+        Some(local_router::protocol::ir::StopReason::EndTurn)
+    );
+}

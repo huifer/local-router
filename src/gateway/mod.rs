@@ -4,13 +4,13 @@ pub mod client;
 pub mod route;
 pub mod usage;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Multipart, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -20,10 +20,21 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
 use crate::config::{AppState, Provider};
+use crate::gateway::usage::UsageRecord;
 use crate::protocol::ir::*;
 use crate::protocol::{anthropic, gemini, openai_chat, openai_responses, sse};
 
 use client::{Target, UpstreamReply};
+
+#[derive(Clone)]
+struct MediaTask {
+    target: Target,
+    provider: Provider,
+    /// The upstream's answer when the task was created. A vendor that
+    /// finishes the video straight away has no task endpoint of its own, so
+    /// the gateway keeps the answer and serves it.
+    body: Value,
+}
 use route::{RoutePlan, Router};
 
 /// Everything a gateway handler needs.
@@ -32,6 +43,9 @@ pub struct Gateway {
     pub state: AppState,
     pub router: Arc<Router>,
     pub clients: Arc<Mutex<HashMap<String, reqwest::Client>>>,
+    /// Video tasks are asynchronous upstream resources. Keep the route to
+    /// the provider long enough for status/content/delete calls.
+    media_tasks: Arc<Mutex<HashMap<String, MediaTask>>>,
 }
 
 impl Gateway {
@@ -40,6 +54,7 @@ impl Gateway {
             state,
             router: Arc::new(Router::new()),
             clients: Arc::new(Mutex::new(HashMap::new())),
+            media_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -60,18 +75,62 @@ impl Gateway {
 
 /// Build the gateway's routes.
 pub fn router(gateway: Gateway) -> axum::Router {
-    axum::Router::new()
+    let router = axum::Router::new()
         .route("/health", get(health))
         .route("/v1/models", get(list_models))
         .route("/v1/models/{provider}/{model}", get(get_model))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/images/generations", post(image_generations))
+        .route("/v1/images/edits", post(image_edits))
+        .route("/v1/videos", post(video_create))
+        .route("/v1/videos/{id}", get(video_status).delete(video_delete))
+        .route("/v1/videos/{id}/content", get(video_content))
         .route("/v1/responses", post(responses))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1beta/models/{*model}", post(gemini_route))
         .route("/v1/local-router/route", get(route_info))
+        .route("/v1/local-router/quotas", get(quotas))
+        .route("/v1/local-router/usage", get(usage_summary))
+        .route("/v1/local-router/usage/requests", get(usage_requests))
         .route("/v1/local-router/status", get(status))
-        .with_state(gateway)
+        .with_state(gateway.clone());
+    // A browser on another site may only talk to the gateway when the
+    // user says so.
+    let origins = match gateway.state.config.try_read() {
+        Ok(config) => config.settings.cors_origins.clone(),
+        Err(_) => {
+            tracing::warn!("the CORS setting could not be read; no origin is allowed");
+            Vec::new()
+        }
+    };
+    if !origins.is_empty() {
+        let allow_any = origins.iter().any(|o| o == "*");
+        let layer = if allow_any {
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(tower_http::cors::Any)
+                .allow_methods(tower_http::cors::AllowMethods::any())
+                .allow_headers(tower_http::cors::Any)
+        } else {
+            let allowed: Vec<axum::http::HeaderValue> = origins
+                .iter()
+                .filter_map(|origin| match origin.parse() {
+                    Ok(value) => Some(value),
+                    Err(_) => {
+                        tracing::warn!("{origin} is not a valid origin; it is not allowed");
+                        None
+                    }
+                })
+                .collect();
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(allowed)
+                .allow_methods(tower_http::cors::AllowMethods::any())
+                .allow_headers(tower_http::cors::Any)
+        };
+        router.layer(layer)
+    } else {
+        router
+    }
 }
 
 async fn health() -> Json<Value> {
@@ -107,6 +166,25 @@ async fn list_models(State(g): State<Gateway>, headers: HeaderMap) -> Response {
                 "created": created,
                 "owned_by": p.id,
                 "display_name": format!("{} · {}", p.name, m),
+                "modalities": {"input": ["text"], "output": ["text"]},
+                "native_endpoints": ["/v1/chat/completions"],
+            }));
+        }
+        // The media models are listed too, so a client can find out which
+        // model draws or films.
+        for m in &p.media_models {
+            data.push(json!({
+                "id": format!("{}/{}", p.id, m),
+                "object": "model",
+                "created": created,
+                "owned_by": p.id,
+                "display_name": format!("{} · {}", p.name, m),
+                "modalities": {"input": ["text"], "output": ["image", "video"]},
+                "native_endpoints": [
+                    "/v1/images/generations",
+                    "/v1/images/edits",
+                    "/v1/videos",
+                ],
             }));
         }
     }
@@ -148,23 +226,161 @@ async fn get_model(
 }
 
 /// What the routing view shows.
-async fn route_info(State(g): State<Gateway>) -> Json<Value> {
+async fn route_info(State(g): State<Gateway>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_auth(&g, &headers) {
+        return error_response(&e);
+    }
     let config = g.state.config.read().await;
-    let groups: Vec<Value> = config
-        .groups
-        .iter()
-        .map(|group| {
-            json!({
-                "id": group.id,
-                "name": group.name,
-                "routing": group.routing.as_str(),
-                "stays": group.stays.as_str(),
-                "members": group.models,
-                "listed": group.listed,
+    // The session a caller named, if it named one.
+    let session = headers
+        .get("x-session-id")
+        .or_else(|| headers.get("x-magpie-session"))
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    drop(config);
+    let trace = match &session {
+        Some(s) => g.router.trace_of(s).await,
+        None => None,
+    };
+    let groups: Vec<Value> = {
+        let config = g.state.config.read().await;
+        config
+            .groups
+            .iter()
+            .map(|group| {
+                json!({
+                    "id": group.id,
+                    "name": group.name,
+                    "routing": group.routing.as_str(),
+                    "stays": group.stays.as_str(),
+                    "members": group.models,
+                    "listed": group.listed,
+                })
             })
+            .collect()
+    };
+    let mut out = json!({"groups": groups});
+    if let Some(trace) = trace {
+        out["session"] = json!(trace);
+    }
+    Json(out).into_response()
+}
+
+/// The quota windows of every provider that reports one.
+async fn quotas(State(g): State<Gateway>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_auth(&g, &headers) {
+        return error_response(&e);
+    }
+    let config = g.state.config.read().await;
+    let session_based = config
+        .providers
+        .iter()
+        .filter(|p| p.enabled && p.uses_session())
+        .map(|p| p.id.clone())
+        .collect::<Vec<_>>();
+    drop(config);
+
+    let mut data = Vec::new();
+    if session_based.iter().any(|id| id == "workbuddy") {
+        match crate::workbuddy::quota().await {
+            Ok(quota) => data.push(serde_json::to_value(quota).unwrap_or(Value::Null)),
+            Err(err) => {
+                return error_response(&ApiError::Upstream(err.to_string()));
+            }
+        }
+    }
+    Json(json!({"data": data})).into_response()
+}
+
+/// The period a usage query covers.
+fn usage_period(query: &HashMap<String, String>) -> (&'static str, i64) {
+    match query.get("period").map(|s| s.as_str()) {
+        Some("today") => ("today", 1),
+        Some("24h") => ("24h", 1),
+        Some("30d") => ("30d", 30),
+        Some("all") => ("all", 36500),
+        _ => ("7d", 7),
+    }
+}
+
+/// The account's usage over a period.
+async fn usage_summary(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = check_auth(&g, &headers) {
+        return error_response(&e);
+    }
+    let (period, days) = usage_period(&query);
+    let records = usage::read_all(&g.state.usage_path());
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+    let recent: Vec<_> = records
+        .into_iter()
+        .filter(|r| {
+            chrono::DateTime::parse_from_rfc3339(&r.time)
+                .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+                .unwrap_or(true)
         })
         .collect();
-    Json(json!({"groups": groups}))
+    let totals = usage::totals(&recent);
+    let by_model = usage::group_by(&recent, |r| r.model.clone());
+    let by_provider = usage::group_by(&recent, |r| r.provider.clone());
+    let by_day = usage::by_day(&recent);
+    Json(json!({
+        "period": period,
+        "since": cutoff.to_rfc3339(),
+        "calls": totals.requests,
+        "errors": totals.failed,
+        "input": totals.input_tokens,
+        "output": totals.output_tokens,
+        "cache_read": totals.cache_read_tokens,
+        "cache_write": totals.cache_write_tokens,
+        "reasoning": totals.reasoning_tokens,
+        "by_model": by_model,
+        "by_provider": by_provider,
+        "by_day": by_day,
+    }))
+    .into_response()
+}
+
+/// The requests behind the summary, newest last.
+async fn usage_requests(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = check_auth(&g, &headers) {
+        return error_response(&e);
+    }
+    let (period, days) = usage_period(&query);
+    let records = usage::read_all(&g.state.usage_path());
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+    let recent: Vec<_> = records
+        .into_iter()
+        .filter(|r| {
+            chrono::DateTime::parse_from_rfc3339(&r.time)
+                .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+                .unwrap_or(true)
+        })
+        .collect();
+    let totals = usage::totals(&recent);
+    let limit = query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .min(1000);
+    let rows: Vec<&UsageRecord> = recent.iter().rev().take(limit).collect();
+    Json(json!({
+        "period": period,
+        "rows": rows,
+        "total": recent.len(),
+        "calls": totals.requests,
+        "errors": totals.failed,
+        "input": totals.input_tokens,
+        "output": totals.output_tokens,
+    }))
+    .into_response()
 }
 
 // ------------------------------------------------------------------ auth --
@@ -248,6 +464,503 @@ async fn messages(
     body: axum::body::Bytes,
 ) -> Response {
     handle(g, Protocol::Anthropic, headers, body).await
+}
+
+/// Image generation uses the provider's native OpenAI-compatible endpoint.
+/// It deliberately bypasses the chat IR: image payloads contain provider
+/// specific fields and should pass through unchanged.
+async fn image_generations(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Response {
+    if let Err(e) = check_auth(&g, &headers) {
+        return error_response(&e);
+    }
+    let requested = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let target = match media_target(&g, requested).await {
+        Ok(target) => target,
+        Err(e) => return error_response(&e),
+    };
+    body["model"] = Value::String(target.model.clone());
+    match send_media_json(&g, &target, &body, MediaKind::ImageGenerations).await {
+        Ok(response) => response,
+        Err(e) => error_response(&e),
+    }
+}
+
+/// Image editing accepts OpenAI's multipart form (model, prompt, image,
+/// mask and optional generation fields) and forwards it as multipart.
+async fn image_edits(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Response {
+    if let Err(e) = check_auth(&g, &headers) {
+        return error_response(&e);
+    }
+    let mut fields: Vec<(String, Option<String>, Option<String>, bytes::Bytes)> = Vec::new();
+    let mut model = String::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let name = field.name().unwrap_or("field").to_string();
+        let file_name = field.file_name().map(str::to_string);
+        let content_type = field.content_type().map(str::to_string);
+        let bytes = match field.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => return error_response(&ApiError::BadRequest(err.to_string())),
+        };
+        if name == "model" {
+            model = String::from_utf8_lossy(&bytes).to_string();
+        }
+        fields.push((name, file_name, content_type, bytes));
+    }
+    let target = match media_target(&g, &model).await {
+        Ok(target) => target,
+        Err(e) => return error_response(&e),
+    };
+    let mut form = reqwest::multipart::Form::new();
+    for (name, file_name, content_type, bytes) in fields {
+        let mut part = if let Some(content_type) = content_type {
+            reqwest::multipart::Part::bytes(bytes.to_vec())
+                .mime_str(&content_type)
+                .unwrap_or_else(|_| reqwest::multipart::Part::bytes(bytes.to_vec()))
+        } else {
+            reqwest::multipart::Part::bytes(bytes.to_vec())
+        };
+        if let Some(file_name) = file_name {
+            part = part.file_name(file_name);
+        }
+        form = form.part(name, part);
+    }
+    match send_media_multipart(&g, &target, form, MediaKind::ImageEdits).await {
+        Ok(response) => response,
+        Err(e) => error_response(&e),
+    }
+}
+
+/// Create an asynchronous video generation task.
+async fn video_create(
+    State(g): State<Gateway>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Response {
+    if let Err(e) = check_auth(&g, &headers) {
+        return error_response(&e);
+    }
+    let requested = body.get("model").and_then(Value::as_str).unwrap_or("");
+    let target = match media_target(&g, requested).await {
+        Ok(target) => target,
+        Err(e) => return error_response(&e),
+    };
+    body["model"] = Value::String(target.model.clone());
+    let provider = match g
+        .state
+        .config
+        .read()
+        .await
+        .provider(&target.provider_id)
+        .cloned()
+    {
+        Some(provider) => provider,
+        None => return error_response(&ApiError::NotFound("the provider disappeared".into())),
+    };
+    let (response, upstream_body) =
+        match send_media_json_raw(&g, &target, &body, MediaKind::VideoCreate).await {
+            Ok(value) => value,
+            Err(e) => return error_response(&e),
+        };
+    let upstream: Value = serde_json::from_slice(&upstream_body).unwrap_or(Value::Null);
+    if let Some(id) = upstream.get("id").and_then(Value::as_str) {
+        g.media_tasks.lock().await.insert(
+            id.to_string(),
+            MediaTask {
+                target,
+                provider,
+                body: upstream,
+            },
+        );
+    }
+    response
+}
+
+/// Retrieve a video task's current state.
+async fn video_status(
+    State(g): State<Gateway>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    media_task_request(&g, id, MediaKind::VideoStatus, "GET", headers).await
+}
+
+/// Cancel/delete a video task and forget its provider route.
+async fn video_delete(
+    State(g): State<Gateway>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let response =
+        media_task_request(&g, id.clone(), MediaKind::VideoDelete, "DELETE", headers).await;
+    g.media_tasks.lock().await.remove(&id);
+    response
+}
+
+/// Download the completed video bytes.
+async fn video_content(
+    State(g): State<Gateway>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    media_task_request(&g, id, MediaKind::VideoContent, "GET", headers).await
+}
+
+/// Find the first configured target for a media request.
+///
+/// A media model may live in the provider's media list rather than its
+/// chat list, so both are consulted.
+async fn media_target(g: &Gateway, requested: &str) -> Result<Target, ApiError> {
+    if requested.trim().is_empty() {
+        return Err(ApiError::BadRequest("the request has no model".into()));
+    }
+    let (provider_id, model) = match requested.split_once('/') {
+        Some((provider_id, model)) => (provider_id.to_string(), model.to_string()),
+        None => (String::new(), requested.to_string()),
+    };
+    let config = g.state.config.read().await;
+    let provider = if provider_id.is_empty() {
+        config
+            .providers
+            .iter()
+            .find(|p| p.enabled && p.media_models.contains(&model))
+            .or_else(|| {
+                config
+                    .providers
+                    .iter()
+                    .find(|p| p.enabled && p.models.contains(&model))
+            })
+    } else {
+        config
+            .providers
+            .iter()
+            .find(|p| p.id == provider_id && p.enabled)
+    };
+    let Some(provider) = provider.cloned() else {
+        return Err(ApiError::NotFound(format!(
+            "there is no provider called {provider_id}"
+        )));
+    };
+    if !provider.media_models.contains(&model) && !provider.models.contains(&model) {
+        return Err(ApiError::NotFound(format!(
+            "the provider {} does not serve {model}",
+            provider.id
+        )));
+    }
+    let secret = provider
+        .enabled_keys()
+        .next()
+        .map(|k| k.key.clone())
+        .unwrap_or_default();
+    let key_id = provider
+        .enabled_keys()
+        .next()
+        .map(|k| k.id.clone())
+        .unwrap_or_else(|| "session".to_string());
+    Ok(Target {
+        provider_id: provider.id.clone(),
+        provider_name: provider.name.clone(),
+        key_id,
+        key_label: None,
+        secret,
+        model,
+        protocol: provider.protocol,
+        asked: requested.to_string(),
+    })
+}
+
+/// Make the base URL for an auxiliary media endpoint.
+///
+/// A provider may point its media endpoints somewhere else than the OpenAI
+/// `/v1` family — WorkBuddy keeps them under `/v2` next to its chat
+/// endpoint — so the path is configurable.
+fn media_url(
+    provider: &Provider,
+    target: &Target,
+    kind: MediaKind,
+    id: Option<&str>,
+) -> Result<String, ApiError> {
+    let base = provider
+        .base_url_for(target.protocol)
+        .ok_or_else(|| ApiError::BadRequest("the provider has no url".into()))?;
+    let configured = provider.media_paths.as_ref().and_then(|paths| match kind {
+        MediaKind::ImageGenerations => paths.image_generations.clone(),
+        MediaKind::ImageEdits => paths.image_edits.clone(),
+        MediaKind::VideoCreate => paths.video_create.clone(),
+        MediaKind::VideoStatus => paths.video_status.clone(),
+        MediaKind::VideoContent => paths.video_content.clone(),
+        MediaKind::VideoDelete => paths.video_delete.clone(),
+    });
+    let path = match configured {
+        Some(path) => path,
+        None => {
+            let suffix = match kind {
+                MediaKind::ImageGenerations => "images/generations",
+                MediaKind::ImageEdits => "images/edits",
+                MediaKind::VideoCreate => "videos",
+                MediaKind::VideoStatus => "videos/{id}",
+                MediaKind::VideoContent => "videos/{id}/content",
+                MediaKind::VideoDelete => "videos/{id}",
+            };
+            let suffix = match id {
+                Some(id) => suffix.replace("{id}", id),
+                None => suffix.to_string(),
+            };
+            client::auxiliary_path(&base, &suffix)
+        }
+    };
+    Ok(format!("{}{}", base.trim_end_matches('/'), path))
+}
+
+/// Which media endpoint is being addressed.
+#[derive(Clone, Copy)]
+enum MediaKind {
+    ImageGenerations,
+    ImageEdits,
+    VideoCreate,
+    VideoStatus,
+    VideoContent,
+    VideoDelete,
+}
+
+/// Forward a JSON media request and preserve the upstream body/status.
+async fn send_media_json(
+    g: &Gateway,
+    target: &Target,
+    body: &Value,
+    kind: MediaKind,
+) -> Result<Response, ApiError> {
+    let (response, _) = send_media_json_raw(g, target, body, kind).await?;
+    Ok(response)
+}
+
+async fn send_media_json_raw(
+    g: &Gateway,
+    target: &Target,
+    body: &Value,
+    kind: MediaKind,
+) -> Result<(Response, bytes::Bytes), ApiError> {
+    let provider = g
+        .state
+        .config
+        .read()
+        .await
+        .provider(&target.provider_id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound("the provider disappeared".into()))?;
+    let headers = target_headers(&provider, target, None, false).await?;
+    let url = media_url(&provider, target, kind, None)?;
+    tracing::debug!("media request to {url}");
+    let http = g
+        .client_for(&target.provider_id, &provider)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let mut request = http.post(url).json(body);
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    media_response_raw(response).await
+}
+
+/// Forward a multipart image edit.
+async fn send_media_multipart(
+    g: &Gateway,
+    target: &Target,
+    form: reqwest::multipart::Form,
+    kind: MediaKind,
+) -> Result<Response, ApiError> {
+    let provider = g
+        .state
+        .config
+        .read()
+        .await
+        .provider(&target.provider_id)
+        .cloned()
+        .ok_or_else(|| ApiError::NotFound("the provider disappeared".into()))?;
+    let headers = target_headers(&provider, target, None, false).await?;
+    let url = media_url(&provider, target, kind, None)?;
+    let http = g
+        .client_for(&target.provider_id, &provider)
+        .await
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    let mut request = http.post(url).multipart(form);
+    for (name, value) in &headers {
+        request = request.header(name, value);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    media_response(response).await
+}
+
+/// Preserve media status, content type and bytes. Errors are translated to
+/// the gateway's normal JSON error shape by the caller.
+async fn media_response(response: reqwest::Response) -> Result<Response, ApiError> {
+    let (response, _) = media_response_raw(response).await?;
+    Ok(response)
+}
+
+async fn media_response_raw(
+    response: reqwest::Response,
+) -> Result<(Response, bytes::Bytes), ApiError> {
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| ApiError::Upstream(e.to_string()))?;
+    if !status.is_success() {
+        let value: Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| json!({"error": {"message": String::from_utf8_lossy(&body)}}));
+        let message = error_message(&value);
+        return Err(match status.as_u16() {
+            400..=499 => ApiError::BadRequest(message),
+            _ => ApiError::Upstream(message),
+        });
+    }
+    let saved = body.clone();
+    let response = Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .map_err(|e| ApiError::Internal(e.to_string()))?;
+    Ok((response, saved))
+}
+
+/// Forward a status/delete/content request for a task created by this
+/// process. The task mapping is intentionally in-memory; if the process
+/// restarts, clients should submit the task again or use the provider's
+/// native API.
+async fn media_task_request(
+    g: &Gateway,
+    id: String,
+    kind: MediaKind,
+    method: &str,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(e) = check_auth(g, &headers) {
+        return error_response(&e);
+    }
+    if id.contains('/') || id.contains("..") {
+        return error_response(&ApiError::BadRequest("invalid media task id".into()));
+    }
+    let task = match g.media_tasks.lock().await.get(&id).cloned() {
+        Some(task) => task,
+        None => return error_response(&ApiError::NotFound("there is no such media task".into())),
+    };
+    // A vendor that keeps its media outside the OpenAI family may finish
+    // the video straight away and have no task endpoints at all; then the
+    // gateway answers from the answer it already has. A vendor that
+    // follows the OpenAI family has task endpoints of its own.
+    let paths = task.provider.media_paths.as_ref();
+    let has_native = match kind {
+        MediaKind::VideoStatus => {
+            paths.and_then(|p| p.video_status.as_ref()).is_some() || paths.is_none()
+        }
+        MediaKind::VideoContent => {
+            paths.and_then(|p| p.video_content.as_ref()).is_some() || paths.is_none()
+        }
+        MediaKind::VideoDelete => {
+            paths.and_then(|p| p.video_delete.as_ref()).is_some() || paths.is_none()
+        }
+        _ => false,
+    };
+    if !has_native {
+        return match kind {
+            MediaKind::VideoStatus => Json(task.body).into_response(),
+            MediaKind::VideoDelete => StatusCode::NO_CONTENT.into_response(),
+            MediaKind::VideoContent => download_media_result(g, &task, &id).await,
+            _ => error_response(&ApiError::NotFound("there is no such media task".into())),
+        };
+    }
+    let url = match media_url(&task.provider, &task.target, kind, Some(&id)) {
+        Ok(url) => url,
+        Err(e) => return error_response(&e),
+    };
+    let auth = match target_headers(&task.provider, &task.target, None, false).await {
+        Ok(headers) => headers,
+        Err(e) => return error_response(&e),
+    };
+    let http = match g.client_for(&task.target.provider_id, &task.provider).await {
+        Ok(client) => client,
+        Err(e) => return error_response(&ApiError::Internal(e.to_string())),
+    };
+    let mut request = match method {
+        "DELETE" => http.delete(url),
+        _ => http.get(url),
+    };
+    for (name, value) in &auth {
+        request = request.header(name, value);
+    }
+    match request.send().await {
+        Ok(response) => match media_response(response).await {
+            Ok(response) => response,
+            Err(e) => error_response(&e),
+        },
+        Err(e) => error_response(&ApiError::Upstream(e.to_string())),
+    }
+}
+
+/// Fetch the finished video from the url the vendor returned.
+async fn download_media_result(g: &Gateway, task: &MediaTask, id: &str) -> Response {
+    let Some(url) = media_result_url(&task.body) else {
+        return error_response(&ApiError::NotFound(format!(
+            "the video {id} has no download url yet"
+        )));
+    };
+    let auth = match target_headers(&task.provider, &task.target, None, false).await {
+        Ok(headers) => headers,
+        Err(e) => return error_response(&e),
+    };
+    let http = match g.client_for(&task.target.provider_id, &task.provider).await {
+        Ok(client) => client,
+        Err(e) => return error_response(&ApiError::Internal(e.to_string())),
+    };
+    let mut request = http.get(&url);
+    for (name, value) in &auth {
+        request = request.header(name, value);
+    }
+    match request.send().await {
+        Ok(response) => match media_response(response).await {
+            Ok(response) => response,
+            Err(e) => error_response(&e),
+        },
+        Err(e) => error_response(&ApiError::Upstream(e.to_string())),
+    }
+}
+
+/// The download url of a finished video, wherever the vendor put it.
+fn media_result_url(body: &Value) -> Option<String> {
+    if let Some(url) = body.get("url").and_then(Value::as_str) {
+        return Some(url.to_string());
+    }
+    if let Some(items) = body.get("data").and_then(Value::as_array) {
+        for item in items {
+            if let Some(url) = item.get("url").and_then(Value::as_str) {
+                return Some(url.to_string());
+            }
+        }
+    }
+    body.pointer("/output/url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// Anthropic's token counter. The answer is an estimate; an agent only uses
@@ -389,12 +1102,19 @@ async fn handle(
         }
     };
 
-    // The agent's own session id, when it sent one.
+    // The agent's own session id, when it sent one: in the body like
+    // Anthropic does, or a header like every other tool does.
     let session = value
         .get("metadata")
         .and_then(|m| m.get("user_id"))
         .and_then(Value::as_str)
         .or_else(|| value.get("user").and_then(Value::as_str))
+        .or_else(|| {
+            headers
+                .get("x-session-id")
+                .or_else(|| headers.get("x-magpie-session"))
+                .and_then(|v| v.to_str().ok())
+        })
         .map(|s| s.to_string());
     request.session_id = session.clone();
 
@@ -423,6 +1143,26 @@ async fn handle(
             Some(p) => p.clone(),
             None => continue,
         };
+        // A provider that asked to be held back while its quota is empty
+        // waits here instead of getting a request it cannot serve.
+        if provider.hold_when_exhausted && provider.uses_session() {
+            match crate::workbuddy::exhausted().await {
+                Ok(true) => {
+                    last_error = ApiError::RateLimited(format!(
+                        "the provider {} is out of quota",
+                        target.provider_id
+                    ));
+                    continue;
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        "the quota of {} could not be read: {err}",
+                        target.provider_id
+                    );
+                }
+            }
+        }
         let started = Instant::now();
         let result = if stream {
             stream_attempt(
@@ -454,6 +1194,18 @@ async fn handle(
                 g.router.note_used(&asked).await;
                 if let Some(session) = &session {
                     g.router.note_affinity(session, &target.key_id).await;
+                    note_route_trace(
+                        &g,
+                        session,
+                        &plan,
+                        &asked,
+                        Some(route::PlanEntry {
+                            provider: target.provider_id.clone(),
+                            model: target.model.clone(),
+                            key: target.key_id.clone(),
+                        }),
+                    )
+                    .await;
                 }
                 return response;
             }
@@ -464,7 +1216,7 @@ async fn handle(
                 rec.latency_ms = started.elapsed().as_millis() as u64;
                 let record = g.state.config.read().await.settings.record_usage;
                 if record {
-                    usage::record(&crate::config::usage_file(), &rec);
+                    usage::record(&g.state.usage_path(), &rec);
                 }
                 last_error = err;
                 if !last_error.retryable() {
@@ -473,7 +1225,70 @@ async fn handle(
             }
         }
     }
+    // Whatever the outcome, the routing view can say what happened.
+    if let Some(session) = &session {
+        note_route_trace(&g, session, &plan, &asked, None).await;
+    }
     error_response(&last_error)
+}
+
+/// Write down the route a session took, for the routing view.
+async fn note_route_trace(
+    g: &Gateway,
+    session: &str,
+    plan: &route::RoutePlan,
+    asked: &str,
+    served: Option<route::PlanEntry>,
+) {
+    g.router
+        .note_trace(
+            session,
+            route::RouteTrace {
+                asked: asked.to_string(),
+                plan: plan
+                    .targets
+                    .iter()
+                    .map(|t| route::PlanEntry {
+                        provider: t.provider_id.clone(),
+                        model: t.model.clone(),
+                        key: t.key_id.clone(),
+                    })
+                    .collect(),
+                served,
+                reason: plan.reason.clone(),
+                at: chrono::Utc::now().to_rfc3339(),
+            },
+        )
+        .await;
+}
+
+/// The headers to send to a target, and the secret behind them.
+///
+/// A provider that authenticates with a local app's session has no stored
+/// key: the session is read (and renewed when it is about to expire) right
+/// before the request goes out.
+async fn target_headers(
+    provider: &Provider,
+    target: &Target,
+    agent_user_agent: Option<&str>,
+    send_agent_ua: bool,
+) -> Result<BTreeMap<String, String>, ApiError> {
+    if provider.uses_session() {
+        let session = crate::workbuddy::session()
+            .await
+            .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+        return Ok(client::session_headers(target.protocol, provider, &session));
+    }
+    Ok(client::auth_headers(
+        target.protocol,
+        provider,
+        &target.secret,
+        if send_agent_ua {
+            agent_user_agent
+        } else {
+            None
+        },
+    ))
 }
 
 /// The request body in the protocol a vendor speaks.
@@ -524,24 +1339,25 @@ async fn whole_attempt(
     rec.key_label = target.key_label.clone();
     rec.group = plan.group_id.clone();
 
-    let body = upstream_body(request, target.protocol, &target.model);
-    let headers = client::auth_headers(
-        target.protocol,
-        provider,
-        &target.secret,
-        if send_agent_ua {
-            agent_user_agent
-        } else {
-            None
-        },
-    );
+    let mut body = upstream_body(request, target.protocol, &target.model);
+    // A vendor that only answers streaming requests is asked for a stream
+    // even when the caller wants one whole reply.
+    let stream_only = provider.stream_only;
+    if stream_only {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    let headers = match target_headers(provider, target, agent_user_agent, send_agent_ua).await {
+        Ok(h) => h,
+        Err(e) => return Err((e, rec)),
+    };
 
     let client = match g.client_for(&target.provider_id, provider).await {
         Ok(c) => c,
         Err(err) => return Err((ApiError::Internal(err.to_string()), rec)),
     };
     let started = Instant::now();
-    let reply = match client::send(&client, target, provider, body, headers, false).await {
+    let reply = match client::send(&client, target, provider, body, headers, stream_only).await {
         Ok(r) => r,
         Err(err) => {
             rec.latency_ms = started.elapsed().as_millis() as u64;
@@ -550,11 +1366,24 @@ async fn whole_attempt(
     };
     let (status, payload) = match reply {
         UpstreamReply::Whole { status, body } => (status, body),
-        UpstreamReply::Stream { .. } => {
-            return Err((
-                ApiError::Internal("the upstream streamed unexpectedly".into()),
-                rec,
-            ))
+        UpstreamReply::Stream { status, bytes } => {
+            // The vendor only speaks streaming: fold the events back into
+            // one reply for the caller.
+            let events = collect_stream(bytes, target.protocol).await;
+            let parsed = ChatResponse::from_events(&events);
+            rec.input_tokens = parsed.usage.input_tokens;
+            rec.output_tokens = parsed.usage.output_tokens;
+            rec.cache_read_tokens = parsed.usage.cache_read_tokens;
+            rec.cache_write_tokens = parsed.usage.cache_write_tokens;
+            rec.reasoning_tokens = parsed.usage.reasoning_tokens;
+            rec.latency_ms = started.elapsed().as_millis() as u64;
+            rec.status = status;
+            let outbound = downstream_response(caller_protocol, &parsed, &request.model);
+            let record = g.state.config.read().await.settings.record_usage;
+            if record {
+                usage::record(&g.state.usage_path(), &rec);
+            }
+            return Ok(Json(outbound).into_response());
         }
     };
     if !(200..300).contains(&status) {
@@ -590,7 +1419,7 @@ async fn whole_attempt(
 
     let record = g.state.config.read().await.settings.record_usage;
     if record {
-        usage::record(&crate::config::usage_file(), &rec);
+        usage::record(&g.state.usage_path(), &rec);
     }
     Ok(Json(outbound).into_response())
 }
@@ -613,17 +1442,15 @@ async fn stream_attempt(
     rec.key_label = target.key_label.clone();
     rec.group = plan.group_id.clone();
 
-    let body = upstream_body(request, target.protocol, &target.model);
-    let headers = client::auth_headers(
-        target.protocol,
-        provider,
-        &target.secret,
-        if send_agent_ua {
-            agent_user_agent
-        } else {
-            None
-        },
-    );
+    let mut body = upstream_body(request, target.protocol, &target.model);
+    if provider.stream_only {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+    }
+    let headers = match target_headers(provider, target, agent_user_agent, send_agent_ua).await {
+        Ok(h) => h,
+        Err(e) => return Err((e, rec)),
+    };
     let client = match g.client_for(&target.provider_id, provider).await {
         Ok(c) => c,
         Err(err) => return Err((ApiError::Internal(err.to_string()), rec)),
@@ -645,7 +1472,7 @@ async fn stream_attempt(
                 ));
             }
             rec.status = status;
-            let usage_path = crate::config::usage_file();
+            let usage_path = g.state.usage_path();
             let record_usage = g.state.config.read().await.settings.record_usage;
             Ok(build_stream(
                 bytes,
@@ -755,7 +1582,7 @@ async fn stream_attempt(
             });
             events.push(StreamEvent::MessageStop);
 
-            let usage_path = crate::config::usage_file();
+            let usage_path = g.state.usage_path();
             let record_usage = g.state.config.read().await.settings.record_usage;
             Ok(events_to_stream(
                 events,
@@ -768,6 +1595,31 @@ async fn stream_attempt(
             ))
         }
     }
+}
+
+/// Read a vendor's stream all the way to the end, collecting its events.
+async fn collect_stream(mut upstream: client::ByteStream, protocol: Protocol) -> Vec<StreamEvent> {
+    let mut collector: Box<dyn client::StreamCollector> = match protocol {
+        Protocol::OpenAiChat => Box::new(openai_chat::Collector::new()),
+        Protocol::OpenAiResponses => Box::new(openai_responses::Collector::new()),
+        Protocol::Anthropic => Box::new(anthropic::Collector::new()),
+        Protocol::Gemini => Box::new(gemini::Collector::new()),
+    };
+    let mut events: Vec<StreamEvent> = Vec::new();
+    let mut buffer = String::new();
+    while let Some(item) = upstream.next().await {
+        let Ok(chunk) = item else { break };
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = client::find_frame_end(&buffer) {
+            let frame = buffer[..pos.0].to_string();
+            buffer = buffer[pos.1..].to_string();
+            if let Some(value) = client::parse_frame(&frame) {
+                collector.push(&value, &mut events);
+            }
+        }
+    }
+    collector.finish(&mut events);
+    events
 }
 
 /// Writes a stream's usage record when the stream ends — or when it is
@@ -873,6 +1725,7 @@ fn build_stream(
                 if let Some(value) = client::parse_frame(&frame) {
                     collector.push(&value, &mut events);
                     for ev in events.drain(..) {
+                        guard.rec.note_usage(&ev);
                         for out in renderer(&ev) {
                             yield bytes::Bytes::from(out.encode());
                         }
@@ -882,6 +1735,7 @@ fn build_stream(
         }
         collector.finish(&mut events);
         for ev in events.drain(..) {
+            guard.rec.note_usage(&ev);
             for out in renderer(&ev) {
                 yield bytes::Bytes::from(out.encode());
             }

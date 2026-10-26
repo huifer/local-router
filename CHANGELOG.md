@@ -6,6 +6,68 @@
 
 ## [Unreleased]
 
+### Added
+
+- **WorkBuddy 登录态上游**：新增 `workbuddy` provider，复用本机 WorkBuddy 客户端
+  的登录态作为上游凭据。
+  - `local-router provider add workbuddy`（无需 key），
+    `local-router workbuddy status|credits|models` 查看登录状态、积分与模型。
+  - access token 只在内存中：`config.json`、日志、`usage.jsonl` 均不落盘。
+  - token 快到期时自动用 refresh token 续期（`X-Refresh-Token` 头）。
+  - 上游只接受流式请求，调用方要整段回复时网关会收流再拼好，四种入口协议
+    都能用。
+  - 控制台 Overview 新增「WorkBuddy session」面板：账号、剩余积分、签到状态、
+    token 有效期与资源包明细；接口为 `GET /api/workbuddy`。
+  - 新增环境变量 `LOCAL_ROUTER_WORKBUDDY_SESSION`（登录态文件路径）、
+    `LOCAL_ROUTER_WORKBUDDY_ENDPOINT`（换端点）、`WORKBUDDY_HOME`（登录态目录）。
+- **浏览器跨域**：`settings.cors_origins` 控制哪些源可以跨域调用网关。默认
+  拒绝（网关是给本地工具用的）；填 `["*"]` 或具体 origin 后放行。
+- 用量日志跟 `config.json` 同目录（此前写死在全局配置目录，多实例时会串）。
+
+- **上游配额与路由洞察**（对齐同类网关的观察能力）：
+  - `GET /v1/local-router/quotas`：每个上游的配额窗口（名称/已用/剩余/重置时间/
+    是否被扣住），WorkBuddy 直接来自其账单接口。
+  - `GET /v1/local-router/usage?period=` 与 `/v1/local-router/usage/requests?limit=`：
+    周期汇总与逐请求明细的 HTTP API（此前只有控制台内页和 CLI）。
+  - `GET /v1/local-router/route` 带 `X-Session-ID` 头可查该会话最近一次路由：
+    计划、实际服务者、原因、时间。会话 ID 也接受 `X-Magpie-Session`。
+  - Provider 新增 `hold_when_exhausted`：配额窗口空了就不再路由到它（默认关；
+    WorkBuddy 实测 0 额度仍可用，故默认不挡）。
+
+### Added
+
+- **图片与视频**：新增 OpenAI 形状的媒体端点，图片生成/编辑、视频任务全生命周期
+  （创建 / 状态 / 取文件 / 取消）。
+  - `POST /v1/images/generations`、`POST /v1/images/edits`（multipart 编辑）。
+  - `POST /v1/videos`、`GET|DELETE /v1/videos/{id}`、`GET /v1/videos/{id}/content`。
+  - provider 新增 `media_models`（能做图/视频的模型）与 `media_paths`（厂商原生
+    媒体路径）；`local-router provider media <id> <模型...>` 可配置。
+  - `/v1/models` 增加 `modalities` 与 `native_endpoints` 元信息，客户端据此发现
+    哪些模型能画图/拍视频。
+  - 厂商把视频一次生成完（无任务状态接口）时，网关自己保管结果并提供状态与下载。
+
+- **WorkBuddy 自动签到**：网关启动后每半小时检查一次签到活动，到点未签就
+  代签（每日 +100 credits 自动到账）。`workbuddy_auto_checkin` 默认开；
+  `local-router workbuddy checkin` 可手动领。
+
+### Fixed
+
+- 流式请求的用量记录此前 token 恒为 0（绝大多数 agent 走流式，用量页看不到
+  真实消耗）：现在从流事件里取用量。
+- `local-router opencode` 此前会覆盖整个 `provider` 段，把用户自己配的其它
+  provider 一起删掉；现在只替换 local-router 那一项。
+- 绑在 `0.0.0.0` 时，写给 agent 的地址改为 `127.0.0.1`（之前写的是
+  `0.0.0.0`）。
+- `doctor` 不再把「登录态型」和「本地免 key 型」provider 误报为缺 key；并会
+  报告 WorkBuddy 登录状态与 token 剩余时间。
+- 控制台的「刷新模型」「测试 provider」现在支持登录态型 provider。
+- `usage.jsonl` 会自动翻页（默认 8 MB），不再无限增长。
+
+### Changed
+
+- 测试从 47 个增加到 72 个：新增 WorkBuddy 会话、续期、agent 配置写入、用量
+  日志与「流式上游 → 整段回复」的端到端用例。
+
 ## [0.1.0] - 2026-10-26
 
 首个公开发布版本。

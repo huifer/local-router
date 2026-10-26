@@ -6,6 +6,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::protocol::ir::StreamEvent;
+
 /// One request, as the usage page shows it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
@@ -55,6 +57,25 @@ fn yes() -> bool {
 }
 
 impl UsageRecord {
+    /// Take the token counts an event carries.
+    ///
+    /// A stream is the usual shape of a request, and its usage only shows
+    /// up in the last events; without this the usage page would report
+    /// zeroes for every agent that streams.
+    pub fn note_usage(&mut self, event: &StreamEvent) {
+        let usage = match event {
+            StreamEvent::MessageStart { usage, .. } | StreamEvent::MessageDelta { usage, .. } => {
+                *usage
+            }
+            _ => return,
+        };
+        self.input_tokens = usage.input_tokens.max(self.input_tokens);
+        self.output_tokens = usage.output_tokens.max(self.output_tokens);
+        self.cache_read_tokens = usage.cache_read_tokens.max(self.cache_read_tokens);
+        self.cache_write_tokens = usage.cache_write_tokens.max(self.cache_write_tokens);
+        self.reasoning_tokens = usage.reasoning_tokens.max(self.reasoning_tokens);
+    }
+
     pub fn new(model: &str, protocol: &str) -> Self {
         UsageRecord {
             time: chrono::Utc::now().to_rfc3339(),
@@ -78,10 +99,31 @@ impl UsageRecord {
     }
 }
 
+/// How large the usage log may grow before it is rolled over.
+const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The limit the log is rolled over at. The environment may lower it, which
+/// is what the tests do.
+fn max_log_bytes() -> u64 {
+    std::env::var("LOCAL_ROUTER_USAGE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_LOG_BYTES)
+}
+
 /// Append one record to the log.
 pub fn record(path: &Path, rec: &UsageRecord) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+    }
+    // Keep the log from growing forever: the old file becomes one
+    // generation of history, and the new one starts fresh.
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > max_log_bytes() {
+            let old = path.with_extension("jsonl.1");
+            let _ = std::fs::rename(path, old);
+        }
     }
     let Ok(line) = serde_json::to_string(rec) else {
         return;

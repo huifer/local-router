@@ -42,6 +42,7 @@ pub fn router(state: AppState) -> Router {
         .route("/assets/app.js", get(app_js))
         .route("/assets/style.css", get(style_css))
         .route("/api/status", get(api_status))
+        .route("/api/workbuddy", get(api_workbuddy))
         .route("/api/presets", get(api_presets))
         .route("/api/providers", get(api_providers).post(api_add_provider))
         .route(
@@ -177,6 +178,41 @@ async fn api_status(State(state): State<AppState>) -> Json<Value> {
         "models": config.model_ids().len(),
         "settings": config.settings,
     }))
+}
+
+async fn api_workbuddy() -> Json<Value> {
+    // The WorkBuddy session lives on the machine that runs local-router;
+    // a container without it simply reports that nobody is signed in.
+    let mut out = json!({
+        "signed_in": false,
+        "account": Value::Null,
+        "token_expires_at": Value::Null,
+        "credits": Value::Null,
+        "note": Value::Null,
+    });
+    match crate::workbuddy::read_session_file() {
+        Ok(session) => {
+            out["signed_in"] = json!(true);
+            out["account"] = json!({
+                "uid": session.account.uid,
+                "nickname": session.account.nickname,
+                "type": session.account.account_type,
+            });
+            out["token_expires_at"] = json!(session.expires_at);
+            out["checkin"] = match crate::workbuddy::checkin_state().await {
+                Some(state) => serde_json::to_value(state).unwrap_or(Value::Null),
+                None => Value::Null,
+            };
+            match crate::workbuddy::credits().await {
+                Ok(credits) => {
+                    out["credits"] = serde_json::to_value(credits).unwrap_or(Value::Null)
+                }
+                Err(err) => out["note"] = json!(err.to_string()),
+            }
+        }
+        Err(err) => out["note"] = json!(err.to_string()),
+    }
+    Json(out)
 }
 
 async fn api_presets() -> Json<Value> {
@@ -561,6 +597,19 @@ async fn api_refresh_models(
             Json(json!({"error": "there is no provider with that id"})),
         ));
     };
+    // A session-backed provider lists its models from its own account.
+    if provider.uses_session() {
+        let models = crate::workbuddy::models().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        let mut ids: Vec<String> = models.into_iter().collect();
+        ids.sort();
+        ids.dedup();
+        return Ok(Json(json!({"models": ids})));
+    }
     let base = provider.base_url.clone().ok_or_else(|| {
         (
             StatusCode::BAD_REQUEST,
@@ -649,17 +698,30 @@ async fn api_test_provider(
             Json(json!({"error": "there is no provider with that id"})),
         ));
     };
-    let Some(key) = provider.enabled_keys().next().cloned() else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "the provider has no key"})),
-        ));
-    };
     let Some(model) = provider.models.first().cloned() else {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(json!({"error": "the provider exposes no model"})),
         ));
+    };
+    // A session-backed provider has no stored key: the session is read
+    // when the request goes out.
+    let headers = if provider.uses_session() {
+        let session = crate::workbuddy::session().await.map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        client::session_headers(provider.protocol, &provider, &session)
+    } else {
+        let Some(key) = provider.enabled_keys().next().cloned() else {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "the provider has no key"})),
+            ));
+        };
+        client::auth_headers(provider.protocol, &provider, &key.key, None)
     };
     let base = provider.base_url.clone().ok_or_else(|| {
         (
@@ -667,13 +729,19 @@ async fn api_test_provider(
             Json(json!({"error": "the provider has no url"})),
         )
     })?;
-    let url = client::url_for(&base, provider.protocol, Some(&model), false);
-    let body = json!({
+    let url = match &provider.chat_path {
+        Some(path) => format!("{}{}", base.trim_end_matches('/'), path),
+        None => client::url_for(&base, provider.protocol, Some(&model), false),
+    };
+    let mut body = json!({
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 8,
     });
-    let headers = client::auth_headers(provider.protocol, &provider, &key.key, None);
+    if provider.stream_only {
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({"include_usage": true});
+    }
     let http = reqwest::Client::builder()
         .user_agent(format!("local-router/{}", client::VERSION))
         .build()
@@ -1019,7 +1087,7 @@ async fn api_delete_caller_key(
 // ------------------------------------------------------------------ usage --
 
 async fn api_usage(State(state): State<AppState>) -> Json<Value> {
-    let records = usage::read_all(&crate::config::usage_file());
+    let records = usage::read_all(&state.usage_path());
     let totals = usage::totals(&records);
     let by_model = usage::group_by(&records, |r| r.model.clone());
     let by_provider = usage::group_by(&records, |r| r.provider.clone());

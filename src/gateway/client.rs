@@ -25,7 +25,7 @@ pub trait StreamCollector: Send {
 /// The version local-router reports to vendors.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Build the URL a protocol's endpoint lives at.
+/// The URL a request goes to.
 pub fn url_for(base: &str, protocol: Protocol, model: Option<&str>, stream: bool) -> String {
     let base = base.trim_end_matches('/');
     match protocol {
@@ -63,6 +63,21 @@ pub fn url_for(base: &str, protocol: Protocol, model: Option<&str>, stream: bool
                 format!("{base}/v1beta/models/{m}:{action}")
             }
         }
+    }
+}
+
+/// Build the path of an OpenAI-style auxiliary endpoint under a provider
+/// base URL.
+///
+/// Providers normally configure either `https://host/v1` or `https://host`;
+/// both forms should reach `/v1/images/...` and `/v1/videos/...`.
+pub fn auxiliary_path(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = format!("/{}", path.trim_start_matches('/'));
+    if base.ends_with("/v1") {
+        path
+    } else {
+        format!("/v1{path}")
     }
 }
 
@@ -112,7 +127,7 @@ pub fn build_client(provider: &Provider) -> anyhow::Result<reqwest::Client> {
     Ok(builder.build()?)
 }
 
-/// The headers every request to a vendor carries.
+/// The headers a request to a vendor carries.
 pub fn auth_headers(
     protocol: Protocol,
     provider: &Provider,
@@ -149,6 +164,28 @@ pub fn auth_headers(
     headers
 }
 
+/// The headers for a provider that authenticates with a local app's
+/// session rather than a stored key.
+pub fn session_headers(
+    protocol: Protocol,
+    provider: &Provider,
+    session: &crate::workbuddy::Session,
+) -> BTreeMap<String, String> {
+    let mut headers = session.auth_headers();
+    // A session provider speaks OpenAI's Chat shape, so the bearer token
+    // goes in the same header it would for a stored key.
+    headers.remove("x-api-key");
+    headers.remove("x-goog-api-key");
+    if protocol == Protocol::Anthropic {
+        headers.remove("authorization");
+        headers.insert("x-api-key".to_string(), session.access_token.clone());
+    }
+    for (name, value) in &provider.headers {
+        headers.insert(name.to_lowercase(), value.clone());
+    }
+    headers
+}
+
 /// A vendor's reply, either whole or streamed.
 pub enum UpstreamReply {
     Whole { status: u16, body: Value },
@@ -167,7 +204,11 @@ pub async fn send(
     let base = provider
         .base_url_for(target.protocol)
         .ok_or_else(|| anyhow::anyhow!("the provider {} has no url", target.provider_id))?;
-    let url = url_for(&base, target.protocol, Some(&target.model), stream);
+    let url = match &provider.chat_path {
+        // A vendor that does not use the protocol's default path.
+        Some(path) => format!("{}{}", base.trim_end_matches('/'), path),
+        None => url_for(&base, target.protocol, Some(&target.model), stream),
+    };
 
     let mut req = client.post(&url).json(&body);
     for (name, value) in &headers {

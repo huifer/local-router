@@ -265,6 +265,25 @@
       "docs": "https://portal.nousresearch.com"
     },
     {
+      "id": "workbuddy",
+      "name": "WorkBuddy（用本机登录态）",
+      "group": "local",
+      "protocol": "openai_chat",
+      "base_url": "https://copilot.tencent.com",
+      "chat_path": "/v2/chat/completions",
+      "auth": "workbuddy",
+      "stream_only": true,
+      "media_models": ["hunyuan-image-v3.0-art", "kling-video-v3", "minimax-video-h3"],
+      "media_paths": {
+        "image_generations": "/v2/images/generations",
+        "image_edits": "/v2/images/edits",
+        "video_create": "/v2/videos/generations"
+      },
+      "default_models": ["hy3", "auto", "kimi-k2.6", "glm-5.1", "deepseek-v4-flash"],
+      "key_hint": "(无需 key，使用本机 WorkBuddy 登录态)",
+      "docs": "https://www.codebuddy.cn"
+    },
+    {
       "id": "ollama",
       "name": "Ollama",
       "group": "local",

@@ -55,7 +55,7 @@ local-router serve [--port N] [--web-port N] [--lan]
 local-router web [--port N]
 
 local-router provider add <preset|名字> --key sk-… [--url …] [--models a,b]
-local-router provider list | rm | models | expose | test | key
+local-router provider list | rm | models | expose | media | test | key
 local-router models                            # 模型目录
 local-router group add <名字> --models a/m1,b/m2 --routing order | list | rm
 local-router ls | usage [--csv] | doctor
@@ -73,6 +73,20 @@ usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
 
 文件被 CLI / 另一个进程修改后，网关在下一个请求自动重载（mtime 探测），
 不用重启。
+
+`config.json` 里的 `settings` 还能改几件事：
+
+| 字段 | 作用 |
+| --- | --- |
+| `cors_origins` | 允许哪些浏览器源跨域调用网关。默认空（不允许）；填 `["*"]` 或 `["http://localhost:3000"]` 才开 |
+| `default_caller_key` | 调用方默认用的 key |
+| `record_usage` | 是否记录用量 |
+| `masking` | 是否在发往上游前遮蔽提示词里的密钥 |
+| `workbuddy_auto_checkin` | 是否自动领 WorkBuddy 每日签到（默认开） |
+| `send_agent_user_agent` | 是否把 agent 的 User-Agent 转发给上游 |
+
+`usage.jsonl` 跟 `config.json` 放在同一个目录；超过 8 MB 会自动翻页成
+`usage.jsonl.1`（可用 `LOCAL_ROUTER_USAGE_MAX_BYTES` 改这个上限）。
 
 ### 环境变量
 
@@ -99,6 +113,8 @@ usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
 | 端点 | 说明 |
 | --- | --- |
 | `POST /v1/chat/completions` | OpenAI Chat（流式 / 非流式） |
+| `POST /v1/images/generations` · `/v1/images/edits` | 图片生成 / 编辑（multipart 编辑） |
+| `POST /v1/videos` · `GET/DELETE /v1/videos/{id}` · `GET /v1/videos/{id}/content` | 视频任务：创建 / 查状态 / 取文件 / 取消 |
 | `POST /v1/responses` | OpenAI Responses |
 | `POST /v1/messages` · `/v1/messages/count_tokens` | Anthropic Messages |
 | `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Gemini |
@@ -110,6 +126,74 @@ usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
 思考 token）双向翻译。上游忽略 `stream=true` 返回 JSON 时，网关自动把整段
 回复转成事件流。
 
+## WorkBuddy：用本机登录态当上游
+
+不想买 API key，但本机装了 WorkBuddy？local-router 可以直接复用 WorkBuddy 的
+登录态，把它当成一个上游：
+
+```sh
+local-router provider add workbuddy      # 不需要 key
+local-router workbuddy status            # 登录状态、账号、token 有效期
+local-router workbuddy credits           # 积分（资源包 + 签到）
+local-router workbuddy checkin           # 手动领当日签到（通常自动完成）
+local-router workbuddy models            # 账号可用的模型
+local-router claude workbuddy/hy3        # 让 Claude Code 走 WorkBuddy
+```
+
+要点：
+
+- **不落盘**：access token 只在内存里。`config.json` 里只有
+  `"auth": "workbuddy"` 这样的标记，没有任何密钥；日志和 `usage.jsonl` 里也
+  不会出现 token。
+- **自动续期**：token 快到期时会用 refresh token 换一个新的（refresh token
+  放在 `X-Refresh-Token` 头里，由 WorkBuddy 客户端同样的接口换发）。
+- **协议**：上游只接受流式请求（`POST /v2/chat/completions`）。local-router
+  会在调用方要整段回复时把它流式收回来再拼好，所以 OpenAI / Anthropic /
+  Responses / Gemini 四种入口都能用。
+- **自动签到**：网关会自己盯签到活动，到点未签就代签（默认开；
+  `config.json` 里 `"workbuddy_auto_checkin": false` 关掉）。每日 +100 credits
+  就不用手动领了。也可手动：`local-router workbuddy checkin`。
+- **需要先登录**：请先在 WorkBuddy 客户端里登录；没有登录态时
+  `local-router workbuddy status` 会直接告诉你原因。
+- 容器里看不到宿主机的登录态，除非你把会话文件挂进去
+  （`LOCAL_ROUTER_WORKBUDDY_SESSION`）。
+
+### 图片与视频
+
+图片与视频走各厂商自己的原生端点，网关只做转发与统一入口：
+
+```sh
+# 用 WorkBuddy 的图像模型画一张图
+curl http://127.0.0.1:3425/v1/images/generations \
+  -H "Authorization: Bearer local-router" \
+  -H "content-type: application/json" \
+  -d '{"model":"workbuddy/hunyuan-image-v3.0-art","prompt":"一只戴帽子的猫"}'
+
+# 视频是异步任务：创建 → 查状态 → 取文件
+curl http://127.0.0.1:3425/v1/videos \
+  -H "Authorization: Bearer local-router" \
+  -H "content-type: application/json" \
+  -d '{"model":"workbuddy/kling-video-v3","prompt":"一只猫在跑"}'
+```
+
+要点：
+
+- **模型要声明**：给 provider 配上能做图/视频的模型
+  （`local-router provider media <id> <模型...>`），它们会出现在 `/v1/models`
+  里，并带 `modalities` / `native_endpoints` 元信息，客户端据此发现能力。
+- **厂商原生路径可配**：默认走 OpenAI 的 `/v1` 家族；像 WorkBuddy 把媒体放在
+  `/v2` 且视频一次生成完（没有任务状态接口），在 provider 的 `media_paths` 里
+  写明即可，网关会自己兜住状态与下载。
+- 图片/视频的用量不计入 chat 的 token 统计，但同样计入 `usage.jsonl` 的请求数。
+
+### WorkBuddy 相关的环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `LOCAL_ROUTER_WORKBUDDY_SESSION` | 登录态文件的完整路径（找不到时不再猜别的位置） |
+| `LOCAL_ROUTER_WORKBUDDY_ENDPOINT` | 换用别的 WorkBuddy 端点（私有化 / 测试） |
+| `WORKBUDDY_HOME` | 登录态所在目录（默认自动查找） |
+
 ## 路由组
 
 ```sh
@@ -120,13 +204,15 @@ local-router claude group/backup
 - `order` 主备故障转移 · `rotate` 轮询 · `usage` 最少使用 · `smart` 额度感知 · `weight` 加权
 - `stays=auto|session|turn|off|strict`：会话粘性（prompt cache 还值钱时留在同一个 key 上）
 - 组内可嵌套组（带环检测）；一个 provider 配多把 key 会逐个尝试
+- `hold_when_exhausted`：账户配额窗口空了就不再路由到该上游（默认关；
+  实测 WorkBuddy 在额度为 0 时仍可服务，所以不要对它开）
 
 ## 开发
 
 ```sh
 cargo fmt --all -- --check   # 格式
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                   # 47 个测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫
+cargo test                   # 67 个测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫 / 登录态
 cd frontend && npm run dev   # 控制台热更新（API 代理到 :3426）
 ```
 

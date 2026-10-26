@@ -39,6 +39,33 @@ pub fn usage_file() -> PathBuf {
     config_dir().join("usage.jsonl")
 }
 
+/// Where a provider's media endpoints live.
+///
+/// Most vendors follow the OpenAI `/v1` family; others (WorkBuddy) keep
+/// their media next to their chat endpoint. Anything left unset follows
+/// the default.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MediaPaths {
+    /// Where an image is generated, e.g. `/v2/images/generations`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_generations: Option<String>,
+    /// Where an image is edited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_edits: Option<String>,
+    /// Where a video task is created.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_create: Option<String>,
+    /// Where a video task's state is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_status: Option<String>,
+    /// Where the finished video is downloaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_content: Option<String>,
+    /// Where a video task is cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub video_delete: Option<String>,
+}
+
 /// A vendor key local-router holds for one provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderKey {
@@ -51,6 +78,16 @@ pub struct ProviderKey {
     /// A friendly name, e.g. which team card this is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+}
+
+/// Where a provider's credential comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthKind {
+    /// A key stored in this file. The default.
+    Stored,
+    /// The WorkBuddy app's own login session, read from the machine.
+    #[serde(rename = "workbuddy")]
+    WorkBuddy,
 }
 
 fn yes() -> bool {
@@ -122,6 +159,67 @@ pub struct Provider {
     /// The provider is only reachable through a routing group.
     #[serde(default)]
     pub group_only: bool,
+    /// Where the credential comes from. Absent means a stored key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<AuthKind>,
+    /// The path of the chat endpoint, when the vendor does not use the
+    /// protocol's default one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_path: Option<String>,
+    /// The upstream only answers streaming requests. The gateway asks it
+    /// for a stream and assembles a whole reply when the caller wants one.
+    #[serde(default)]
+    pub stream_only: bool,
+    /// Stop sending requests here while the account's quota window says it
+    /// is empty. Off by default: some accounts keep serving on an empty
+    /// window, and holding them would break working requests.
+    #[serde(default)]
+    pub hold_when_exhausted: bool,
+    /// The models this provider offers for image and video work.
+    #[serde(default)]
+    pub media_models: Vec<String>,
+    /// The provider's native media endpoints, when they are not the
+    /// OpenAI `/v1` family.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_paths: Option<MediaPaths>,
+}
+
+impl Default for Provider {
+    fn default() -> Self {
+        Provider {
+            id: String::new(),
+            name: String::new(),
+            kind: "custom".to_string(),
+            enabled: true,
+            protocol: Protocol::OpenAiChat,
+            base_url: None,
+            anthropic_base_url: None,
+            responses_base_url: None,
+            gemini_base_url: None,
+            keys: Vec::new(),
+            models: Vec::new(),
+            auto_include: Vec::new(),
+            catalog: None,
+            headers: BTreeMap::new(),
+            user_agent: None,
+            proxy: None,
+            group_only: false,
+            auth: None,
+            chat_path: None,
+            stream_only: false,
+            hold_when_exhausted: false,
+            media_models: Vec::new(),
+            media_paths: None,
+        }
+    }
+}
+
+impl Provider {
+    /// Whether this provider authenticates with a local app's session
+    /// rather than a key stored in the config.
+    pub fn uses_session(&self) -> bool {
+        self.auth == Some(AuthKind::WorkBuddy)
+    }
 }
 
 fn custom_kind() -> String {
@@ -269,6 +367,15 @@ pub struct Settings {
     pub record_usage: bool,
     /// The user's locale for the web UI.
     pub locale: String,
+    /// Origins a browser may call the gateway from. Empty means none:
+    /// the gateway is for local tools, and a browser on another site
+    /// should not be able to use it. `["*"]` allows any origin.
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    /// Claim the WorkBuddy account's daily check-in on its own, so the
+    /// day's credits land without anyone opening the app.
+    #[serde(default = "yes")]
+    pub workbuddy_auto_checkin: bool,
 }
 
 impl Default for Settings {
@@ -284,6 +391,8 @@ impl Default for Settings {
             masking: false,
             record_usage: true,
             locale: "zh-CN".to_string(),
+            cors_origins: Vec::new(),
+            workbuddy_auto_checkin: true,
         }
     }
 }
@@ -422,6 +531,14 @@ impl Store {
         &self.path
     }
 
+    /// Where the usage log lives: next to the config file it belongs to.
+    pub fn usage_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|dir| dir.join("usage.jsonl"))
+            .unwrap_or_else(|| config_dir().join("usage.jsonl"))
+    }
+
     pub fn load(&self) -> anyhow::Result<Config> {
         if !self.path.exists() {
             return Ok(Config::default());
@@ -502,6 +619,11 @@ impl AppState {
     /// Where the web page is actually listening right now.
     pub async fn web_bind(&self) -> String {
         self.web_bind.read().await.clone()
+    }
+
+    /// Where the usage log of this configuration is written.
+    pub fn usage_path(&self) -> PathBuf {
+        self.store.usage_path()
     }
 
     /// Pick up changes another local-router made to the file.

@@ -43,6 +43,13 @@ export interface Provider {
   auto_include: string[];
   catalog?: string;
   group_only: boolean;
+  /** Where the credential comes from; "workbuddy" means the local session. */
+  auth?: "workbuddy";
+  chat_path?: string;
+  /** The upstream only answers streaming requests. */
+  stream_only?: boolean;
+  /** The models this provider offers for image and video work. */
+  media_models?: string[];
 }
 
 export type Routing = "smart" | "order" | "rotate" | "usage" | "weight";
@@ -128,4 +135,31 @@ export interface CallerKey {
   enabled: boolean;
   daily_tokens?: number;
   monthly_cost?: number;
+}
+
+export interface WorkBuddyCredits {
+  remaining: number;
+  capacity: number;
+  packages: {
+    package_name: string;
+    capacity: number;
+    used: number;
+    remaining: number;
+    unit: string;
+    expires_at: number | null;
+  }[];
+  checkin: {
+    checked_in_today: boolean;
+    streak_days: number;
+    daily_credit: number;
+    today_credit: number;
+  } | null;
+}
+
+export interface WorkBuddyStatus {
+  signed_in: boolean;
+  account: { uid: string; nickname: string; type: string } | null;
+  token_expires_at: number | null;
+  credits: WorkBuddyCredits | null;
+  note: string | null;
 }

@@ -26,6 +26,12 @@ fn provider(id: &str, models: &[&str], keys: usize) -> Provider {
         user_agent: None,
         proxy: None,
         group_only: false,
+        auth: None,
+        chat_path: None,
+        stream_only: false,
+        hold_when_exhausted: false,
+        media_models: Vec::new(),
+        media_paths: None,
     }
 }
 

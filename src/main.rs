@@ -3,7 +3,7 @@
 //! The web page and the gateway are the same process. `local-router` starts both;
 //! `local-router serve` starts the gateway alone.
 
-use local_router::{config, gateway, presets, protocol, web};
+use local_router::{config, gateway, presets, protocol, web, workbuddy};
 
 use std::sync::Arc;
 
@@ -52,6 +52,21 @@ enum Command {
     Opencode(AgentModelArgs),
     /// Check that everything is in order.
     Doctor,
+    /// WorkBuddy: the local login session, its credits and its models.
+    #[command(name = "workbuddy", subcommand)]
+    WorkBuddy(WorkBuddyCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum WorkBuddyCmd {
+    /// Show whether the WorkBuddy app is signed in.
+    Status,
+    /// Show the credits on the account.
+    Credits,
+    /// List the models the account may use.
+    Models,
+    /// Claim the day's check-in now.
+    Checkin,
 }
 
 impl Default for ServeArgs {
@@ -100,7 +115,7 @@ struct UsageArgs {
     /// Print csv instead of a table.
     #[arg(long)]
     csv: bool,
-    /// Only show the last day.
+    /// Only show the last day: today, 7d or 30d.
     #[arg(long, default_value = "7d")]
     period: String,
 }
@@ -138,6 +153,8 @@ enum ProviderCmd {
     Models { id: String },
     /// Set the models a provider exposes.
     Expose { id: String, models: Vec<String> },
+    /// Set the models a provider offers for image and video work.
+    Media { id: String, models: Vec<String> },
     /// Send a tiny request to a provider.
     Test { id: String },
     /// Add a key to a provider.
@@ -190,6 +207,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Gemini(args)) => set_agent("gemini", args).await,
         Some(Command::Opencode(args)) => set_agent("opencode", args).await,
         Some(Command::Doctor) => doctor().await,
+        Some(Command::WorkBuddy(cmd)) => workbuddy_cmd(cmd).await,
         None => serve(ServeArgs::default()).await,
     }
 }
@@ -221,6 +239,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Handlers that care — the console's remote guard — must see the real
     // bind address, not the file's.
     state.set_web_bind(&settings.web_addr).await;
+
+    if settings.workbuddy_auto_checkin {
+        start_auto_checkin();
+    }
 
     let gateway = gateway::Gateway::new(state.clone());
     let gateway_addr = format!("{}:{}", settings.gateway_addr, settings.gateway_port);
@@ -268,6 +290,9 @@ async fn web_only(args: WebArgs) -> anyhow::Result<()> {
     let state = AppState::load(store).await?;
     let settings = state.config.read().await.settings.clone().from_env();
     state.set_web_bind(&settings.web_addr).await;
+    if settings.workbuddy_auto_checkin {
+        start_auto_checkin();
+    }
 
     let gateway = gateway::Gateway::new(state.clone());
     let gateway_addr = format!("{}:{}", settings.gateway_addr, args.gateway_port);
@@ -300,6 +325,50 @@ async fn web_only(args: WebArgs) -> anyhow::Result<()> {
 async fn shutdown() {
     let _ = tokio::signal::ctrl_c().await;
     println!("\nstopping");
+}
+
+/// Claim the WorkBuddy account's daily check-in on a schedule, so the
+/// day's credits land without anyone opening the app.
+///
+/// The first check waits a little: at boot the session file may not be
+/// readable yet, and a failed attempt is simply retried later.
+fn start_auto_checkin() {
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let wait = if first {
+                first = false;
+                std::time::Duration::from_secs(30)
+            } else {
+                std::time::Duration::from_secs(30 * 60)
+            };
+            tokio::time::sleep(wait).await;
+
+            // 未登录或登录态不可读：安静跳过
+            let Some(status) = workbuddy::checkin_state().await else {
+                continue;
+            };
+            if !status.active || status.checked_in_today {
+                tracing::debug!("WorkBuddy 自动签到：今日无需处理");
+                continue;
+            }
+            match workbuddy::claim_checkin().await {
+                Ok(outcome) if outcome.granted => tracing::info!(
+                    "WorkBuddy 自动签到完成：{}{}",
+                    outcome
+                        .credit
+                        .map(|c| format!("+{c} credits "))
+                        .unwrap_or_default(),
+                    outcome.message
+                ),
+                Ok(outcome) if outcome.already => {
+                    tracing::debug!("WorkBuddy 今日已签到：{}", outcome.message)
+                }
+                Ok(outcome) => tracing::warn!("WorkBuddy 签到未完成：{}", outcome.message),
+                Err(err) => tracing::warn!("WorkBuddy 签到失败：{err}"),
+            }
+        }
+    });
 }
 
 // -------------------------------------------------------------- providers --
@@ -361,7 +430,7 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                 println!("no providers yet");
                 return Ok(());
             }
-            println!("{:<16} {:<22} {:<6} MODELS", "ID", "HOST", "KEYS");
+            println!("{:<16} {:<22} {:<8} MODELS", "ID", "HOST", "KEYS");
             for p in &config.providers {
                 let host = p
                     .base_url
@@ -371,12 +440,19 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                     .replace("http://", "")
                     .trim_end_matches('/')
                     .to_string();
+                let keys = if p.uses_session() {
+                    "登录态".to_string()
+                } else {
+                    p.keys.len().to_string()
+                };
+                let mut models = p.models.clone();
+                models.extend(p.media_models.iter().cloned());
                 println!(
-                    "{:<16} {:<22} {:<6} {}",
+                    "{:<16} {:<22} {:<8} {}",
                     p.id,
                     host,
-                    p.keys.len(),
-                    p.models.join(", ")
+                    keys,
+                    models.join(", ")
                 );
             }
         }
@@ -413,6 +489,17 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
             save_config(&config)?;
             println!("{id} now exposes {count} models");
         }
+        ProviderCmd::Media { id, models } => {
+            let count = {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.media_models = models;
+                p.media_models.len()
+            };
+            save_config(&config)?;
+            println!("{id} now offers {count} media model(s)");
+        }
         ProviderCmd::Test { id } => {
             let Some(provider) = config.provider(&id) else {
                 anyhow::bail!("there is no provider called {id}");
@@ -444,6 +531,13 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
 }
 
 async fn fetch_models(provider: &config::Provider) -> anyhow::Result<Vec<String>> {
+    // A session-backed provider lists its models from its own account.
+    if provider.uses_session() {
+        let mut models = workbuddy::models().await?;
+        models.sort();
+        models.dedup();
+        return Ok(models);
+    }
     let base = provider
         .base_url
         .clone()
@@ -498,25 +592,43 @@ async fn fetch_models(provider: &config::Provider) -> anyhow::Result<Vec<String>
 }
 
 async fn test_provider(provider: &config::Provider) -> anyhow::Result<(u128, String)> {
-    let key = provider
-        .enabled_keys()
-        .next()
-        .context("the provider has no key")?;
     let model = provider
         .models
         .first()
         .context("the provider exposes no model")?;
+    // A session-backed provider has no stored key: the session is read
+    // when the request goes out.
+    let (headers, _token) = if provider.uses_session() {
+        let session = workbuddy::session().await?;
+        let headers = gateway::client::session_headers(provider.protocol, provider, &session);
+        (headers, session.access_token.clone())
+    } else {
+        let key = provider
+            .enabled_keys()
+            .next()
+            .context("the provider has no key")?;
+        (
+            gateway::client::auth_headers(provider.protocol, provider, &key.key, None),
+            key.key.clone(),
+        )
+    };
     let base = provider
         .base_url
         .clone()
         .context("the provider has no url")?;
-    let url = gateway::client::url_for(&base, provider.protocol, Some(model), false);
-    let body = serde_json::json!({
+    let url = match &provider.chat_path {
+        Some(path) => format!("{}{}", base.trim_end_matches('/'), path),
+        None => gateway::client::url_for(&base, provider.protocol, Some(model), false),
+    };
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 16,
     });
-    let headers = gateway::client::auth_headers(provider.protocol, provider, &key.key, None);
+    if provider.stream_only {
+        body["stream"] = serde_json::json!(true);
+        body["stream_options"] = serde_json::json!({"include_usage": true});
+    }
     let http = reqwest::Client::builder()
         .user_agent(format!("local-router/{}", gateway::client::VERSION))
         .build()?;
@@ -533,6 +645,99 @@ async fn test_provider(provider: &config::Provider) -> anyhow::Result<(u128, Str
         anyhow::bail!("{}", text.chars().take(200).collect::<String>());
     }
     Ok((latency, text.chars().take(200).collect()))
+}
+
+// -------------------------------------------------------------- workbuddy --
+
+async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
+    match cmd {
+        WorkBuddyCmd::Status => {
+            let path = workbuddy::session_file();
+            println!("local-router {}", gateway::client::VERSION);
+            match workbuddy::read_session_file() {
+                Ok(session) => {
+                    println!("  signed in   yes");
+                    if !session.account.nickname.is_empty() {
+                        println!(
+                            "  account     {} ({})",
+                            session.account.nickname, session.account.uid
+                        );
+                    }
+                    match session.expires_at {
+                        Some(at) => {
+                            let left = (at - workbuddy::now_ms()) / 1000;
+                            println!("  token until {} ({} h left)", format_time(at), left / 3600);
+                        }
+                        None => println!("  token until unknown"),
+                    }
+                    println!(
+                        "  session     {}",
+                        path.map(|p| p.display().to_string()).unwrap_or_default()
+                    );
+                }
+                Err(err) => {
+                    println!("  signed in   no");
+                    println!("  {err}");
+                }
+            }
+        }
+        WorkBuddyCmd::Credits => {
+            let credits = workbuddy::credits().await?;
+            println!("credits left: {} / {}", credits.remaining, credits.capacity);
+            for p in &credits.packages {
+                println!(
+                    "  {:<32} {}/{} {} used",
+                    p.package_name, p.remaining, p.capacity, p.used
+                );
+            }
+            if let Some(checkin) = &credits.checkin {
+                println!(
+                    "  check-in    {} (streak {} days, {} credits today)",
+                    if checkin.checked_in_today {
+                        "done"
+                    } else {
+                        "not done"
+                    },
+                    checkin.streak_days,
+                    checkin.today_credit
+                );
+            }
+        }
+        WorkBuddyCmd::Models => {
+            let models = workbuddy::models().await?;
+            println!("the account may use {} models:", models.len());
+            for m in models {
+                println!("  {m}");
+            }
+        }
+        WorkBuddyCmd::Checkin => match workbuddy::claim_checkin().await {
+            Ok(outcome) if outcome.granted => {
+                println!(
+                    "checked in — {}",
+                    outcome
+                        .credit
+                        .map(|c| format!("+{c} credits"))
+                        .unwrap_or_else(|| outcome.message.clone())
+                );
+            }
+            Ok(outcome) if outcome.already => {
+                println!("already checked in today — {}", outcome.message);
+            }
+            Ok(outcome) => println!("{}", outcome.message),
+            Err(err) => {
+                println!("the check-in did not go through: {err}");
+                println!("sign in to WorkBuddy first, then try again");
+            }
+        },
+    }
+    Ok(())
+}
+
+/// A timestamp, in a readable form.
+fn format_time(millis: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(millis)
+        .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 // ---------------------------------------------------------------- groups --
@@ -644,11 +849,15 @@ async fn ls() -> anyhow::Result<()> {
     }
     for p in &config.providers {
         println!(
-            "  {:<16} {:<6} {} model(s), {} key(s)",
+            "  {:<16} {:<6} {} model(s), {}",
             p.id,
             if p.enabled { "on" } else { "off" },
             p.models.len(),
-            p.keys.len()
+            if p.uses_session() {
+                "登录态".to_string()
+            } else {
+                format!("{} key(s)", p.keys.len())
+            }
         );
     }
     println!();
@@ -746,6 +955,13 @@ async fn set_agent(which: &str, args: AgentModelArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether a provider is one that needs no key at all.
+fn keyless(id: &str) -> bool {
+    presets::get(id)
+        .map(|preset| preset.key_hint.contains("(none needed)"))
+        .unwrap_or(false)
+}
+
 async fn doctor() -> anyhow::Result<()> {
     let config = load_config()?;
     println!("local-router {}", gateway::client::VERSION);
@@ -764,7 +980,31 @@ async fn doctor() -> anyhow::Result<()> {
 
     let mut problems = Vec::new();
     for p in &config.providers {
-        if p.enabled && p.keys.is_empty() && p.id != "ollama" && p.id != "lmstudio" {
+        if p.uses_session() {
+            // A WorkBuddy provider authenticates with the local app's
+            // session, so the only thing to check is that there is one.
+            match crate::workbuddy::read_session_file() {
+                Ok(session) => {
+                    let left = session
+                        .expires_at
+                        .map(|at| (at - crate::workbuddy::now_ms()) / 3_600_000)
+                        .unwrap_or_default();
+                    println!(
+                        "  workbuddy   signed in as {} (token {} h left)",
+                        if session.account.nickname.is_empty() {
+                            "unknown"
+                        } else {
+                            &session.account.nickname
+                        },
+                        left
+                    );
+                }
+                Err(err) => problems.push(format!(
+                    "the provider {} needs a WorkBuddy login: {err}",
+                    p.id
+                )),
+            }
+        } else if p.enabled && p.enabled_keys().next().is_none() && !keyless(&p.id) {
             problems.push(format!("the provider {} has no key", p.id));
         }
         if p.enabled && p.base_url.is_none() {

@@ -36,6 +36,33 @@ struct RouterState {
     rotate: HashMap<String, u64>,
     /// Which target answered which session.
     affinity: HashMap<String, String>,
+    /// The last route of each session, so the routing view can say what
+    /// happened. The oldest session falls off when the map is full.
+    traces: HashMap<String, RouteTrace>,
+    order: std::collections::VecDeque<String>,
+}
+
+/// The route one session last took.
+#[derive(Clone, serde::Serialize)]
+pub struct RouteTrace {
+    /// The model the caller asked for.
+    pub asked: String,
+    /// The targets that were in the plan, in order.
+    pub plan: Vec<PlanEntry>,
+    /// The target that answered, if one did.
+    pub served: Option<PlanEntry>,
+    /// Why the plan looks the way it does.
+    pub reason: String,
+    /// When the request came in, RFC 3339.
+    pub at: String,
+}
+
+/// One target in a route plan, as the routing view shows it.
+#[derive(Clone, serde::Serialize)]
+pub struct PlanEntry {
+    pub provider: String,
+    pub model: String,
+    pub key: String,
 }
 
 /// The router's memory.
@@ -47,6 +74,25 @@ pub struct Router {
 impl Router {
     pub fn new() -> Self {
         Router::default()
+    }
+
+    /// Record the route a session took.
+    pub async fn note_trace(&self, session: &str, trace: RouteTrace) {
+        let mut state = self.state.lock().await;
+        if !state.traces.contains_key(session) {
+            state.order.push_back(session.to_string());
+            while state.order.len() > 128 {
+                if let Some(oldest) = state.order.pop_front() {
+                    state.traces.remove(&oldest);
+                }
+            }
+        }
+        state.traces.insert(session.to_string(), trace);
+    }
+
+    /// The route a session last took.
+    pub async fn trace_of(&self, session: &str) -> Option<RouteTrace> {
+        self.state.lock().await.traces.get(session).cloned()
     }
 
     pub async fn note_used(&self, model: &str) {
@@ -254,6 +300,20 @@ fn expand_member(
 
 /// Every key of a provider that could serve a model.
 fn targets_for(provider: &Provider, model: &str, asked: &str) -> Vec<Target> {
+    // A provider that authenticates with a local app's session holds no
+    // key: it is one target, whose secret is filled in at request time.
+    if provider.uses_session() {
+        return vec![Target {
+            provider_id: provider.id.clone(),
+            provider_name: provider.name.clone(),
+            key_id: "session".to_string(),
+            key_label: Some("登录态".to_string()),
+            secret: String::new(),
+            model: model.to_string(),
+            protocol: provider.protocol,
+            asked: asked.to_string(),
+        }];
+    }
     provider
         .enabled_keys()
         .map(|k| Target {

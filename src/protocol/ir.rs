@@ -331,6 +331,117 @@ impl ChatResponse {
             })
             .collect()
     }
+
+    /// Build a whole reply out of the events of a stream.
+    ///
+    /// A vendor that only answers streaming requests still has to serve a
+    /// caller that wants one reply; this folds the events back together.
+    pub fn from_events(events: &[StreamEvent]) -> ChatResponse {
+        let mut id = String::new();
+        let mut model = String::new();
+        let mut usage = Usage::default();
+        let mut stop_reason = None;
+        // The text, the reasoning and the tool call of each block index.
+        let mut texts: Vec<String> = Vec::new();
+        let mut thinkings: Vec<String> = Vec::new();
+        let mut tools: Vec<(String, String, String)> = Vec::new();
+
+        for event in events {
+            match event {
+                StreamEvent::MessageStart {
+                    id: start_id,
+                    model: start_model,
+                    usage: start_usage,
+                } => {
+                    if id.is_empty() {
+                        id = start_id.clone();
+                    }
+                    if model.is_empty() {
+                        model = start_model.clone();
+                    }
+                    usage = *start_usage;
+                }
+                StreamEvent::TextDelta { index, text } => {
+                    grow(&mut texts, *index);
+                    texts[*index].push_str(text);
+                }
+                StreamEvent::ThinkingDelta { index, text } => {
+                    grow(&mut thinkings, *index);
+                    thinkings[*index].push_str(text);
+                }
+                StreamEvent::ToolUseStart {
+                    index,
+                    id: call_id,
+                    name,
+                } => {
+                    grow(&mut tools, *index);
+                    tools[*index].0 = call_id.clone();
+                    tools[*index].1 = name.clone();
+                }
+                StreamEvent::ToolInputDelta {
+                    index,
+                    partial_json,
+                } => {
+                    grow(&mut tools, *index);
+                    tools[*index].2.push_str(partial_json);
+                }
+                StreamEvent::MessageDelta {
+                    stop_reason: reason,
+                    usage: final_usage,
+                } => {
+                    if reason.is_some() {
+                        stop_reason = *reason;
+                    }
+                    usage = *final_usage;
+                }
+                _ => {}
+            }
+        }
+
+        let mut content = Vec::new();
+        let blocks = texts.len().max(thinkings.len()).max(tools.len());
+        for index in 0..blocks {
+            // The reasoning comes before the text it led to.
+            if let Some(thinking) = thinkings.get(index) {
+                if !thinking.is_empty() {
+                    content.push(ContentBlock::Thinking {
+                        text: thinking.clone(),
+                        signature: None,
+                    });
+                }
+            }
+            if let Some(text) = texts.get(index) {
+                if !text.is_empty() {
+                    content.push(ContentBlock::text(text.clone()));
+                }
+            }
+        }
+        for (_, name, args) in &tools {
+            if name.is_empty() && args.is_empty() {
+                continue;
+            }
+            content.push(ContentBlock::ToolUse {
+                id: String::new(),
+                name: name.clone(),
+                input: serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({})),
+            });
+        }
+
+        ChatResponse {
+            id,
+            model,
+            content,
+            stop_reason,
+            usage,
+        }
+    }
+}
+
+/// Make sure a per-index list is long enough to hold `index`.
+fn grow<T: Default>(list: &mut Vec<T>, index: usize) {
+    while list.len() <= index {
+        list.push(T::default());
+    }
 }
 
 /// A normalised streaming event. The shape follows Anthropic's event

@@ -19,6 +19,9 @@ services:
       LOCAL_ROUTER_LOG: ${LOCAL_ROUTER_LOG:-info}
     volumes:
       - local-router-data:/data
+      # 想在容器里用本机 WorkBuddy 登录态（需宿主是 macOS）：
+      # - /Users/<你>/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info:/workbuddy/auth/workbuddy-desktop.info:ro
+      # 并设 LOCAL_ROUTER_WORKBUDDY_SESSION=/workbuddy/auth/workbuddy-desktop.info
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3425/health"]
       interval: 30s

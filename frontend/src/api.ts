@@ -7,6 +7,7 @@ import type {
   Settings,
   Status,
   UsageData,
+  WorkBuddyStatus,
 } from "./types";
 
 // The console needs no key on loopback. When the page is served from a LAN
@@ -78,6 +79,8 @@ export const getModels = () => api<{ models: ModelItem[] }>("/api/models");
 export const getPresets = () => api<{ presets: PresetGroup[] }>("/api/presets");
 export const getUsage = () => api<UsageData>("/api/usage");
 export const getCallerKeys = () => api<{ keys: CallerKey[] }>("/api/caller-keys");
+
+export const getWorkBuddy = () => api<WorkBuddyStatus>("/api/workbuddy");
 
 export async function saveSettings(settings: Settings) {
   return api<{ ok: boolean }>("/api/settings", { method: "PUT", body: settings });
