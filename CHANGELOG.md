@@ -8,6 +8,52 @@
 
 ### Added
 
+- **QwenWork（千问办公）登录态上游**：新增 `qwenwork` provider，走千问办公
+  个人公有云的设备流登录（与桌面客户端同款 COSY 信封协议）。
+  - `local-router qwen login` 打印登录链接，浏览器完成后自动存会话文件
+    （0600）并配好 provider；`local-router qwen status|credits|models`
+    查看登录状态、额度余额（钱包分日常/月度/长期池）与模型。
+  - 每个请求由网关自行 RSA 包 AES 密钥 + MD5 签名 + 乱序 base64 编码，
+    调用方看到的仍是标准入口协议；token 自动续期且不回写磁盘。
+  - 仅支持个人公有云（gateway.qwenwork.cn）；企业版 VPC / PAT 有意不做。
+- **会话与项目观测**：
+  - 会话标题簿：每个会话 id 记住标题（首个用户消息第一行），Usage 页
+    Sessions 子页按会话出账。
+  - 项目注册表：按 agent 上报的工作目录分组（`x-project` / `metadata.cwd`），
+    控制台可改名、配色、设预算、合并重复目录；合并会把 JSONL 与 SQLite
+    里的历史记录一起重键。
+  - 上下文拆解：每个请求记录系统提示 / 工具定义 / 附件 / 对话各占多少
+    token，窗口填充率与缓存友好度评分，Usage 页 Context 子页可视化。
+  - `/api/usage` 返回 `by_session` / `by_agent` / `by_project` / `by_key` /
+    `requests_timeline` / `context` / `quota` 全量字段；前端类型同步对齐
+    （含 `qwenwork` 协议与 `auth` 枚举、settings 新字段）。
+
+### Fixed
+
+- **控制台「按模型」聚合一直是空的**：`usage.db` 的 by-model 查询里
+  `ORDER BY requests` 引用了不存在的列别名（`COUNT(*)` 未命名），SQL 准备
+  失败后被静默吞掉返回空列表；加 `AS requests` 后修复，并有聚合单元测试
+  覆盖（totals / by_day / by_provider / by_model / recent）。
+- **流式上游的整段回复丢了工具调用 id**：`ChatResponse::from_events` 重组
+  tool_use 时未回填 call id，后续 tool_result 无法配对；已修复并有
+  单元测试覆盖。
+- **QwenWork 额度重置时间永远为空**：服务端答 `YYYY-MM-DD HH:MM:SS` 无时区
+  的时间串，此前用要求带时区的 `DateTime::parse_from_str` 解析必然失败；
+  改为按 UTC 读 `NaiveDateTime`。
+- 控制台保存设置时会把后端新字段（`cors_origins`、`workbuddy_auto_checkin`）
+  静默重置：前端 `Settings` 类型补齐这两个字段。
+- **内置预设泄迭代入了一个密钥模板占位符**：`qwenwork` 预设的默认模型列表
+  里混入了 `{{SECRET_…}}` 占位符（编辑工具的模板残留），展开到 provider
+  后会成为一个不存在的模型名；已替换为真实模型 `qwen3-coder-plus`，
+  并有预设清单完整性单元测试守护。
+
+### Changed
+
+- 测试从 79 个增加到 220 个：src/ 内新增 123 个 Rust 原生单元测试
+  （`#[cfg(test)]`，覆盖协议 IR 与四协议往返、COSY 信封、配置、价目、预设、
+  会话、项目、用量聚合与估算、SQLite 存储、URL/帧解析、仪表盘渲染、
+  控制台守卫源校验），tests/ 内新增控制台 API 形状用例（对齐前端
+  types.ts 的每个面板字段）。
 - **WorkBuddy 登录态上游**：新增 `workbuddy` provider，复用本机 WorkBuddy 客户端
   的登录态作为上游凭据。
   - `local-router provider add workbuddy`（无需 key），

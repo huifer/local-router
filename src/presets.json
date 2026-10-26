@@ -7,7 +7,11 @@
       "protocol": "anthropic",
       "base_url": "https://api.anthropic.com",
       "catalog": "anthropic",
-      "default_models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
+      "default_models": [
+        "claude-opus-4-5",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5"
+      ],
       "key_hint": "sk-ant-…",
       "docs": "https://docs.anthropic.com/en/api/getting-started"
     },
@@ -18,7 +22,13 @@
       "protocol": "openai_chat",
       "base_url": "https://api.openai.com/v1",
       "catalog": "openai",
-      "default_models": ["gpt-5.2", "gpt-5.2-mini", "gpt-5.1", "gpt-4.1", "o4-mini"],
+      "default_models": [
+        "gpt-5.2",
+        "gpt-5.2-mini",
+        "gpt-5.1",
+        "gpt-4.1",
+        "o4-mini"
+      ],
       "key_hint": "sk-…",
       "docs": "https://platform.openai.com/docs/api-reference"
     },
@@ -29,7 +39,11 @@
       "protocol": "gemini",
       "base_url": "https://generativelanguage.googleapis.com/v1beta",
       "catalog": "google",
-      "default_models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+      "default_models": [
+        "gemini-2.5-pro",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash"
+      ],
       "key_hint": "AIza…",
       "docs": "https://ai.google.dev/gemini-api/docs"
     },
@@ -40,7 +54,10 @@
       "protocol": "openai_chat",
       "base_url": "https://api.deepseek.com/v1",
       "catalog": "deepseek",
-      "default_models": ["deepseek-chat", "deepseek-reasoner"],
+      "default_models": [
+        "deepseek-chat",
+        "deepseek-reasoner"
+      ],
       "key_hint": "sk-…",
       "docs": "https://api-docs.deepseek.com"
     },
@@ -51,7 +68,10 @@
       "protocol": "openai_chat",
       "base_url": "https://api.moonshot.cn/v1",
       "catalog": "moonshotai",
-      "default_models": ["kimi-k2-0905-preview", "moonshot-v1-128k"],
+      "default_models": [
+        "kimi-k2-0905-preview",
+        "moonshot-v1-128k"
+      ],
       "key_hint": "sk-…",
       "docs": "https://platform.moonshot.cn/docs"
     },
@@ -62,7 +82,11 @@
       "protocol": "openai_chat",
       "base_url": "https://open.bigmodel.cn/api/paas/v4",
       "catalog": "zhipuai",
-      "default_models": ["glm-4.6", "glm-4.5-air", "glm-4.5-flash"],
+      "default_models": [
+        "glm-4.6",
+        "glm-4.5-air",
+        "glm-4.5-flash"
+      ],
       "key_hint": "…",
       "docs": "https://open.bigmodel.cn/dev/api"
     },
@@ -73,7 +97,11 @@
       "protocol": "openai_chat",
       "base_url": "https://api.minimaxi.com/v1",
       "catalog": "minimax",
-      "default_models": ["MiniMax-M2.1", "MiniMax-M2", "MiniMax-M2.5"],
+      "default_models": [
+        "MiniMax-M2.1",
+        "MiniMax-M2",
+        "MiniMax-M2.5"
+      ],
       "key_hint": "eyJ…",
       "docs": "https://platform.minimaxi.com/document"
     },
@@ -84,7 +112,11 @@
       "protocol": "openai_chat",
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
       "catalog": "alibaba",
-      "default_models": ["qwen3-max", "qwen3-coder-plus", "qwen-plus"],
+      "default_models": [
+        "qwen3-max",
+        "qwen3-coder-plus",
+        "qwen-plus"
+      ],
       "key_hint": "sk-…",
       "docs": "https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope"
     },
@@ -95,7 +127,10 @@
       "protocol": "openai_chat",
       "base_url": "https://api.stepfun.com/v1",
       "catalog": "stepfun-ai",
-      "default_models": ["step-3.5-flash", "step-2-mini"],
+      "default_models": [
+        "step-3.5-flash",
+        "step-2-mini"
+      ],
       "key_hint": "…",
       "docs": "https://platform.stepfun.com/docs"
     },
@@ -106,7 +141,10 @@
       "protocol": "openai_chat",
       "base_url": "https://ark.cn-beijing.volces.com/api/v3",
       "catalog": "volcengine",
-      "default_models": ["doubao-seed-1-6", "doubao-seed-1-6-lite"],
+      "default_models": [
+        "doubao-seed-1-6",
+        "doubao-seed-1-6-lite"
+      ],
       "key_hint": "…",
       "docs": "https://www.volcengine.com/docs/82379"
     },
@@ -117,7 +155,10 @@
       "protocol": "openai_chat",
       "base_url": "https://api.groq.com/openai/v1",
       "catalog": "groq",
-      "default_models": ["llama-3.3-70b-versatile", "qwen-3-32b"],
+      "default_models": [
+        "llama-3.3-70b-versatile",
+        "qwen-3-32b"
+      ],
       "key_hint": "gsk_…",
       "docs": "https://console.groq.com/docs/openai"
     },
@@ -128,7 +169,11 @@
       "protocol": "openai_chat",
       "base_url": "https://api.x.ai/v1",
       "catalog": "xai",
-      "default_models": ["grok-4", "grok-3", "grok-3-mini"],
+      "default_models": [
+        "grok-4",
+        "grok-3",
+        "grok-3-mini"
+      ],
       "key_hint": "xai-…",
       "docs": "https://docs.x.ai/docs/api-reference"
     },
@@ -139,7 +184,11 @@
       "protocol": "openai_chat",
       "base_url": "https://api.mistral.ai/v1",
       "catalog": "mistral",
-      "default_models": ["mistral-large-latest", "codestral-latest", "ministral-8b-latest"],
+      "default_models": [
+        "mistral-large-latest",
+        "codestral-latest",
+        "ministral-8b-latest"
+      ],
       "key_hint": "…",
       "docs": "https://docs.mistral.ai/api"
     },
@@ -150,7 +199,11 @@
       "protocol": "openai_chat",
       "base_url": "https://api.perplexity.ai",
       "catalog": "perplexity",
-      "default_models": ["sonar", "sonar-pro", "sonar-reasoning"],
+      "default_models": [
+        "sonar",
+        "sonar-pro",
+        "sonar-reasoning"
+      ],
       "key_hint": "pplx-…",
       "docs": "https://docs.perplexity.ai"
     },
@@ -161,7 +214,10 @@
       "protocol": "openai_chat",
       "base_url": "https://qianfan.baidubce.com/v2",
       "catalog": "baidu",
-      "default_models": ["ernie-4.5-turbo-128k", "ernie-4.5-8k"],
+      "default_models": [
+        "ernie-4.5-turbo-128k",
+        "ernie-4.5-8k"
+      ],
       "key_hint": "bce-…",
       "docs": "https://cloud.baidu.com/doc/WENXINWORKSHOP"
     },
@@ -172,7 +228,10 @@
       "protocol": "openai_chat",
       "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
       "catalog": "tencent",
-      "default_models": ["hunyuan-turbos-latest", "hunyuan-a13b"],
+      "default_models": [
+        "hunyuan-turbos-latest",
+        "hunyuan-a13b"
+      ],
       "key_hint": "…",
       "docs": "https://cloud.tencent.com/document/product/1729"
     },
@@ -183,7 +242,10 @@
       "protocol": "openai_chat",
       "base_url": "https://api.modelarts-maas.com/v1",
       "catalog": "huawei",
-      "default_models": ["deepseek-v3.2", "qwen3-235b-a22b"],
+      "default_models": [
+        "deepseek-v3.2",
+        "qwen3-235b-a22b"
+      ],
       "key_hint": "…",
       "docs": "https://support.huaweicloud.com/modelarts"
     },
@@ -273,15 +335,40 @@
       "chat_path": "/v2/chat/completions",
       "auth": "workbuddy",
       "stream_only": true,
-      "media_models": ["hunyuan-image-v3.0-art", "kling-video-v3", "minimax-video-h3"],
+      "media_models": [
+        "hunyuan-image-v3.0-art",
+        "kling-video-v3",
+        "minimax-video-h3"
+      ],
       "media_paths": {
         "image_generations": "/v2/images/generations",
         "image_edits": "/v2/images/edits",
         "video_create": "/v2/videos/generations"
       },
-      "default_models": ["hy3", "auto", "kimi-k2.6", "glm-5.1", "deepseek-v4-flash"],
+      "default_models": [
+        "hy3",
+        "auto",
+        "kimi-k2.6",
+        "glm-5.1",
+        "deepseek-v4-flash"
+      ],
       "key_hint": "(无需 key，使用本机 WorkBuddy 登录态)",
       "docs": "https://www.codebuddy.cn"
+    },
+    {
+      "id": "qwenwork",
+      "name": "QwenWork（千问办公，用本机登录态）",
+      "group": "local",
+      "protocol": "qwenwork",
+      "base_url": "https://gateway.qwenwork.cn",
+      "auth": "qwenwork",
+      "default_models": [
+        "flash",
+        "pro",
+        "qwen3-coder-plus"
+      ],
+      "key_hint": "(无需 key，使用本机 QwenWork 登录态)",
+      "docs": "https://qwenwork.cn"
     },
     {
       "id": "ollama",

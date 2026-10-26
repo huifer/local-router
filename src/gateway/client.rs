@@ -50,6 +50,11 @@ pub fn url_for(base: &str, protocol: Protocol, model: Option<&str>, stream: bool
                 format!("{base}/v1/messages")
             }
         }
+        Protocol::QwenWork => {
+            // Never used: the QwenWork module builds its own URL.
+            let m = model.unwrap_or("flash");
+            format!("{base}/qwenwork/{m}")
+        }
         Protocol::Gemini => {
             let m = model.unwrap_or("gemini-2.5-flash");
             let action = if stream {
@@ -144,6 +149,10 @@ pub fn auth_headers(
             headers.insert("x-goog-api-key".to_string(), key.to_string());
         }
         Protocol::OpenAiChat | Protocol::OpenAiResponses => {
+            headers.insert("authorization".to_string(), format!("Bearer {key}"));
+        }
+        Protocol::QwenWork => {
+            // Never used: the QwenWork module signs its own headers.
             headers.insert("authorization".to_string(), format!("Bearer {key}"));
         }
     }
@@ -294,4 +303,129 @@ pub fn parse_frame(frame: &str) -> Option<Value> {
         return None;
     }
     serde_json::from_str::<Value>(data).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -------------------------------------------------------- url_for --\n
+    #[test]
+    fn url_for_builds_each_protocols_endpoint() {
+        // OpenAI-style bases may already carry /v1.
+        assert_eq!(
+            url_for(
+                "https://api.deepseek.com/v1",
+                Protocol::OpenAiChat,
+                None,
+                false
+            ),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
+        assert_eq!(
+            url_for("https://api.vendor.com", Protocol::OpenAiChat, None, false),
+            "https://api.vendor.com/v1/chat/completions"
+        );
+        assert_eq!(
+            url_for(
+                "https://api.vendor.com/v1",
+                Protocol::OpenAiResponses,
+                None,
+                false
+            ),
+            "https://api.vendor.com/v1/responses"
+        );
+        assert_eq!(
+            url_for("https://api.vendor.com/", Protocol::Anthropic, None, false),
+            "https://api.vendor.com/v1/messages"
+        );
+        // Trailing slashes are trimmed before joining.
+        assert_eq!(
+            url_for(
+                "https://api.vendor.com//",
+                Protocol::OpenAiChat,
+                None,
+                false
+            ),
+            "https://api.vendor.com//v1/chat/completions".replace("//v1", "/v1")
+        );
+    }
+
+    #[test]
+    fn url_for_gemini_switches_action_and_fills_the_model() {
+        assert_eq!(
+            url_for(
+                "https://generativelanguage.googleapis.com/v1beta",
+                Protocol::Gemini,
+                Some("glm-4.6"),
+                true
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/glm-4.6:streamGenerateContent"
+        );
+        assert_eq!(
+            url_for("https://gemini.vendor.com", Protocol::Gemini, None, false),
+            "https://gemini.vendor.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+    }
+
+    #[test]
+    fn auxiliary_and_models_paths_follow_the_v1_family() {
+        assert_eq!(
+            auxiliary_path("https://api.vendor.com/v1", "/images/generations"),
+            "/images/generations"
+        );
+        assert_eq!(
+            auxiliary_path("https://api.vendor.com", "/images/generations"),
+            "/v1/images/generations"
+        );
+        assert_eq!(
+            auxiliary_path("https://api.vendor.com/", "images/edits"),
+            "/v1/images/edits"
+        );
+        assert_eq!(
+            models_url("https://api.vendor.com/v1"),
+            "https://api.vendor.com/v1/models"
+        );
+        assert_eq!(
+            models_url("https://api.vendor.com"),
+            "https://api.vendor.com/v1/models"
+        );
+    }
+
+    // -------------------------------------------------------- frames --\n
+    #[test]
+    fn frames_split_on_lf_lf_and_crlf_crlf() {
+        assert_eq!(find_frame_end("data: {\"a\":1}\n\nrest"), Some((13, 15)));
+        assert_eq!(
+            find_frame_end("data: {\"a\":1}\r\n\r\nrest"),
+            Some((13, 17))
+        );
+        // The earlier terminator wins when both are present.
+        let both = "a\n\nb\r\n\r\n";
+        let (end, next) = find_frame_end(both).unwrap();
+        assert_eq!(&both[..end], "a");
+        assert_eq!(&both[next..], "b\r\n\r\n");
+        assert_eq!(find_frame_end("no terminator here"), None);
+    }
+
+    #[test]
+    fn parse_frame_joins_data_lines_and_skips_sentinels() {
+        assert_eq!(
+            parse_frame("data: {\"x\":1}"),
+            Some(serde_json::json!({"x": 1}))
+        );
+        // Multi-line data is joined with newlines (SSE semantics).
+        let joined = parse_frame("data: {\"a\":\ndata: 1}");
+        assert!(joined.is_some());
+        // A sentinel and an empty frame produce nothing.
+        assert_eq!(parse_frame("data: [DONE]"), None);
+        assert_eq!(parse_frame("event: ping\ndata: "), None);
+        // Broken JSON is dropped, not a panic.
+        assert_eq!(parse_frame("data: {oops"), None);
+        // CRLF line endings survive.
+        assert_eq!(
+            parse_frame("data: {\"y\":2}\r\n"),
+            Some(serde_json::json!({"y": 2}))
+        );
+    }
 }

@@ -27,6 +27,107 @@ use crate::store;
 
 use client::{Target, UpstreamReply};
 
+/// Where the request says its working directory is, if anywhere.
+///
+/// Harnesses differ: some send a dedicated header, some a body field, some
+/// only embed the directory inside Anthropic's `metadata.user_id`. All three
+/// are accepted; the first that says anything wins.
+fn request_project_dir(body: &Value, headers: &HeaderMap) -> Option<String> {
+    // A header is the most explicit: `x-project: /path` or `x-cwd: /path`.
+    for name in ["x-project", "x-project-dir", "x-cwd"] {
+        if let Some(v) = headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(v);
+        }
+    }
+    // A body field the agent chose to add.
+    for pointer in ["/metadata/cwd", "/metadata/project_dir", "/cwd"] {
+        if let Some(v) = body
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Claude Code packs its working directory into the session id it sends as
+/// `metadata.user_id`: `user_<hash>__account__<uuid>__cwd_<path>`. Pull the
+/// path out so those requests group into projects too.
+fn extract_cwd_from_session(session: &str) -> Option<String> {
+    let marker = "__cwd_";
+    let pos = session.find(marker)?;
+    let dir = session[pos + marker.len()..].trim();
+    (!dir.is_empty() && dir.starts_with('/') || dir.starts_with('~')).then(|| dir.to_string())
+}
+
+/// Turn a caller's User-Agent into the coding agent it is, when it is one.
+///
+/// Agents that route through the gateway send their own User-Agent (Claude
+/// Code, Codex, Gemini CLI, Pi, OpenCode…). magpie groups usage by agent; this
+/// names the agent so the Usage page can do the same. A generic HTTP client
+/// or browser maps to `None` and is shown as "unknown".
+fn agent_from_user_agent(ua: &str) -> Option<String> {
+    let ua = ua.to_ascii_lowercase();
+    let known = [
+        "claude",
+        "codex",
+        "gemini-cli",
+        "gemini_code",
+        "opencode",
+        "pi/",
+        "pi ",
+        "cursor",
+        "aider",
+        "continue",
+        "cline",
+        "goose",
+        "copilot",
+        "crush",
+        "openrouter",
+        "zed",
+        "windsurf",
+        "trae",
+        "qwen",
+        "zai",
+    ];
+    for token in known {
+        if ua.contains(token) {
+            // The agent's own short name, as the Usage page labels it.
+            let name = match token {
+                "claude" => "claude-code",
+                "codex" => "codex",
+                "gemini-cli" | "gemini_code" => "gemini-cli",
+                "pi/" | "pi " => "pi",
+                "copilot" => "copilot",
+                "opencode" => "opencode",
+                "cursor" => "cursor",
+                "aider" => "aider",
+                "continue" => "continue",
+                "cline" => "cline",
+                "goose" => "goose",
+                "crush" => "crush",
+                "openrouter" => "openrouter",
+                "zed" => "zed",
+                "windsurf" => "windsurf",
+                "trae" => "trae",
+                "qwen" => "qwen",
+                "zai" => "zai",
+                _ => token,
+            };
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 #[derive(Clone)]
 struct MediaTask {
     target: Target,
@@ -1119,6 +1220,12 @@ async fn handle(
         Protocol::OpenAiResponses => openai_responses::parse_request(&value),
         Protocol::Anthropic => anthropic::parse_request(&value),
         Protocol::Gemini => gemini::parse_request(&value),
+        // A QwenWork request is parsed upstream and never reaches here.
+        Protocol::QwenWork => {
+            return error_response(&ApiError::BadRequest(
+                "a QwenWork request must name a qwenwork provider".into(),
+            ))
+        }
     };
     let mut request = match parsed {
         Ok(r) => r,
@@ -1145,6 +1252,38 @@ async fn handle(
         .map(|s| s.to_string());
     request.session_id = session.clone();
 
+    // The context breakdown: how full this request's window is, by source.
+    // Captured once here from the already-parsed request, then copied into
+    // every usage record the request produces (success or each failure).
+    let context = crate::gateway::usage::measure_request_context(
+        &request.system,
+        &request.tools,
+        &request.messages,
+        0,
+    );
+    // Remember the session so the Usage page can title it; the title is the
+    // first user message's opening line, the way a chat thread is named.
+    if let Some(id) = &session {
+        let title = request
+            .messages
+            .iter()
+            .find(|m| matches!(m.role, crate::protocol::ir::Role::User))
+            .and_then(|m| m.text().lines().next().map(|s| s.to_string()));
+        crate::sessions::note(id, title.as_deref());
+    }
+
+    // The project the request belongs to: the working directory the agent
+    // ran from. Agents report it when they know it — a `metadata.user_id` of
+    // the Anthropic `user_xxx__account__cwd_...` shape, a `metadata.cwd`, or
+    // an `x-project` / `x-cwd` header. The first seen becomes the project's
+    // key in the registry, where the user can rename and budget it.
+    let project_dir = request_project_dir(&value, &headers)
+        .or_else(|| session.as_deref().and_then(extract_cwd_from_session));
+    request.project = project_dir.clone();
+    if let Some(dir) = &project_dir {
+        crate::projects::note(dir);
+    }
+
     let (plan, send_agent_ua) = {
         let config = g.state.config.read().await;
         match g
@@ -1163,6 +1302,21 @@ async fn handle(
         .get("user-agent")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
+
+    // A QwenWork (千问办公) request is built and COSY-signed by the local
+    // `qwen` module; it never travels the generic OpenAI path. Route it the
+    // moment a QwenWork provider is in the plan, before the generic loop.
+    if plan.targets.iter().any(|t| t.provider_id == "qwenwork") {
+        return qwen_attempt(
+            &g,
+            protocol,
+            &request,
+            &plan,
+            agent_user_agent.as_deref(),
+            &context,
+        )
+        .await;
+    }
 
     let mut last_error: ApiError = ApiError::Upstream("no target could answer".into());
     for target in plan.targets.clone() {
@@ -1201,6 +1355,7 @@ async fn handle(
                 &provider,
                 agent_user_agent.as_deref(),
                 send_agent_ua,
+                &context,
             )
             .await
         } else {
@@ -1213,6 +1368,7 @@ async fn handle(
                 &provider,
                 agent_user_agent.as_deref(),
                 send_agent_ua,
+                &context,
             )
             .await
         };
@@ -1335,6 +1491,7 @@ fn upstream_body(request: &ChatRequest, protocol: Protocol, model: &str) -> Valu
         Protocol::OpenAiResponses => openai_responses::format_request(request, model),
         Protocol::Anthropic => anthropic::format_request(request, model),
         Protocol::Gemini => gemini::format_request(request, model),
+        Protocol::QwenWork => openai_chat::format_request(request, model),
     }
 }
 
@@ -1345,6 +1502,7 @@ fn upstream_response(protocol: Protocol, payload: &Value) -> ApiResult<ChatRespo
         Protocol::OpenAiResponses => openai_responses::parse_response(payload),
         Protocol::Anthropic => anthropic::parse_response(payload),
         Protocol::Gemini => gemini::parse_response(payload),
+        Protocol::QwenWork => openai_chat::parse_response(payload),
     }
 }
 
@@ -1355,6 +1513,155 @@ fn downstream_response(protocol: Protocol, response: &ChatResponse, model: &str)
         Protocol::OpenAiResponses => openai_responses::format_response(response, model),
         Protocol::Anthropic => anthropic::format_response(response, model),
         Protocol::Gemini => gemini::format_response(response, model),
+        Protocol::QwenWork => openai_chat::format_response(response, model),
+    }
+}
+
+/// One QwenWork (千问办公) request: build the chat body from the caller's
+/// IR, sign and send it through the local `qwen` module, and render the
+/// COSY SSE reply back as the caller's protocol.
+///
+/// QwenWork always answers a stream, so a caller that asked for one whole
+/// reply gets the events folded back together.
+async fn qwen_attempt(
+    g: &Gateway,
+    caller_protocol: Protocol,
+    request: &ChatRequest,
+    plan: &RoutePlan,
+    agent_user_agent: Option<&str>,
+    context: &usage::ContextBreakdown,
+) -> Response {
+    let session = match crate::qwen::login::session().await {
+        Ok(s) => s,
+        Err(e) => return error_response(&ApiError::Unauthorized(e.to_string())),
+    };
+    let target = match plan.targets.iter().find(|t| t.provider_id == "qwenwork") {
+        Some(t) => t.clone(),
+        None => return error_response(&ApiError::Upstream("no QwenWork target".into())),
+    };
+    let model = target.model.clone();
+    let body = build_qwen_body(request, &model);
+
+    let mut rec = usage::UsageRecord::new(&request.model, "qwenwork");
+    rec.provider = "qwenwork".to_string();
+    rec.key_id = Some(target.key_id.clone());
+    rec.key_label = target.key_label.clone();
+    rec.group = plan.group_id.clone();
+    rec.session_id = request.session_id.clone();
+    rec.project = request.project.clone();
+    rec.agent = agent_user_agent.and_then(agent_from_user_agent);
+    rec.context = Some(context.clone());
+    let started = Instant::now();
+    let usage_path = g.state.usage_path();
+    let record = g.state.config.read().await.settings.record_usage;
+    let sqlite = g.sqlite.clone();
+
+    let events = match crate::qwen::client::chat(&session, &body).await {
+        Ok(events) => events,
+        Err(err) => {
+            let mut rec = rec;
+            rec.ok = false;
+            rec.error = Some(err.to_string());
+            rec.latency_ms = started.elapsed().as_millis() as u64;
+            if record {
+                crate::pricing::price_record(&mut rec);
+                if let Some(store) = &sqlite {
+                    store.record(&rec);
+                }
+                usage::record(&usage_path, &rec);
+            }
+            return error_response(&ApiError::Upstream(err.to_string()));
+        }
+    };
+
+    // Record usage from the final events, then render.
+    for ev in &events {
+        rec.note_usage(ev);
+    }
+
+    if request.stream {
+        events_to_stream(
+            events,
+            caller_protocol,
+            request.model.clone(),
+            rec,
+            usage_path,
+            record,
+            started,
+            sqlite,
+        )
+    } else {
+        let parsed = ChatResponse::from_events(&events);
+        g.router.note_used(&request.model).await;
+        Json(downstream_response(
+            caller_protocol,
+            &parsed,
+            &request.model,
+        ))
+        .into_response()
+    }
+}
+
+/// Build a QwenWork chat body from the caller's normalized request.
+fn build_qwen_body(request: &ChatRequest, model: &str) -> crate::qwen::client::QwenChatBody {
+    let system: Vec<String> = request
+        .system
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    let messages: Vec<crate::qwen::client::QwenMessage> = request
+        .messages
+        .iter()
+        .map(|m| {
+            let content: Vec<crate::qwen::client::QwenContent> = match m.content.as_slice() {
+                [ContentBlock::Text { text }] => {
+                    vec![crate::qwen::client::QwenContent::Text(text.clone())]
+                }
+                [ContentBlock::Image { data, .. }] => {
+                    vec![crate::qwen::client::QwenContent::Image(format!(
+                        "data:image/png;base64,{data}"
+                    ))]
+                }
+                _ => vec![],
+            };
+            crate::qwen::client::QwenMessage {
+                role: match m.role {
+                    crate::protocol::ir::Role::System => "system",
+                    crate::protocol::ir::Role::User => "user",
+                    crate::protocol::ir::Role::Assistant => "assistant",
+                    crate::protocol::ir::Role::Tool => "tool",
+                }
+                .to_string(),
+                content,
+            }
+        })
+        .collect();
+    let tools: Vec<Value> = request
+        .tools
+        .iter()
+        .map(|t| {
+            json!({
+                "function": {
+                    "name": t.name,
+                    "description": t.description.clone().unwrap_or_default(),
+                    "parameters": t.input_schema,
+                }
+            })
+        })
+        .collect();
+    crate::qwen::client::QwenChatBody {
+        model: model.to_string(),
+        messages,
+        system,
+        tools,
+        max_tokens: request.max_tokens,
+        enable_thinking: request
+            .reasoning_effort
+            .map(|e| !matches!(e, ReasoningEffort::None))
+            .unwrap_or(false),
     }
 }
 
@@ -1369,12 +1676,17 @@ async fn whole_attempt(
     provider: &Provider,
     agent_user_agent: Option<&str>,
     send_agent_ua: bool,
+    context: &usage::ContextBreakdown,
 ) -> Result<Response, (ApiError, usage::UsageRecord)> {
     let mut rec = usage::UsageRecord::new(&request.model, target.protocol.as_str());
     rec.provider = target.provider_id.clone();
     rec.key_id = Some(target.key_id.clone());
     rec.key_label = target.key_label.clone();
     rec.group = plan.group_id.clone();
+    rec.session_id = request.session_id.clone();
+    rec.project = request.project.clone();
+    rec.agent = agent_user_agent.and_then(agent_from_user_agent);
+    rec.context = Some(context.clone());
 
     let mut body = upstream_body(request, target.protocol, &target.model);
     // A vendor that only answers streaming requests is asked for a stream
@@ -1457,7 +1769,7 @@ async fn whole_attempt(
 
     let record = g.state.config.read().await.settings.record_usage;
     if record {
-        usage::record(&g.state.usage_path(), &rec);
+        persist_usage(&g.state, &g.sqlite, &rec);
     }
     Ok(Json(outbound).into_response())
 }
@@ -1473,12 +1785,17 @@ async fn stream_attempt(
     provider: &Provider,
     agent_user_agent: Option<&str>,
     send_agent_ua: bool,
+    context: &usage::ContextBreakdown,
 ) -> Result<Response, (ApiError, usage::UsageRecord)> {
     let mut rec = usage::UsageRecord::new(&request.model, target.protocol.as_str());
     rec.provider = target.provider_id.clone();
     rec.key_id = Some(target.key_id.clone());
     rec.key_label = target.key_label.clone();
     rec.group = plan.group_id.clone();
+    rec.session_id = request.session_id.clone();
+    rec.project = request.project.clone();
+    rec.agent = agent_user_agent.and_then(agent_from_user_agent);
+    rec.context = Some(context.clone());
 
     let mut body = upstream_body(request, target.protocol, &target.model);
     if provider.stream_only {
@@ -1646,6 +1963,7 @@ async fn collect_stream(mut upstream: client::ByteStream, protocol: Protocol) ->
         Protocol::OpenAiResponses => Box::new(openai_responses::Collector::new()),
         Protocol::Anthropic => Box::new(anthropic::Collector::new()),
         Protocol::Gemini => Box::new(gemini::Collector::new()),
+        Protocol::QwenWork => Box::new(openai_chat::Collector::new()),
     };
     let mut events: Vec<StreamEvent> = Vec::new();
     let mut buffer = String::new();
@@ -1769,6 +2087,7 @@ fn build_stream(
             Protocol::OpenAiResponses => Box::new(openai_responses::Collector::new()),
             Protocol::Anthropic => Box::new(anthropic::Collector::new()),
             Protocol::Gemini => Box::new(gemini::Collector::new()),
+            Protocol::QwenWork => Box::new(openai_chat::Collector::new()),
         };
         let mut renderer = make_renderer(caller_protocol, id.clone(), asked_model.clone());
         let mut events: Vec<StreamEvent> = Vec::new();
@@ -1841,6 +2160,10 @@ fn make_renderer(protocol: Protocol, id: String, model: String) -> Rendered {
         }
         Protocol::Gemini => {
             let mut r = gemini::Renderer::new(id, model);
+            Box::new(move |ev| r.render(ev))
+        }
+        Protocol::QwenWork => {
+            let mut r = openai_chat::Renderer::new(id, model);
             Box::new(move |ev| r.render(ev))
         }
     }

@@ -67,6 +67,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/caller-keys/{id}", delete(api_delete_caller_key))
         .route("/api/usage", get(api_usage))
+        .route("/api/projects", get(api_projects).patch(api_update_project))
+        .route("/api/projects/merge", post(api_merge_projects))
+        // Project ids are directories; a directory cannot ride in one path
+        // segment (the %2F is decoded before routing), so an edit takes the
+        // id as a query parameter instead.
         .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
 }
@@ -1086,10 +1091,11 @@ async fn api_delete_caller_key(
 
 // ------------------------------------------------------------------ usage --
 
-async fn api_usage(
-    State(state): State<AppState>,
-    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
-) -> Json<Value> {
+/// How far back to look, and in what money.
+type UsageWindow = (i64, String);
+
+/// The shape the Usage page asks for: how far back, and in what money.
+fn usage_query(query: &BTreeMap<String, String>) -> UsageWindow {
     let period = query.get("period").map(|s| s.as_str()).unwrap_or("7d");
     let days: i64 = match period {
         "today" | "24h" => 1,
@@ -1097,117 +1103,490 @@ async fn api_usage(
         "all" => 36500,
         _ => 7,
     };
+    let currency = query
+        .get("currency")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "usd".to_string());
+    (days, currency)
+}
+
+async fn api_usage(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let (days, currency) = usage_query(&query);
     let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
 
-    // The queries come from SQLite when it is on; the JSONL log is the
-    // fallback for a gateway that runs with it off.
-    let (totals, by_model, by_provider, by_day, recent) = if let Some(store) = &state.sqlite {
-        let totals = store
-            .totals_since(&cutoff)
-            .map(|row| {
-                json!({
-                    "requests": row.requests,
-                    "failed": row.failed,
-                    "input_tokens": row.input_tokens,
-                    "output_tokens": row.output_tokens,
-                    "cache_read_tokens": row.cache_read_tokens,
-                    "cache_write_tokens": row.cache_write_tokens,
-                    "reasoning_tokens": row.reasoning_tokens,
-                    "cost_usd": row.cost_usd.unwrap_or(0.0),
-                    "credits": row.credits.unwrap_or(0.0),
-                    "unpriced": 0,
-                })
+    // One owned copy of the records, newest last, from either store.
+    let use_sqlite = state.sqlite.is_some();
+    let records: Vec<usage::UsageRecord> = if let Some(store) = &state.sqlite {
+        store.all_since(&cutoff)
+    } else {
+        usage::read_all(&state.usage_path())
+            .into_iter()
+            .filter(|r| r.time.as_str() >= cutoff.as_str())
+            .collect()
+    };
+    // Reuse the legacy `recent` order (newest first) for the request log.
+    let recent: Vec<Value> = records
+        .iter()
+        .rev()
+        .take(200)
+        .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
+        .collect();
+
+    // Aggregate every dimension from the same records, so the page never
+    // shows a field the backend forgot to fill.
+    let totals = usage::totals(&records);
+    let by_model = usage::group_by(&records, |r| r.model.clone());
+    let by_provider = usage::group_by(&records, |r| r.provider.clone());
+    let _ = &by_provider;
+    let by_day = usage::by_day(&records);
+    let by_session = usage::group_by(&records, |r| r.session_id.clone().unwrap_or_default());
+    let by_agent = usage::group_by(&records, |r| {
+        r.agent.clone().unwrap_or_else(|| "unknown".into())
+    });
+    let by_project = usage::group_by(&records, |r| r.project.clone().unwrap_or_default());
+    let by_key = usage::group_by(&records, |r| {
+        r.key_label
+            .clone()
+            .or_else(|| r.key_id.clone())
+            .unwrap_or_else(|| "default".into())
+    });
+
+    // Per-hour request counts for the Requests timeline (line/bar toggle).
+    let mut hour_map: BTreeMap<String, u64> = BTreeMap::new();
+    for r in &records {
+        let hour = r.time.chars().take(13).collect::<String>();
+        *hour_map.entry(hour).or_insert(0) += 1;
+    }
+    let requests_timeline: Vec<Value> = hour_map
+        .into_iter()
+        .map(|(hour, count)| json!({ "hour": hour, "requests": count }))
+        .collect();
+
+    // Per-provider cost, as a map (the legacy by_provider_costs field, now
+    // actually returned so the platform-cost panels render).
+    let by_provider_costs: BTreeMap<String, usage::Totals> = by_provider.iter().cloned().collect();
+
+    // Context: average fill ratio and score per provider, over the requests
+    // that carried a breakdown. Values: (count, sum_fill, system, tool, file,
+    // conversation, cache_read).
+    type CtxAgg = (u64, f64, u64, u64, u64, u64, u64);
+    let mut ctx_providers: BTreeMap<String, CtxAgg> = BTreeMap::new();
+    let mut ctx_total = (0u64, 0u64, 0u64, 0u64);
+    for r in &records {
+        if let Some(ctx) = &r.context {
+            ctx_total.0 += ctx.system_tokens;
+            ctx_total.1 += ctx.tool_tokens;
+            ctx_total.2 += ctx.file_tokens;
+            ctx_total.3 += ctx.conversation_tokens;
+            let entry = ctx_providers.entry(r.provider.clone()).or_default();
+            entry.0 += 1;
+            entry.1 += ctx.fill_ratio();
+            entry.2 += ctx.system_tokens;
+            entry.3 += ctx.tool_tokens;
+            entry.4 += ctx.file_tokens;
+            entry.5 += ctx.conversation_tokens;
+            entry.6 += ctx.cache_read_tokens;
+        }
+    }
+    let context = json!({
+        "by_provider": ctx_providers
+            .into_iter()
+            .map(|(provider, e)| json!({
+                "provider": provider,
+                "requests": e.0,
+                "avg_fill": if e.0 > 0 { e.1 / e.0 as f64 } else { 0.0 },
+                "system_tokens": e.2,
+                "tool_tokens": e.3,
+                "file_tokens": e.4,
+                "conversation_tokens": e.5,
+                "cache_read_tokens": e.6,
+            }))
+            .collect::<Vec<_>>(),
+        "totals": {
+            "system_tokens": ctx_total.0,
+            "tool_tokens": ctx_total.1,
+            "file_tokens": ctx_total.2,
+            "conversation_tokens": ctx_total.3,
+        },
+        "captured": records.iter().any(|r| r.context.is_some()),
+    });
+
+    // Sessions: title each session id from the session book.
+    let sessions = crate::sessions::load();
+    let by_session_json: Vec<Value> = by_session
+        .into_iter()
+        .filter(|(id, _)| !id.is_empty())
+        .map(|(id, t)| {
+            let session = sessions.sessions.get(&id);
+            json!({
+                "id": id,
+                "title": session.map(|s| s.title.clone()).filter(|s| !s.is_empty()).unwrap_or_else(|| id.clone()),
+                "requests": t.requests,
+                "input_tokens": t.input_tokens,
+                "output_tokens": t.output_tokens,
+                "cost_usd": t.cost_usd,
+                "credits": t.credits,
+                "failed": t.failed,
+                "last_seen": session.map(|s| s.last_seen.clone()).unwrap_or_default(),
             })
-            .unwrap_or(json!({"requests": 0}));
-        let map_row = |row: &crate::store::AggregateRow| {
-            json!([
-                row.label.clone().unwrap_or_default(),
-                {
-                    "requests": row.requests,
-                    "failed": row.failed,
-                    "input_tokens": row.input_tokens,
-                    "output_tokens": row.output_tokens,
-                    "cache_read_tokens": row.cache_read_tokens,
-                    "cache_write_tokens": row.cache_write_tokens,
-                    "reasoning_tokens": row.reasoning_tokens,
-                    "cost_usd": row.cost_usd.unwrap_or(0.0),
-                    "credits": row.credits.unwrap_or(0.0),
-                    "unpriced": 0,
-                }
-            ])
-        };
-        let by_model: Vec<Value> = store.by_model_since(&cutoff).iter().map(map_row).collect();
-        let by_provider: Vec<Value> = store
-            .by_provider_since(&cutoff)
-            .iter()
-            .map(map_row)
-            .collect();
-        let by_day: Vec<Value> = store
-            .by_day_since(&cutoff)
-            .iter()
-            .map(|row| {
+        })
+        .collect();
+
+    let totals_json = json!({
+        "requests": totals.requests,
+        "failed": totals.failed,
+        "input_tokens": totals.input_tokens,
+        "output_tokens": totals.output_tokens,
+        "cache_read_tokens": totals.cache_read_tokens,
+        "cache_write_tokens": totals.cache_write_tokens,
+        "reasoning_tokens": totals.reasoning_tokens,
+        "cost_usd": totals.cost_usd,
+        "credits": totals.credits,
+        "unpriced": totals.unpriced,
+    });
+    let map_to_array = |rows: Vec<(String, usage::Totals)>| {
+        rows.into_iter()
+            .map(|(label, t)| {
                 json!([
-                    row.day.clone().unwrap_or_default(),
+                    label,
                     {
-                        "requests": row.requests,
-                        "failed": row.failed,
-                        "input_tokens": row.input_tokens,
-                        "output_tokens": row.output_tokens,
-                        "cost_usd": row.cost_usd.unwrap_or(0.0),
-                        "credits": row.credits.unwrap_or(0.0),
+                        "requests": t.requests,
+                        "failed": t.failed,
+                        "input_tokens": t.input_tokens,
+                        "output_tokens": t.output_tokens,
+                        "cache_read_tokens": t.cache_read_tokens,
+                        "cache_write_tokens": t.cache_write_tokens,
+                        "reasoning_tokens": t.reasoning_tokens,
+                        "cost_usd": t.cost_usd,
+                        "credits": t.credits,
+                        "unpriced": t.unpriced,
                     }
                 ])
             })
-            .collect();
-        let recent: Vec<Value> = store
-            .recent(&cutoff, 200)
-            .iter()
-            .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
-            .collect();
-        (
-            totals,
-            Value::Array(by_model),
-            Value::Array(by_provider),
-            Value::Array(by_day),
-            recent,
-        )
-    } else {
-        let records = usage::read_all(&state.usage_path());
-        let records: Vec<_> = records
-            .into_iter()
-            .filter(|r| r.time.as_str() >= cutoff.as_str())
-            .collect();
-        let totals = usage::totals(&records);
-        let by_model = usage::group_by(&records, |r| r.model.clone());
-        let by_provider = usage::group_by(&records, |r| r.provider.clone());
-        let _by_provider_costs: BTreeMap<String, usage::Totals> =
-            usage::group_by(&records, |r| r.provider.clone())
-                .into_iter()
-                .collect();
-        let by_day = usage::by_day(&records);
-        let recent: Vec<Value> = records
-            .iter()
-            .rev()
-            .take(200)
-            .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
-            .collect();
-        (
-            serde_json::to_value(totals).unwrap_or(json!({})),
-            serde_json::to_value(by_model).unwrap_or(json!([])),
-            serde_json::to_value(by_provider).unwrap_or(json!([])),
-            serde_json::to_value(by_day).unwrap_or(json!([])),
-            recent,
-        )
+            .collect::<Vec<_>>()
     };
+    let by_model_json = map_to_array(by_model);
+    let by_provider_json = map_to_array(by_provider);
+    let by_agent_json = map_to_array(by_agent);
+    let by_key_json = map_to_array(by_key);
+    let by_project_json = map_to_array(by_project);
+    let by_day_json = by_day
+        .into_iter()
+        .map(|(day, t)| {
+            json!([
+                day,
+                {
+                    "requests": t.requests,
+                    "failed": t.failed,
+                    "input_tokens": t.input_tokens,
+                    "output_tokens": t.output_tokens,
+                    "cost_usd": t.cost_usd,
+                    "credits": t.credits,
+                }
+            ])
+        })
+        .collect::<Vec<_>>();
 
     Json(json!({
-        "totals": totals,
-        "by_model": by_model,
-        "by_provider": by_provider,
-        "by_day": by_day,
+        "storage": if use_sqlite { "sqlite" } else { "jsonl" },
+        "currency": currency,
+        "totals": totals_json,
+        "by_model": by_model_json,
+        "by_provider": by_provider_json,
+        "by_provider_costs": by_provider_costs,
+        "by_agent": by_agent_json,
+        "by_key": by_key_json,
+        "by_project": by_project_json,
+        "by_day": by_day_json,
+        "by_session": by_session_json,
+        "requests_timeline": requests_timeline,
+        "context": context,
+        "quota": quota_summary(&state).await,
         "recent": recent,
-        "storage": if state.sqlite.is_some() { "sqlite" } else { "jsonl" },
     }))
+}
+
+/// The quota summary for the Usage page's Quota panel. Reads the WorkBuddy
+/// account when it is configured; every other provider reports no quota (it
+/// bills by token, not by window) and is listed as unlimited.
+async fn quota_summary(state: &AppState) -> Value {
+    let config = state.config.read().await;
+    let mut accounts: Vec<Value> = Vec::new();
+    for provider in &config.providers {
+        if !provider.uses_session() {
+            accounts.push(json!({
+                "provider": provider.id,
+                "name": provider.name,
+                "kind": "token",
+                "windows": [],
+                "unlimited": true,
+            }));
+            continue;
+        }
+        match crate::workbuddy::quota().await {
+            Ok(q) => accounts.push(json!({
+                "provider": q.provider,
+                "name": q.name,
+                "kind": q.kind,
+                "user": q.user,
+                "windows": q.windows
+                    .iter()
+                    .map(|w| json!({
+                        "name": w.name,
+                        "used": w.used,
+                        "remaining": w.remaining,
+                        "resets_at": w.resets_at,
+                        "display": w.display,
+                        "unit": w.unit,
+                        "unlimited": w.unlimited(),
+                        "holds_why": w.holds_why,
+                    }))
+                    .collect::<Vec<_>>(),
+                "unlimited": false,
+                "read_at": q.read_at,
+            })),
+            Err(err) => accounts.push(json!({
+                "provider": provider.id,
+                "name": provider.name,
+                "kind": "token",
+                "windows": [],
+                "unlimited": true,
+                "error": err.to_string(),
+            })),
+        }
+    }
+    json!(accounts)
+}
+
+// ---------------------------------------------------------------- projects --
+
+/// One project row on the Usage page: the registry entry joined with what
+/// the period's requests charged it.
+#[derive(serde::Serialize)]
+struct ProjectRow {
+    id: String,
+    name: String,
+    color: String,
+    created_at: String,
+    budget_tokens: Option<u64>,
+    budget_cost: Option<f64>,
+    requests: u64,
+    failed: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cost_usd: f64,
+    credits: f64,
+    last_seen: String,
+}
+
+async fn project_rows(state: &AppState, days: i64) -> Vec<ProjectRow> {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let records: Vec<usage::UsageRecord> = if let Some(store) = &state.sqlite {
+        store.all_since(&cutoff)
+    } else {
+        usage::read_all(&state.usage_path())
+            .into_iter()
+            .filter(|r| r.time.as_str() >= cutoff.as_str())
+            .collect()
+    };
+    type ProjectUsage = (u64, u64, u64, u64, f64, f64, String);
+    let mut usage_by_project: BTreeMap<String, ProjectUsage> = BTreeMap::new();
+    for r in &records {
+        let Some(project) = &r.project else { continue };
+        let entry = usage_by_project
+            .entry(project.clone())
+            .or_insert_with(|| (0, 0, 0, 0, 0.0, 0.0, String::new()));
+        entry.0 += 1;
+        if !r.ok {
+            entry.1 += 1;
+            continue;
+        }
+        entry.2 += r.input_tokens;
+        entry.3 += r.output_tokens;
+        if let Some(usd) = r.cost_usd {
+            entry.4 += usd;
+        }
+        if let Some(c) = r.credits {
+            entry.5 += c;
+        }
+        if r.time.as_str() > entry.6.as_str() {
+            entry.6 = r.time.clone();
+        }
+    }
+    let registry = crate::projects::load();
+    let mut rows: Vec<ProjectRow> = Vec::new();
+    for (id, project) in &registry.projects {
+        let (requests, failed, input_tokens, output_tokens, cost_usd, credits, last_seen) =
+            usage_by_project.remove(id).unwrap_or_default();
+        rows.push(ProjectRow {
+            id: id.clone(),
+            name: project.display_name().to_string(),
+            color: project.color.clone(),
+            created_at: project.created_at.clone(),
+            budget_tokens: project.budget_tokens,
+            budget_cost: project.budget_cost,
+            requests,
+            failed,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            credits,
+            last_seen,
+        });
+    }
+    // A directory usage knows but the registry lost (a cleared projects.json)
+    // still gets a row: the data is honest even when the registry is behind.
+    for (id, (requests, failed, input_tokens, output_tokens, cost_usd, credits, last_seen)) in
+        usage_by_project
+    {
+        rows.push(ProjectRow {
+            id: id.clone(),
+            name: id.clone(),
+            color: "#9ef0bf".to_string(),
+            created_at: String::new(),
+            budget_tokens: None,
+            budget_cost: None,
+            requests,
+            failed,
+            input_tokens,
+            output_tokens,
+            cost_usd,
+            credits,
+            last_seen,
+        });
+    }
+    rows.sort_by(|a, b| {
+        b.cost_usd
+            .total_cmp(&a.cost_usd)
+            .then(b.requests.cmp(&a.requests))
+    });
+    rows
+}
+
+/// The project registry with the period's spend, for the Usage page.
+async fn api_projects(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let (days, _) = usage_query(&query);
+    let rows = project_rows(&state, days).await;
+    Json(json!({ "projects": rows }))
+}
+
+/// Rename a project, recolor it, or set or clear its budgets.
+async fn api_update_project(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+    axum::Json(patch): axum::Json<crate::projects::ProjectPatch>,
+) -> Response {
+    let Some(id) = query.get("id").cloned() else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "id is required"})),
+        )
+            .into_response();
+    };
+    let id = urlencoding_decode(&id);
+    let ok = crate::projects::patch(&id, &patch);
+    if !ok {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "no such project"})),
+        )
+            .into_response();
+    }
+    let (days, _) = usage_query(&query);
+    let rows = project_rows(&state, days).await;
+    Json(json!({ "ok": true, "projects": rows })).into_response()
+}
+
+/// Merge one project into another: the records are re-keyed in both stores.
+async fn api_merge_projects(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    let Some(from) = body.get("from").and_then(Value::as_str) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "from is required"})),
+        )
+            .into_response();
+    };
+    let Some(into) = body.get("into").and_then(Value::as_str) else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "into is required"})),
+        )
+            .into_response();
+    };
+    if !crate::projects::merge(from, into) {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "merge failed: target unknown or same"})),
+        )
+            .into_response();
+    }
+    // Re-key the stored records so the history follows the merge.
+    merge_project_records(&state, from, into);
+    let (days, _) = usage_query(&query);
+    let rows = project_rows(&state, days).await;
+    Json(json!({ "ok": true, "projects": rows })).into_response()
+}
+
+/// Re-key every stored usage record from one project to another.
+fn merge_project_records(state: &AppState, from: &str, into: &str) {
+    let path = state.usage_path();
+    let mut lines = Vec::new();
+    {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        for line in text.lines() {
+            if let Ok(mut rec) = serde_json::from_str::<usage::UsageRecord>(line) {
+                if rec.project.as_deref() == Some(from) {
+                    rec.project = Some(into.to_string());
+                }
+                if let Ok(json) = serde_json::to_string(&rec) {
+                    lines.push(json);
+                }
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+    }
+    if lines.is_empty() {
+        return;
+    }
+    let _ = std::fs::write(&path, lines.join("\n") + "\n");
+    if let Some(store) = &state.sqlite {
+        store.rekey_project(from, into);
+    }
+}
+
+/// Decode a percent-encoded path segment back into a directory. Project ids
+/// are directories, so `/api/projects/~%2Fwork%2Facme` names the same project
+/// the agent reported. A segment without escapes passes through untouched.
+fn urlencoding_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("");
+            if let Ok(v) = u8::from_str_radix(hex, 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A small helper the CLI and the page share.
@@ -1217,4 +1596,49 @@ pub fn provider_map(config: &crate::config::Config) -> BTreeMap<String, String> 
         .iter()
         .map(|p| (p.id.clone(), p.name.clone()))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+
+    fn headers_with_host(host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            axum::http::HeaderValue::from_str(host).unwrap(),
+        );
+        headers
+    }
+
+    #[test]
+    fn an_origin_matching_the_host_is_same_origin() {
+        let headers = headers_with_host("127.0.0.1:3426");
+        assert!(same_origin("http://127.0.0.1:3426", &headers));
+        // The scheme is not compared: a page served over http/https to the
+        // same host is the same site as far as this check goes.
+        assert!(same_origin("https://127.0.0.1:3426", &headers));
+        // Host names are case-insensitive.
+        assert!(same_origin(
+            "http://LOCALHOST:3426",
+            &headers_with_host("localhost:3426")
+        ));
+        // An origin without a scheme still matches (defensive).
+        assert!(same_origin("127.0.0.1:3426", &headers));
+    }
+
+    #[test]
+    fn a_foreign_origin_is_refused() {
+        let headers = headers_with_host("127.0.0.1:3426");
+        assert!(!same_origin("http://evil.example.com", &headers));
+        assert!(!same_origin("http://127.0.0.1:9999", &headers));
+        assert!(!same_origin("http://127.0.0.1.evil.com", &headers));
+    }
+
+    #[test]
+    fn a_missing_host_header_refuses_everything() {
+        let headers = HeaderMap::new();
+        assert!(!same_origin("http://127.0.0.1:3426", &headers));
+    }
 }

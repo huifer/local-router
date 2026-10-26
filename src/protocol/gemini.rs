@@ -768,3 +768,84 @@ impl Renderer {
         frames
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // format ↔ parse round trip: the shape the Gemini CLI sends and reads.
+    #[test]
+    fn a_gemini_request_round_trips_through_the_canonical_shape() {
+        let wire = json!({
+            "model": "glm-4.6",
+            "systemInstruction": {"parts": [{"text": "Be brief."}]},
+            "contents": [
+                {"role": "user", "parts": [{"text": "hello"}]},
+                {"role": "model", "parts": [{"text": "hi"}]},
+                {"role": "user", "parts": [{"text": "bye"}]}
+            ],
+            "generationConfig": {"maxOutputTokens": 123, "temperature": 0.5}
+        });
+        let req = parse_request(&wire).unwrap();
+        assert_eq!(req.model, "glm-4.6");
+        assert_eq!(req.system[0].as_text(), Some("Be brief."));
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(req.max_tokens, Some(123));
+        assert!((req.temperature.unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_formatted_response_carries_gemini_vocabulary() {
+        let resp = ChatResponse {
+            id: "r-1".into(),
+            model: "glm-4.6".into(),
+            content: vec![ContentBlock::text("hello")],
+            stop_reason: Some(StopReason::MaxTokens),
+            usage: Usage {
+                input_tokens: 4,
+                output_tokens: 2,
+                ..Usage::default()
+            },
+        };
+        let wire = format_response(&resp, "glm-4.6");
+        assert_eq!(wire["candidates"][0]["finishReason"], "MAX_TOKENS");
+        assert_eq!(
+            wire["candidates"][0]["content"]["parts"][0]["text"],
+            "hello"
+        );
+        assert_eq!(wire["usageMetadata"]["totalTokenCount"], 6);
+        // And it parses back.
+        let back = parse_response(&wire).unwrap();
+        assert_eq!(back.text(), "hello");
+        assert_eq!(back.stop_reason, Some(StopReason::MaxTokens));
+    }
+
+    #[test]
+    fn tool_calls_and_thinking_render_as_gemini_parts() {
+        let resp = ChatResponse {
+            id: "r-2".into(),
+            model: "m".into(),
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "pondering".into(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "a.rs"}),
+                },
+            ],
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage::default(),
+        };
+        let wire = format_response(&resp, "m");
+        let parts = wire["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap();
+        assert_eq!(parts[0]["thought"], true);
+        assert_eq!(parts[1]["functionCall"]["name"], "read");
+        // ToolUse maps to STOP-with-functionCall, never SAFETY.
+        assert_eq!(wire["candidates"][0]["finishReason"], "STOP");
+    }
+}

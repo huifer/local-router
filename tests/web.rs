@@ -134,3 +134,209 @@ async fn tools_without_an_origin_still_write() {
 }
 
 use std::sync::Arc;
+
+// -------------------------------------------------------------- console api --
+//
+// The console's own data endpoints, over HTTP: the exact surface the React
+// app consumes. Every assertion here mirrors a field `frontend/src/types.ts`
+// declares, so a backend change that breaks the frontend turns red here.
+
+use serde_json::Value;
+
+async fn get_json(state: AppState, path: &str) -> (StatusCode, Value) {
+    let response = console(state)
+        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap_or_default();
+    let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+    (status, value)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_status_endpoint_carries_the_fields_the_header_needs() {
+    let state = state_at("127.0.0.1").await;
+    let (status, body) = get_json(state, "/api/status").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["version"].is_string());
+    assert_eq!(body["providers"], 0);
+    assert_eq!(body["groups"], 0);
+    assert!(body["models"].is_number());
+    let settings = &body["settings"];
+    // The SettingsPanel reads every one of these.
+    for field in [
+        "gateway_port",
+        "web_port",
+        "lan",
+        "gateway_addr",
+        "web_addr",
+        "default_caller_key",
+        "send_agent_user_agent",
+        "masking",
+        "record_usage",
+        "locale",
+        "cors_origins",
+        "workbuddy_auto_checkin",
+    ] {
+        assert!(
+            settings.get(field).is_some(),
+            "settings.{field} is missing; the console reads it"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_preset_list_includes_the_local_session_vendors() {
+    let state = state_at("127.0.0.1").await;
+    let (status, body) = get_json(state, "/api/presets").await;
+    assert_eq!(status, StatusCode::OK);
+    let groups = body["presets"].as_array().expect("presets array");
+    let mut ids = Vec::new();
+    let mut protocols = Vec::new();
+    for group in groups {
+        for preset in group["presets"].as_array().unwrap() {
+            ids.push(preset["id"].as_str().unwrap().to_string());
+            protocols.push(preset["protocol"].as_str().unwrap().to_string());
+        }
+    }
+    assert!(ids.contains(&"workbuddy".to_string()));
+    assert!(ids.contains(&"qwenwork".to_string()));
+    // The qwenwork preset rides its own protocol, which the frontend type
+    // must also know.
+    assert!(protocols.contains(&"qwenwork".to_string()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_usage_endpoint_carries_every_panel_shape() {
+    let state = state_at("127.0.0.1").await;
+    let (status, body) = get_json(state, "/api/usage?period=7d").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["storage"].is_string());
+    for field in [
+        "totals",
+        "by_model",
+        "by_provider",
+        "by_provider_costs",
+        "by_agent",
+        "by_key",
+        "by_project",
+        "by_session",
+        "by_day",
+        "requests_timeline",
+        "context",
+        "quota",
+        "recent",
+    ] {
+        assert!(
+            body.get(field).is_some(),
+            "usage.{field} is missing; a Usage page panel reads it"
+        );
+    }
+    let totals = &body["totals"];
+    for field in [
+        "requests",
+        "failed",
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "reasoning_tokens",
+        "cost_usd",
+        "credits",
+        "unpriced",
+    ] {
+        assert!(totals.get(field).is_some(), "totals.{field} missing");
+    }
+    assert!(body["context"]["by_provider"].is_array());
+    assert!(body["context"]["totals"].is_object());
+    assert!(body["context"]["captured"].is_boolean());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn projects_flow_through_the_console_api() {
+    let dir = "/tmp/lr-web-proj-test";
+    local_router::projects::note(dir);
+    let state = state_at("127.0.0.1").await;
+
+    // Listed with the row shape the Projects panel renders.
+    let (status, body) = get_json(state.clone(), "/api/projects?period=7d").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["projects"].as_array().expect("projects array");
+    let row = rows
+        .iter()
+        .find(|r| r["id"] == dir)
+        .expect("the noted project is listed");
+    for field in [
+        "id",
+        "name",
+        "color",
+        "created_at",
+        "budget_tokens",
+        "budget_cost",
+        "requests",
+        "input_tokens",
+        "output_tokens",
+        "cost_usd",
+        "credits",
+        "last_seen",
+    ] {
+        assert!(row.get(field).is_some(), "project row.{field} missing");
+    }
+
+    // Renamed through the query-parameter endpoint (a directory cannot ride
+    // in a path segment).
+    let response = console(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!("/api/projects?id={}", urlencode(dir)))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name": "Renamed"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, body) = get_json(state.clone(), "/api/projects?period=7d").await;
+    let row = body["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == dir)
+        .unwrap();
+    assert_eq!(row["name"], "Renamed");
+
+    // An unknown project answers 404, not a silent success.
+    let response = console(state)
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/api/projects?id={}",
+                    urlencode("/tmp/never-seen-xyz")
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"name": "Nope"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Percent-encode everything a path segment may not carry.
+fn urlencode(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}

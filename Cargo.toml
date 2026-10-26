@@ -37,9 +37,17 @@ uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-stream = "0.3"
 dirs = "5"
+base64 = "0.22"
+rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.10"
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+rsa = { version = "0.9", default-features = false, features = ["std"] }
+pkcs1 = { version = "0.7", features = ["pem"] }
+md-5 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

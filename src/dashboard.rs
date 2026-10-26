@@ -386,3 +386,81 @@ fn terminal_size() -> (usize, usize) {
     }
     (80, 24)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snapshot() -> Snapshot {
+        Snapshot {
+            version: "0.1.0".into(),
+            gateway_addr: "127.0.0.1:3425".into(),
+            web_addr: "127.0.0.1:3426".into(),
+            providers: vec![ProviderRow {
+                id: "mock".into(),
+                enabled: true,
+                models: 2,
+                auth: "key",
+            }],
+            totals: Totals {
+                requests: 8,
+                failed: 0,
+                input_tokens: 77,
+                output_tokens: 49,
+                cost_usd: 0.25,
+                credits: 3.5,
+            },
+            by_day: vec![(
+                "2026-10-26".into(),
+                DayRow {
+                    requests: 8,
+                    input_tokens: 77,
+                    output_tokens: 49,
+                    cost_usd: 0.25,
+                    credits: 3.5,
+                },
+            )],
+            by_provider: vec![(
+                "mock".into(),
+                DayRow {
+                    requests: 8,
+                    input_tokens: 77,
+                    output_tokens: 49,
+                    cost_usd: 0.25,
+                    credits: 3.5,
+                },
+            )],
+            recent: Vec::new(),
+            storage: "SQLITE",
+        }
+    }
+
+    #[test]
+    fn a_frame_renders_with_the_headline_numbers() {
+        let mut out = Vec::new();
+        render(&mut out, &snapshot(), 0).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("local-router"));
+        assert!(text.contains("0.1.0"));
+        assert!(text.contains("mock"));
+        assert!(text.contains("8"));
+        assert!(text.contains("SQLITE"));
+        // The screen is positioned, then the cursor is hidden while drawing.
+        assert!(text.starts_with("\x1b[H\x1b[2J"));
+    }
+
+    #[test]
+    fn an_empty_gateway_renders_the_placeholders() {
+        let mut s = snapshot();
+        s.providers.clear();
+        s.by_provider.clear();
+        s.by_day.clear();
+        let mut out = Vec::new();
+        render(&mut out, &s, 1).unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("none —"));
+        assert!(text.contains("no traffic yet"));
+        // Dividing by a zero max must not panic; bars stay empty.
+        assert!(text.contains("t1"));
+    }
+}

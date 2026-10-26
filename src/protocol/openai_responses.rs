@@ -1011,3 +1011,84 @@ impl Renderer {
         frames
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The Responses API speaks "input" and "max_output_tokens", not the
+    // chat dialect; the parser must map both.
+    #[test]
+    fn the_responses_dialect_maps_to_the_canonical_request() {
+        let wire = json!({
+            "model": "gpt-5.2",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}],
+            "max_output_tokens": 256,
+            "temperature": 0.3,
+            "reasoning": {"effort": "high"}
+        });
+        let req = parse_request(&wire).unwrap();
+        assert_eq!(req.model, "gpt-5.2");
+        assert_eq!(req.messages.len(), 1);
+        assert_eq!(req.messages[0].text(), "hello");
+        assert_eq!(req.max_tokens, Some(256));
+        assert!((req.temperature.unwrap() - 0.3).abs() < 1e-9);
+        assert_eq!(req.reasoning_effort, Some(ReasoningEffort::High));
+        // An unknown effort is dropped rather than misread.
+        let odd = parse_request(&json!({
+            "model": "m",
+            "input": "plain string input",
+            "reasoning": {"effort": "bogus"}
+        }))
+        .unwrap();
+        assert_eq!(odd.reasoning_effort, None);
+        assert!(
+            !odd.messages.is_empty(),
+            "a plain-string input still parses"
+        );
+    }
+
+    // A Responses-shaped reply parses back with usage and text intact.
+    #[test]
+    fn a_responses_reply_parses_back_to_text_and_usage() {
+        let wire = json!({
+            "id": "resp_1",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-5.2",
+            "output": [
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "hmm"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "the answer"}]}
+            ],
+            "usage": {
+                "input_tokens": 9,
+                "output_tokens": 4,
+                "output_tokens_details": {"reasoning_tokens": 3}
+            }
+        });
+        let resp = parse_response(&wire).unwrap();
+        assert_eq!(resp.text(), "the answer");
+        assert_eq!(resp.usage.input_tokens, 9);
+        assert_eq!(resp.usage.output_tokens, 4);
+        assert_eq!(resp.usage.reasoning_tokens, 3);
+    }
+
+    // format_response output is accepted by parse_response again.
+    #[test]
+    fn a_formatted_response_round_trips() {
+        let resp = ChatResponse {
+            id: "resp_2".into(),
+            model: "gpt-5.2".into(),
+            content: vec![ContentBlock::text("round trip")],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 2,
+                output_tokens: 3,
+                ..Usage::default()
+            },
+        };
+        let wire = format_response(&resp, "gpt-5.2");
+        let back = parse_response(&wire).unwrap();
+        assert_eq!(back.text(), "round trip");
+    }
+}

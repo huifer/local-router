@@ -44,3 +44,29 @@ impl SseFrame {
 
 /// A sentinel some OpenAI-compatible servers send to close a stream.
 pub const DONE: &str = "[DONE]";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frames_encode_with_event_and_data_lines() {
+        let plain = SseFrame::data("{\"x\":1}");
+        assert_eq!(plain.encode(), "data: {\"x\":1}\n\n");
+        assert!(plain.event.is_none());
+
+        let named = SseFrame::named("message_start", "{\"y\":2}");
+        assert_eq!(named.encode(), "event: message_start\ndata: {\"y\":2}\n\n");
+    }
+
+    #[test]
+    fn multi_line_data_becomes_one_data_prefix_per_line() {
+        let frame = SseFrame::data("line one\nline two");
+        assert_eq!(frame.encode(), "data: line one\ndata: line two\n\n");
+    }
+
+    #[test]
+    fn the_done_sentinel_is_the_openai_close_marker() {
+        assert_eq!(DONE, "[DONE]");
+    }
+}

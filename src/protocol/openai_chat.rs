@@ -1004,3 +1004,173 @@ impl Renderer {
         frames
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------- image_block --\n
+    #[test]
+    fn image_blocks_split_data_urls_and_keep_remote_ones() {
+        let data = image_block("data:image/png;base64,QUJD");
+        assert!(matches!(
+            &data,
+            ContentBlock::Image { media_type, data } if media_type == "image/png" && data == "QUJD"
+        ));
+        let remote = image_block("https://cdn.example/cat.png");
+        assert!(matches!(
+            &remote,
+            ContentBlock::Image { media_type, data } if media_type == "image/url"
+                && data == "https://cdn.example/cat.png"
+        ));
+        // A data URL without the base64 marker stays whole.
+        let odd = image_block("data:text/plain,hello");
+        assert!(matches!(
+            &odd,
+            ContentBlock::Image { media_type, .. } if media_type == "image/url"
+        ));
+    }
+
+    // --------------------------------------------------- parse_json_loose --\n
+    #[test]
+    fn loose_json_survives_fences_and_truncation() {
+        assert_eq!(parse_json_loose("  {\"a\": 1}  "), json!({"a": 1}));
+        // Truncated mid-object with no closing brace: wrapped, not lost.
+        let raw = parse_json_loose("{\"a\": 1");
+        assert_eq!(raw["_raw"], "{\"a\": 1");
+        // Trailing garbage after a complete object: cut keeps the object.
+        assert_eq!(parse_json_loose("{\"a\": 1} trailing"), json!({"a": 1}));
+        // No JSON at all: wrapped, not lost.
+        let raw = parse_json_loose("not json");
+        assert_eq!(raw["_raw"], "not json");
+        // Empty input: an empty object, never a panic.
+        assert_eq!(parse_json_loose(""), json!({}));
+    }
+
+    // ------------------------------------------------------- parse_usage --\n
+    #[test]
+    fn usage_fields_are_read_from_every_vendor_dialect() {
+        let openai = parse_usage(Some(&json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 4},
+            "completion_tokens_details": {"reasoning_tokens": 2}
+        })));
+        assert_eq!(openai.input_tokens, 10);
+        assert_eq!(openai.output_tokens, 5);
+        assert_eq!(openai.cache_read_tokens, 4);
+        assert_eq!(openai.reasoning_tokens, 2);
+
+        let anthropic = parse_usage(Some(&json!({
+            "input_tokens": 7,
+            "output_tokens": 3,
+            "cache_read_input_tokens": 6,
+            "cache_creation_input_tokens": 1
+        })));
+        assert_eq!(anthropic.input_tokens, 7);
+        assert_eq!(anthropic.cache_read_tokens, 6);
+        assert_eq!(anthropic.cache_write_tokens, 1);
+
+        assert_eq!(parse_usage(None), Usage::default());
+        assert_eq!(parse_usage(Some(&json!({}))), Usage::default());
+    }
+
+    // The chat dialect: tools, tool_choice and both max-token spellings.
+    #[test]
+    fn the_chat_dialect_maps_to_the_canonical_request() {
+        let wire = json!({
+            "model": "gpt-5.2",
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "tool_calls": [{"id": "c1", "type": "function",
+                    "function": {"name": "read", "arguments": "{\"path\":\"a.rs\"}"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "contents"}
+            ],
+            "max_completion_tokens": 99,
+            "stream": true,
+            "tools": [{"type": "function", "function": {
+                "name": "read", "description": "Read a file",
+                "parameters": {"type": "object"}}}]
+        });
+        let req = parse_request(&wire).unwrap();
+        assert!(req.stream);
+        assert_eq!(req.max_tokens, Some(99));
+        assert_eq!(req.system[0].as_text(), Some("Be brief."));
+        assert_eq!(req.messages.len(), 3);
+        // The tool call rides the assistant turn; the tool result its own.
+        assert!(
+            matches!(&req.messages[1].content[0], ContentBlock::ToolUse { name, .. } if name == "read")
+        );
+        assert!(matches!(
+            &req.messages[2].content[0],
+            ContentBlock::ToolResult { .. }
+        ));
+        assert_eq!(req.tools.len(), 1);
+        assert_eq!(req.tools[0].name, "read");
+    }
+
+    // max_tokens and max_completion_tokens: the newer one wins.
+    #[test]
+    fn both_max_token_spellings_are_accepted() {
+        let old = parse_request(&json!({"model": "m", "max_tokens": 10, "messages": []})).unwrap();
+        assert_eq!(old.max_tokens, Some(10));
+        let new = parse_request(
+            &json!({"model": "m", "max_tokens": 10, "max_completion_tokens": 20, "messages": []}),
+        )
+        .unwrap();
+        assert_eq!(new.max_tokens, Some(20));
+    }
+
+    // format ↔ parse round trip through the upstream shape.
+    #[test]
+    fn a_formatted_request_round_trips_through_parse() {
+        let req = ChatRequest {
+            model: "gpt-5.2".into(),
+            system: vec![ContentBlock::text("sys")],
+            messages: vec![Message::user("hi"), Message::assistant("hello")],
+            max_tokens: Some(55),
+            temperature: Some(0.7),
+            stream: true,
+            ..ChatRequest::default()
+        };
+        let wire = format_request(&req, "gpt-5.2");
+        assert_eq!(wire["max_tokens"], 55);
+        assert_eq!(wire["stream"], true);
+        let back = parse_request(&wire).unwrap();
+        assert_eq!(back.messages.len(), 2);
+        assert_eq!(back.messages[0].text(), "hi");
+        assert_eq!(back.messages[1].text(), "hello");
+        assert_eq!(back.max_tokens, Some(55));
+    }
+
+    // A formatted response parses back, tools and stop reason intact.
+    #[test]
+    fn a_formatted_response_round_trips() {
+        let resp = ChatResponse {
+            id: "chatcmpl-1".into(),
+            model: "gpt-5.2".into(),
+            content: vec![
+                ContentBlock::text("answering"),
+                ContentBlock::ToolUse {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    input: json!({"path": "a.rs"}),
+                },
+            ],
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage {
+                input_tokens: 5,
+                output_tokens: 8,
+                ..Usage::default()
+            },
+        };
+        let wire = format_response(&resp, "gpt-5.2");
+        assert_eq!(wire["choices"][0]["finish_reason"], "tool_calls");
+        let back = parse_response(&wire).unwrap();
+        assert_eq!(back.text(), "answering");
+        assert_eq!(back.tool_uses().len(), 1);
+        assert_eq!(back.stop_reason, Some(StopReason::ToolUse));
+        assert_eq!(back.usage.output_tokens, 8);
+    }
+}

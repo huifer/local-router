@@ -235,3 +235,47 @@ pub fn agent_env(gateway: &Gateway) -> BTreeMap<String, String> {
     env.insert("GEMINI_API_KEY".to_string(), gateway.key.clone());
     env
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lan_gateway_is_rewritten_to_loopback() {
+        let gw = Gateway::new("0.0.0.0", 3425, "k");
+        assert_eq!(gw.base_url, "http://127.0.0.1:3425");
+        let v6 = Gateway::new("::", 3425, "k");
+        assert_eq!(v6.base_url, "http://127.0.0.1:3425");
+        // Any other host passes through.
+        let named = Gateway::new("192.168.1.7", 3425, "k");
+        assert_eq!(named.base_url, "http://192.168.1.7:3425");
+    }
+
+    #[test]
+    fn agent_env_covers_every_protocol_family() {
+        let gw = Gateway::new("127.0.0.1", 3425, "the-key");
+        let env = agent_env(&gw);
+        assert_eq!(
+            env.get("OPENAI_BASE_URL").unwrap(),
+            "http://127.0.0.1:3425/v1"
+        );
+        assert_eq!(env.get("OPENAI_API_KEY").unwrap(), "the-key");
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").unwrap(),
+            "http://127.0.0.1:3425"
+        );
+        assert_eq!(env.get("ANTHROPIC_API_KEY").unwrap(), "the-key");
+        assert_eq!(env.get("ANTHROPIC_AUTH_TOKEN").unwrap(), "the-key");
+        assert_eq!(
+            env.get("GOOGLE_GEMINI_BASE_URL").unwrap(),
+            "http://127.0.0.1:3425"
+        );
+        assert_eq!(env.get("GEMINI_API_KEY").unwrap(), "the-key");
+    }
+
+    #[test]
+    fn the_known_agent_list_matches_the_cli() {
+        let names: Vec<&str> = known_agents().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["claude", "codex", "gemini", "opencode"]);
+    }
+}

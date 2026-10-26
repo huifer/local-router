@@ -3,7 +3,7 @@
 //! The web page and the gateway are the same process. `local-router` starts both;
 //! `local-router serve` starts the gateway alone.
 
-use local_router::{config, gateway, presets, pricing, protocol, store, web, workbuddy};
+use local_router::{config, gateway, presets, pricing, protocol, qwen, store, web, workbuddy};
 
 use std::sync::Arc;
 
@@ -61,6 +61,9 @@ enum Command {
     /// WorkBuddy: the local login session, its credits and its models.
     #[command(name = "workbuddy", subcommand)]
     WorkBuddy(WorkBuddyCmd),
+    /// QwenWork（千问办公）: the device-flow login, its credits and its models.
+    #[command(name = "qwen", subcommand)]
+    Qwen(QwenCmd),
     /// Show the price table the gateway bills with.
     Prices,
 }
@@ -111,6 +114,18 @@ enum WorkBuddyCmd {
     /// Claim the day's check-in now.
     Checkin,
     /// Sign in to WorkBuddy: print a link, wait for the browser, wire it up.
+    Login,
+}
+
+#[derive(Subcommand, Debug)]
+enum QwenCmd {
+    /// Show whether QwenWork is signed in.
+    Status,
+    /// Show the credits on the account.
+    Credits,
+    /// List the models the account may use.
+    Models,
+    /// Sign in to QwenWork: print a link, wait for the browser, wire it up.
     Login,
 }
 
@@ -259,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Opencode(args)) => set_agent("opencode", args).await,
         Some(Command::Doctor) => doctor().await,
         Some(Command::WorkBuddy(cmd)) => workbuddy_cmd(cmd).await,
+        Some(Command::Qwen(cmd)) => qwen_cmd(cmd).await,
         Some(Command::Prices) => prices().await,
         Some(Command::Dashboard) => local_router::dashboard::run().await,
         Some(Command::Daemon(cmd)) => daemon_cmd(cmd).await,
@@ -876,6 +892,134 @@ async fn login() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------- qwenwork --
+
+async fn qwen_cmd(cmd: QwenCmd) -> anyhow::Result<()> {
+    match cmd {
+        QwenCmd::Status => {
+            let path = qwen::login::session_file();
+            println!("local-router {}", gateway::client::VERSION);
+            match qwen::login::read_session_file() {
+                Ok(session) => {
+                    println!("  signed in   yes");
+                    if !session.account.nickname.is_empty() {
+                        println!(
+                            "  account     {} ({})",
+                            session.account.nickname, session.account.uid
+                        );
+                    }
+                    match session.expires_at {
+                        Some(at) => {
+                            let left = (at - qwen::login::now_ms()) / 1000;
+                            println!("  token until {} ({} h left)", format_time(at), left / 3600);
+                        }
+                        None => println!("  token until unknown"),
+                    }
+                    println!(
+                        "  session     {}",
+                        path.map(|p| p.display().to_string()).unwrap_or_default()
+                    );
+                }
+                Err(err) => {
+                    println!("  signed in   no");
+                    println!("  {err}");
+                }
+            }
+        }
+        QwenCmd::Credits => {
+            let session = qwen::login::session().await?;
+            let quota = qwen::client::account_quota(&session).await?;
+            println!("plan: {}", quota.plan);
+            println!("balance: {}", quota.balance);
+            if let Some(at) = quota.resets_at {
+                println!("resets:  {at}");
+            }
+            for p in &quota.pools {
+                println!("  {:<14} {}", p.name, p.balance);
+            }
+        }
+        QwenCmd::Models => {
+            let session = qwen::login::session().await?;
+            let models = qwen::client::models(&session).await?;
+            println!("the account may use {} models:", models.len());
+            for m in models {
+                println!("  {m}");
+            }
+        }
+        QwenCmd::Login => qwen_login().await?,
+    }
+    Ok(())
+}
+
+/// Sign in to QwenWork from the terminal.
+///
+/// The device flow hands out a browser link; the browser signs in; the
+/// gateway polls until the device token arrives. The token is stored in
+/// local-router's own session file — QwenWork's own data is left untouched.
+async fn qwen_login() -> anyhow::Result<()> {
+    let session = qwen::login::start_login().await?;
+    println!("local-router {}", gateway::client::VERSION);
+    println!("  open this link in a browser and sign in:");
+    println!();
+    println!("  {}", session.auth_url);
+    println!();
+
+    let _ = std::process::Command::new("open")
+        .arg(&session.auth_url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    println!("  waiting for the sign-in (up to 5 minutes)…");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+    let token = loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("the sign-in timed out; run `local-router qwen login` again");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match qwen::login::poll_login(&session.state).await {
+            Ok(qwen::login::LoginPoll::Waiting) => continue,
+            Ok(qwen::login::LoginPoll::Ready(result)) => break *result,
+            Err(err) => return Err(err),
+        }
+    };
+
+    // Who signed in, from the adapter account-context.
+    let account = qwen::login::login_account(&session.state, &token)
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    let nickname = account
+        .pointer("/data/user/name")
+        .or_else(|| account.pointer("/user/name"))
+        .or_else(|| account.pointer("/name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let path = qwen::login::store_session(&token, &account, &session.state.machine_id).await?;
+    println!("  signed in   {nickname}");
+    println!("  session     {}", path.display());
+    println!(
+        "  token until {}",
+        token
+            .expires_at
+            .map(format_time)
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+
+    let mut config = load_config()?;
+    if config.provider("qwenwork").is_none() {
+        if let Some(preset) = presets::get("qwenwork") {
+            config.providers.push(presets::to_provider(preset, None));
+            save_config(&config)?;
+            println!("  provider    qwenwork added (no key needed)");
+        }
+    }
+
+    println!();
+    println!("  done — try it: local-router qwen credits");
+    Ok(())
+}
+
 // ---------------------------------------------------------------- daemon --
 
 /// Where the daemon's bookkeeping lives.
@@ -1418,28 +1562,52 @@ async fn doctor() -> anyhow::Result<()> {
     let mut problems = Vec::new();
     for p in &config.providers {
         if p.uses_session() {
-            // A WorkBuddy provider authenticates with the local app's
-            // session, so the only thing to check is that there is one.
-            match crate::workbuddy::read_session_file() {
-                Ok(session) => {
-                    let left = session
-                        .expires_at
-                        .map(|at| (at - crate::workbuddy::now_ms()) / 3_600_000)
-                        .unwrap_or_default();
-                    println!(
-                        "  workbuddy   signed in as {} (token {} h left)",
-                        if session.account.nickname.is_empty() {
-                            "unknown"
-                        } else {
-                            &session.account.nickname
-                        },
-                        left
-                    );
+            // A session provider authenticates with a local login, so the
+            // only thing to check is that there is one.
+            if p.id == "qwenwork" {
+                match crate::qwen::login::read_session_file() {
+                    Ok(session) => {
+                        let left = session
+                            .expires_at
+                            .map(|at| (at - crate::qwen::login::now_ms()) / 3_600_000)
+                            .unwrap_or_default();
+                        println!(
+                            "  qwenwork    signed in as {} (token {} h left)",
+                            if session.account.nickname.is_empty() {
+                                "unknown"
+                            } else {
+                                &session.account.nickname
+                            },
+                            left
+                        );
+                    }
+                    Err(err) => problems.push(format!(
+                        "the provider {} needs a QwenWork login: {err}",
+                        p.id
+                    )),
                 }
-                Err(err) => problems.push(format!(
-                    "the provider {} needs a WorkBuddy login: {err}",
-                    p.id
-                )),
+            } else {
+                match crate::workbuddy::read_session_file() {
+                    Ok(session) => {
+                        let left = session
+                            .expires_at
+                            .map(|at| (at - crate::workbuddy::now_ms()) / 3_600_000)
+                            .unwrap_or_default();
+                        println!(
+                            "  workbuddy   signed in as {} (token {} h left)",
+                            if session.account.nickname.is_empty() {
+                                "unknown"
+                            } else {
+                                &session.account.nickname
+                            },
+                            left
+                        );
+                    }
+                    Err(err) => problems.push(format!(
+                        "the provider {} needs a WorkBuddy login: {err}",
+                        p.id
+                    )),
+                }
             }
         } else if p.enabled && p.enabled_keys().next().is_none() && !keyless(&p.id) {
             problems.push(format!("the provider {} has no key", p.id));

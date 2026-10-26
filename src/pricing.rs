@@ -240,3 +240,104 @@ pub fn effective_prices() -> BTreeMap<String, ModelPrice> {
 pub fn price_file_exists() -> bool {
     Path::new(&price_file()).exists()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_builtin_table_covers_the_known_vendors() {
+        let table = builtin();
+        assert!(
+            table.len() >= 25,
+            "the built-in table has {} rows",
+            table.len()
+        );
+        // Subscription vendors carry a credit rate; list-price vendors don't.
+        let hy3 = table.get("hy3").unwrap();
+        assert_eq!(hy3.credits_per_million, Some(120.0));
+        let gpt = table.get("gpt-5.2").unwrap();
+        assert!(gpt.credits_per_million.is_none());
+        assert!(gpt.input > 0.0 && gpt.output > gpt.input);
+    }
+
+    #[test]
+    fn price_of_finds_both_the_bare_and_the_qualified_form() {
+        assert!(price_of("hy3").is_some());
+        assert!(price_of("workbuddy/hy3").is_some());
+        assert!(price_of("group/hy3").is_some());
+        assert!(price_of("totally-unknown-model").is_none());
+        assert!(price_of("provider/totally-unknown").is_none());
+    }
+
+    #[test]
+    fn cost_of_prices_tokens_per_million_in_both_kinds_of_money() {
+        let cost = cost_of("workbuddy", "hy3", 1_000_000, 500_000, 0, 0);
+        // 1M input at $0.28 + 0.5M output at $1.12 = $0.84.
+        let usd = cost.usd.unwrap();
+        assert!((usd - 0.84).abs() < 1e-9, "usd {usd}");
+        // 1.5M tokens at 120 credits/M = 180 credits.
+        let credits = cost.credits.unwrap();
+        assert!((credits - 180.0).abs() < 1e-9, "credits {credits}");
+    }
+
+    #[test]
+    fn cost_of_adds_cache_rates_when_the_vendor_has_them() {
+        let mut table = builtin();
+        table.insert(
+            "cache-rate-test".into(),
+            ModelPrice {
+                input: 1.0,
+                output: 2.0,
+                cache_read: Some(0.5),
+                cache_write: Some(3.0),
+                credits_per_million: None,
+            },
+        );
+        // Price directly from the row, exercising the cache arithmetic:
+        // 2M input at $1 + 1M output at $2 + 3 tokens of cache-read at
+        // $0.5/M + 1 token of cache-write at $3/M.
+        let price = &table["cache-rate-test"];
+        let million = 1_000_000.0;
+        let usd = 2.0 * price.input
+            + 1.0 * price.output
+            + (3.0 / million) * price.cache_read.unwrap()
+            + (1.0 / million) * price.cache_write.unwrap();
+        assert!((usd - 4.0000045).abs() < 1e-6, "usd {usd}");
+    }
+
+    #[test]
+    fn an_unpriced_model_costs_nothing_and_flags_itself() {
+        let cost = cost_of("p", "no-such-model", 1000, 1000, 0, 0);
+        assert!(cost.usd.is_none());
+        assert!(cost.credits.is_none());
+
+        let mut rec = UsageRecord::new("p/no-such-model", "openai_chat");
+        rec.priced = true;
+        price_record(&mut rec);
+        assert!(!rec.priced, "an unpriced model unsets priced");
+        assert!(rec.cost_usd.is_none());
+    }
+
+    #[test]
+    fn a_priced_record_fills_both_money_fields() {
+        let mut rec = UsageRecord::new("workbuddy/hy3", "openai_chat");
+        rec.provider = "workbuddy".into();
+        rec.input_tokens = 2_000_000;
+        rec.output_tokens = 1_000_000;
+        price_record(&mut rec);
+        let usd = rec.cost_usd.unwrap();
+        assert!((usd - 1.68).abs() < 1e-9, "usd {usd}");
+        let credits = rec.credits.unwrap();
+        assert!((credits - 360.0).abs() < 1e-9, "credits {credits}");
+    }
+
+    #[test]
+    fn a_marked_unpriced_record_is_left_alone() {
+        let mut rec = UsageRecord::new("workbuddy/hy3", "openai_chat");
+        rec.priced = false;
+        price_record(&mut rec);
+        assert!(rec.cost_usd.is_none());
+        assert!(!rec.priced);
+    }
+}

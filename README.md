@@ -8,7 +8,10 @@
 - **四种协议互译**：OpenAI Chat / OpenAI Responses / Anthropic / Gemini，
   任意「入口 × 上游」组合（流式、工具调用、思考块、token 用量）
 - **路由组**：order / rotate / usage / smart / weight，故障转移、会话粘性、嵌套组、多 key
-- **控制台**：React + TypeScript + Vite 构建的服务商 / 模型 / 路由 / 用量 / 设置界面
+- **订阅登录态上游**：WorkBuddy、QwenWork（千问办公）免 key 接入，
+  自动续期、自动签到
+- **控制台**：React + TypeScript + Vite 构建的服务商 / 模型 / 路由 / 用量 /
+  会话 / 项目 / 上下文 / 额度 / 设置界面
 - **Docker**：多阶段构建，`/data` 持久化，compose 一键起
 
 本项目为独立实现，只做网页模式 + CLI，不做桌面客户端。
@@ -66,6 +69,8 @@ local-router ls | usage [--csv] | doctor | prices
 local-router dashboard                        # 终端仪表盘（实时刷新，q 退出）
 local-router daemon start|stop|status|logs    # 后台守护进程
 local-router claude|codex|gemini|opencode <model>
+local-router workbuddy status|credits|login|checkin|models   # WorkBuddy 登录态
+local-router qwen status|credits|login|models                # QwenWork 设备流
 ```
 
 ## 配置
@@ -73,8 +78,14 @@ local-router claude|codex|gemini|opencode <model>
 `~/.config/local-router/`（`LOCAL_ROUTER_HOME` 可覆盖，Docker 里是 `/data`）：
 
 ```
-config.json    # providers、groups、settings、caller-keys（0600）
-usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
+config.json       # providers、groups、settings、caller-keys（0600）
+usage.jsonl       # 每请求一行：模型、provider、token、时延、状态、成本
+usage.db          # 同一份记录的 SQLite 视图（可关）
+sessions.json     # 会话标题簿（会话 id → 标题）
+projects.json     # 项目注册表（目录 → 名称 / 颜色 / 预算）
+prices.json       # 可选：价目表覆盖
+workbuddy-session.json  # WorkBuddy 浏览器登录的 token（0600）
+qwen-session.json       # QwenWork 设备流登录的 token（0600）
 ```
 
 文件被 CLI / 另一个进程修改后，网关在下一个请求自动重载（mtime 探测），
@@ -303,6 +314,51 @@ curl http://127.0.0.1:3425/v1/videos \
 | `LOCAL_ROUTER_WORKBUDDY_SESSION` | 登录态文件的完整路径（找不到时不再猜别的位置） |
 | `LOCAL_ROUTER_WORKBUDDY_ENDPOINT` | 换用别的 WorkBuddy 端点（私有化 / 测试） |
 | `WORKBUDDY_HOME` | 登录态所在目录（默认自动查找） |
+| `LOCAL_ROUTER_QWEN_SESSION` | QwenWork 会话文件路径 |
+| `LOCAL_ROUTER_QWEN_ENDPOINT` | 换用别的 QwenWork 端点（测试） |
+
+## 用量页：会话 / 项目 / 上下文
+
+Usage 页在 Overview 之外还有几个子标签，数据全部来自请求本身：
+
+- **Sessions**：每个会话一行 —— 标题取首个用户消息的第一行，请求数、token、
+  花费。agent 带上 `x-session-id`（或 Anthropic 的 `metadata.user_id`）
+  就会被记录。
+- **Projects**：按工作目录分组。agent 上报 CWD（`x-project` /
+  `x-project-dir` / `x-cwd` 头，或 body 里的 `metadata.cwd`）后自动建档；
+  控制台里可改名、配色、设 token/费用预算、合并重复目录。合并会把两个
+  存储里的历史记录一起重键。
+- **Context**：每个请求的上下文窗口拆解 —— 系统提示 / 工具定义 / 附件文件 /
+  对话各占多少 token（按 ~3.6 字符/token 估算），窗口填充率与缓存友好度
+  评分。填充率需要知道模型窗口大小，未知时显示为 0。
+- **Quota**：登录态上游的额度窗口（WorkBuddy 资源包 / QwenWork 钱包），
+  以及 `GET /v1/local-router/quotas` 的路由视角。
+
+## QwenWork（千问办公）：设备流登录当上游
+
+有 QwenWork 个人账号？不用 API key，走千问办公桌面客户端同款设备流登录，
+把它当一个上游：
+
+```sh
+local-router qwen login      # 打印登录链接 → 浏览器登录 → 自动配置 provider
+local-router qwen status     # 登录状态、账号、token 有效期
+local-router qwen credits    # 额度余额（钱包分日常/月度/长期池）
+local-router qwen models     # 账号可用的模型
+local-router claude qwenwork/qwen3-coder-plus   # 让 Claude Code 走 QwenWork
+```
+
+要点：
+
+- **协议专线**：QwenWork 每个请求都要过 COSY 信封（RSA 包 AES 密钥 +
+  MD5 签名 + 乱序 base64 体编码），通用 OpenAI 管道表达不了，网关里它走
+  自己的模块；调用方看到的仍是标准的四种入口协议。
+- **不落盘密钥**：设备 token 只在 `qwen-session.json`（0600）与内存里；
+  `config.json` 中只有 `"auth": "qwenwork"` 标记。
+- **自动续期**：token 到期前五分钟自动用 refresh token 换新（换发结果
+  不回写磁盘，与客户端行为一致）。
+- **只支持个人公有云**（gateway.qwenwork.cn）；企业版 VPC / PAT 不做。
+- 容器里看不到宿主机登录态时，把会话文件挂进去并设
+  `LOCAL_ROUTER_QWEN_SESSION`。
 
 ## 路由组
 
@@ -322,9 +378,17 @@ local-router claude group/backup
 ```sh
 cargo fmt --all -- --check   # 格式
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                   # 67 个测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫 / 登录态
+cargo test                   # 220 个测试
+#   src/ 内是 Rust 原生单元测试（#[cfg(test)]）：协议 IR 与四协议往返、
+#   COSY 信封、配置/价目/预设/会话/项目、用量聚合、上下文估算、
+#   URL 与帧解析、仪表盘渲染、控制台守卫源校验
+#   tests/ 内是集成测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫与 API
+#   形状 / WorkBuddy 会话与续期 / QwenWork 信封 / agent 配置写入 / 用量存储
 cd frontend && npm run dev   # 控制台热更新（API 代理到 :3426）
 ```
+
+只跑某一块：`cargo test --lib`（单元）/ `--test translate`（协议）/
+`--test gateway`（端到端）/ `--test web`（控制台）/ `--test qwen`（QwenWork）。
 
 `cargo build` 会通过 `build.rs` 自动构建 `frontend/`（检测到源码变化或
 `dist` 缺失时）。CI / 无 npm 环境可设 `LOCAL_ROUTER_SKIP_FRONTEND=1` 用
@@ -339,9 +403,10 @@ cd frontend && npm run dev   # 控制台热更新（API 代理到 :3426）
 
 ## 范围与取舍
 
-核心：多服务商网关、协议互译、路由组、用量记录、网页管理、CLI、多 key
-故障转移。有意不做：桌面菜单栏、TUI、订阅账号登录态、插件生态、本地
-PII 脱敏。
+核心：多服务商网关、协议互译、路由组、用量记录、会话/项目/上下文观测、
+订阅账号登录态接入（WorkBuddy / QwenWork）、网页管理、CLI、多 key
+故障转移。有意不做：桌面菜单栏、桌面客户端形态、插件生态、本地 PII 脱敏、
+QwenWork 企业版（VPC / PAT）。
 
 ## License
 

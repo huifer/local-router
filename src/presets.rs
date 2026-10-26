@@ -167,3 +167,99 @@ fn slugify(name: &str) -> String {
         out
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_builtin_list_is_well_formed() {
+        let presets = all();
+        assert!(presets.len() >= 25, "{} presets", presets.len());
+        // Ids are unique and slug-shaped; every vendor has a group and a URL.
+        let mut ids: Vec<&str> = presets.iter().map(|p| p.id.as_str()).collect();
+        ids.sort();
+        let before = ids.len();
+        ids.dedup();
+        assert_eq!(before, ids.len(), "preset ids must be unique");
+        for p in presets {
+            assert!(!p.group.is_empty(), "{} has no group", p.id);
+            let has_url = p.base_url.is_some()
+                || p.anthropic_base_url.is_some()
+                || p.gemini_base_url.is_some()
+                || p.auth.is_some();
+            assert!(
+                has_url,
+                "{} has neither a base url nor a session auth",
+                p.id
+            );
+            // Template placeholders from the editor must never ride along:
+            // they would expand to a model id no vendor knows.
+            for model in &p.default_models {
+                assert!(
+                    !model.contains("{{") && !model.contains("SECRET"),
+                    "{}/{} carries a template placeholder",
+                    p.id,
+                    model
+                );
+            }
+        }
+        // The groups the add sheet renders.
+        let groups: Vec<String> = grouped().into_keys().collect();
+        assert!(groups.contains(&"vendor".to_string()));
+    }
+
+    #[test]
+    fn get_finds_known_ids_and_skips_unknown() {
+        assert!(get("deepseek").is_some());
+        assert!(get("workbuddy").is_some());
+        assert!(get("qwenwork").is_some());
+        assert!(get("no-such-preset").is_none());
+    }
+
+    #[test]
+    fn session_presets_do_not_need_a_key() {
+        for id in ["workbuddy", "qwenwork"] {
+            let preset = get(id).unwrap();
+            assert!(preset.auth.is_some(), "{id} must carry an auth kind");
+            let provider = to_provider(preset, None);
+            assert!(provider.uses_session());
+            assert!(provider.keys.is_empty());
+        }
+    }
+
+    #[test]
+    fn to_provider_applies_the_preset_shape() {
+        let preset = get("deepseek").unwrap();
+        let provider = to_provider(preset, Some("sk-test"));
+        assert_eq!(provider.id, "deepseek");
+        assert_eq!(provider.name, preset.name);
+        assert_eq!(provider.protocol, preset.protocol);
+        assert_eq!(provider.base_url, preset.base_url);
+        assert_eq!(provider.keys.len(), 1);
+        assert_eq!(provider.keys[0].key, "sk-test");
+        assert!(provider.enabled);
+        assert_eq!(provider.models, preset.default_models);
+        // A blank key means no key at all, not a blank secret.
+        let empty = to_provider(preset, Some("   "));
+        assert!(empty.keys.is_empty());
+    }
+
+    #[test]
+    fn custom_providers_slug_their_name_and_fall_back() {
+        let provider = custom_provider(
+            "My Local Relay!",
+            Some("http://127.0.0.1:9000/v1"),
+            None,
+            Protocol::OpenAiChat,
+            Some("sk-x"),
+            &["m1".to_string()],
+        );
+        assert_eq!(provider.id, "my-local-relay");
+        assert_eq!(provider.models, vec!["m1"]);
+        // A name with no slug characters lands on `custom`.
+        let fallback = custom_provider("???", None, None, Protocol::Anthropic, None, &[]);
+        assert_eq!(fallback.id, "custom");
+        assert_eq!(fallback.protocol, Protocol::Anthropic);
+    }
+}

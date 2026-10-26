@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { api, getCallerKeys, getGroups, getModels, getPresets, getProviders, getStatus, getUsage, getWorkBuddy, saveSettings } from "./api";
-import type { CallerKey, Group, ModelItem, Preset, Provider, Settings, Status, UsageData, UsageTotals, WorkBuddyStatus } from "./types";
+import { api, getCallerKeys, getGroups, getModels, getPresets, getProjects, getProviders, getStatus, getUsage, getWorkBuddy, mergeProjects, saveSettings, updateProject } from "./api";
+import type { CallerKey, Group, ModelItem, Preset, ProjectRow, Provider, SessionRow, Settings, Status, TimelinePoint, UsageData, UsageTotals, WorkBuddyStatus } from "./types";
 import { Button, EmptyState, formatTime, formatTokens, Icon, Panel, StatusDot } from "./components";
 import "./styles.css";
 
@@ -67,7 +67,7 @@ export default function App() {
       {tab === "providers" && <Providers providers={data.providers} onChanged={reload} notify={notify} />}
       {tab === "models" && <Models models={data.models} />}
       {tab === "groups" && <Groups groups={data.groups} models={data.models} onChanged={reload} notify={notify} />}
-      {tab === "usage" && <Usage usage={usage} notify={notify} />}
+      {tab === "usage" && <Usage notify={notify} />}
       {tab === "settings" && <SettingsPanel settings={data.status.settings} callerKeys={callerKeys} setCallerKeys={setCallerKeys} onChanged={reload} notify={notify} />}
     </main>
     {notice && <div className={`notice ${notice.error ? "notice-error" : ""}`}>{notice.text}</div>}
@@ -161,11 +161,299 @@ function Groups({ groups, models, onChanged, notify }: { groups: Group[]; models
   return <div className="page-grid"><div className="section-toolbar"><div><span className="eyebrow">ROUTER / POLICY SETS</span><p>Turn several upstream models into one resilient endpoint.</p></div><Button variant="primary" icon="plus" onClick={() => setShowAdd(true)}>Add routing group</Button></div><div className="routing-grid">{groups.map((group) => <article className="routing-card" key={group.id}><div className="routing-header"><div><span className="routing-code">group/{group.id}</span><h3>{group.name}</h3></div><span className="route-mode">{group.routing}</span></div><div className="route-line"><span>STAYS</span><strong>{group.stays}</strong><span>MEMBERS</span><strong>{group.models.length.toString().padStart(2, "0")}</strong></div><div className="route-members">{group.models.map((model, index) => <div key={model}><i>{String(index + 1).padStart(2, "0")}</i><span>{model}</span>{index === 0 && group.routing === "order" && <em>PRIMARY</em>}</div>)}</div><div className="card-actions"><span className="route-health"><StatusDot /> route ready</span><Button variant="danger" icon="trash" onClick={() => remove(group)}>Remove</Button></div></article>)}</div>{showAdd && <Modal title="Create routing group" onClose={() => setShowAdd(false)}><div className="form-stack"><Field label="Group name"><input autoFocus value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Daily fallback" /></Field><Field label="Members"><input value={form.models} onChange={(event) => setForm({ ...form, models: event.target.value })} placeholder="provider/model, provider/model" /><small className="field-help">Available now: {models.slice(0, 3).map((model) => model.id).join(" · ")}</small></Field><Field label="Routing"><select value={form.routing} onChange={(event) => setForm({ ...form, routing: event.target.value })}><option value="order">order — primary then failover</option><option value="rotate">rotate — round robin</option><option value="usage">usage — least used</option><option value="smart">smart — quota-aware</option><option value="weight">weight — weighted interleave</option></select></Field><Field label="Session affinity"><select value={form.stays} onChange={(event) => setForm({ ...form, stays: event.target.value })}><option value="auto">auto — preserve useful cache</option><option value="session">session — keep the session</option><option value="turn">turn — keep the turn</option><option value="off">off — no affinity</option><option value="strict">strict — never fail over</option></select></Field></div><div className="modal-footer"><Button variant="secondary" onClick={() => setShowAdd(false)}>Cancel</Button><Button variant="primary" onClick={create}>Create group</Button></div></Modal>}</div>;
 }
 
-function Usage({ usage, notify }: { usage: UsageData | null; notify: (text: string, error?: boolean) => void }) {
-  if (!usage) return <div className="skeleton-page"><div /><div /><div /></div>;
+type UsageView = "overview" | "sessions" | "projects" | "context" | "quota" | "bills";
+
+const usageViews: { id: UsageView; label: string }[] = [
+  { id: "overview", label: "Overview" },
+  { id: "sessions", label: "Sessions" },
+  { id: "projects", label: "Projects" },
+  { id: "context", label: "Context" },
+  { id: "quota", label: "Quota" },
+  { id: "bills", label: "Bills" },
+];
+
+const usagePeriods: { id: string; label: string }[] = [
+  { id: "today", label: "Today" },
+  { id: "7d", label: "7 days" },
+  { id: "30d", label: "30 days" },
+  { id: "all", label: "All" },
+];
+
+function Usage({ notify }: { notify: (text: string, error?: boolean) => void }) {
+  const [view, setView] = useState<UsageView>("overview");
+  const [period, setPeriod] = useState("7d");
+  const [usage, setUsage] = useState<UsageData | null>(null);
+  const [projects, setProjects] = useState<ProjectRow[]>([]);
+
+  const reload = useCallback(async () => {
+    const [data, projectData] = await Promise.all([getUsage(period), getProjects(period)]);
+    setUsage(data);
+    setProjects(projectData.projects);
+  }, [period]);
+
+  useEffect(() => {
+    reload().catch((error: Error) => notify(error.message, true));
+  }, [reload, notify]);
+
+  return <div className="page-grid">
+    <div className="usage-toolbar">
+      <div className="subtabs" role="tablist">
+        {usageViews.map((item) => <button key={item.id} role="tab" aria-selected={view === item.id} className={view === item.id ? "subtab subtab-active" : "subtab"} onClick={() => setView(item.id)}>{item.label}</button>)}
+      </div>
+      <div className="period-picker">
+        {usagePeriods.map((item) => <button key={item.id} className={period === item.id ? "period period-active" : "period"} onClick={() => setPeriod(item.id)}>{item.label}</button>)}
+      </div>
+    </div>
+    {!usage ? <div className="skeleton-page"><div /><div /><div /></div> : <>
+      {view === "overview" && <UsageOverview usage={usage} notify={notify} />}
+      {view === "sessions" && <SessionsPanel sessions={usage.by_session} />}
+      {view === "projects" && <ProjectsPanel projects={projects} onChanged={reload} notify={notify} />}
+      {view === "context" && <ContextPanel usage={usage} />}
+      {view === "quota" && <QuotaPanel usage={usage} />}
+      {view === "bills" && <BillsPanel usage={usage} />}
+    </>}
+  </div>;
+}
+
+/// The overview: totals, the requests timeline, and the per-platform / model
+/// breakdowns the page has always had.
+function UsageOverview({ usage, notify }: { usage: UsageData; notify: (text: string, error?: boolean) => void }) {
   const totals = usage.totals;
   const perProvider = Object.entries(usage.by_provider_costs ?? {});
-  return <div className="page-grid"><span className="storage-tag">{usage.storage === "sqlite" ? "SQLITE" : "JSONL"}</span><div className="metric-strip"><Metric label="REQUESTS" value={totals.requests.toLocaleString()} /><Metric label="FAILED" value={totals.failed.toLocaleString()} danger={totals.failed > 0} /><Metric label="INPUT TOKENS" value={formatTokens(totals.input_tokens)} /><Metric label="OUTPUT TOKENS" value={formatTokens(totals.output_tokens)} /><Metric label="COST (USD)" value={`$${totals.cost_usd.toFixed(4)}`} /><Metric label="CREDITS" value={totals.credits.toFixed(1)} /></div><Panel eyebrow="USAGE / BY PLATFORM" title="What each provider cost"><div className="usage-list">{perProvider.length ? perProvider.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.input_tokens)} in · {formatTokens(value.output_tokens)} out</span></div><div className="usage-money"><span className="usage-number">${value.cost_usd.toFixed(4)}</span><span className="usage-credits">{value.credits.toFixed(1)} credits{value.unpriced > 0 ? ` · ${value.unpriced} unpriced` : ""}</span></div></div>) : <EmptyState title="No platform usage" detail="Platform costs appear after the first call." />}</div></Panel><div className="content-grid content-grid-secondary"><Panel eyebrow="USAGE / BY MODEL" title="Model distribution"><div className="usage-list">{usage.by_model.length ? usage.by_model.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.output_tokens)} output</span></div><span className="usage-number">{value.requests}</span></div>) : <EmptyState title="No usage data" detail="Request data appears after the first call." />}</div></Panel><Panel eyebrow="USAGE / BY DAY" title="Daily activity"><DayChart data={usage.by_day} /></Panel></div><div className="content-grid content-grid-secondary"><Panel eyebrow="USAGE / COST BY PLATFORM" title="Spending per platform"><ProviderCostChart data={perProvider} /></Panel><Panel eyebrow="USAGE / SHARE" title="Model mix"><ModelDonut data={usage.by_model} /></Panel></div><Panel eyebrow="USAGE / REQUEST LOG" title="Recent requests" action={<Button variant="quiet" onClick={() => getUsage().then(() => notify("Usage refreshed"))}>Refresh log</Button>}>{usage.recent.length ? <div className="request-list">{usage.recent.map((record, index) => <RequestRow key={`${record.time}-${index}`} record={record} />)}</div> : <EmptyState title="No requests yet" detail="Connect an agent to start collecting telemetry." />}</Panel></div>;
+  const cacheRate = totals.input_tokens + totals.cache_read_tokens > 0
+    ? totals.cache_read_tokens / (totals.input_tokens + totals.cache_read_tokens)
+    : 0;
+  return <>
+    <span className="storage-tag">{usage.storage === "sqlite" ? "SQLITE" : "JSONL"}</span>
+    <div className="metric-strip"><Metric label="REQUESTS" value={totals.requests.toLocaleString()} /><Metric label="FAILED" value={totals.failed.toLocaleString()} danger={totals.failed > 0} /><Metric label="INPUT TOKENS" value={formatTokens(totals.input_tokens)} /><Metric label="OUTPUT TOKENS" value={formatTokens(totals.output_tokens)} /><Metric label="CACHE HIT" value={`${Math.round(cacheRate * 100)}%`} /><Metric label="COST (USD)" value={`$${totals.cost_usd.toFixed(4)}`} /><Metric label="CREDITS" value={totals.credits.toFixed(1)} /></div>
+    <Panel eyebrow="USAGE / REQUESTS TIMELINE" title="Requests over time" action={<TimelineToggle />}>
+      <RequestsTimeline points={usage.requests_timeline} />
+    </Panel>
+    <div className="content-grid content-grid-secondary">
+      <Panel eyebrow="USAGE / BY PLATFORM" title="What each provider cost">
+        <div className="usage-list">{perProvider.length ? perProvider.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.input_tokens)} in · {formatTokens(value.output_tokens)} out</span></div><div className="usage-money"><span className="usage-number">${value.cost_usd.toFixed(4)}</span><span className="usage-credits">{value.credits.toFixed(1)} credits{value.unpriced > 0 ? ` · ${value.unpriced} unpriced` : ""}</span></div></div>) : <EmptyState title="No platform usage" detail="Platform costs appear after the first call." />}</div>
+      </Panel>
+      <Panel eyebrow="USAGE / BY DAY" title="Daily activity"><DayChart data={usage.by_day} /></Panel>
+    </div>
+    <div className="content-grid content-grid-secondary">
+      <Panel eyebrow="USAGE / BY MODEL" title="Model distribution">
+        <div className="usage-list">{usage.by_model.length ? usage.by_model.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.output_tokens)} output</span></div><span className="usage-number">{value.requests}</span></div>) : <EmptyState title="No usage data" detail="Request data appears after the first call." />}</div>
+      </Panel>
+      <Panel eyebrow="USAGE / SHARE" title="Model mix"><ModelDonut data={usage.by_model} /></Panel>
+    </div>
+    <Panel eyebrow="USAGE / REQUEST LOG" title="Recent requests" action={<Button variant="quiet" onClick={() => getUsage().then(() => notify("Usage refreshed"))}>Refresh log</Button>}>{usage.recent.length ? <div className="request-list">{usage.recent.map((record, index) => <RequestRow key={`${record.time}-${index}`} record={record} />)}</div> : <EmptyState title="No requests yet" detail="Connect an agent to start collecting telemetry." />}</Panel>
+  </>;
+}
+
+/// Requests per hour: bars by default, a line when the viewer prefers it.
+/// The preference is per browser, the way magpie keeps it.
+let timelineStyle: "bars" | "line" = (localStorage.getItem("local-router.timeline") as "bars" | "line") || "bars";
+
+function TimelineToggle() {
+  const [style, setStyle] = useState(timelineStyle);
+  const pick = (next: "bars" | "line") => {
+    timelineStyle = next;
+    localStorage.setItem("local-router.timeline", next);
+    window.dispatchEvent(new CustomEvent("local-router.timeline", { detail: next }));
+    setStyle(next);
+  };
+  return <span className="timeline-toggle">
+    <button className={style === "bars" ? "period period-active" : "period"} onClick={() => pick("bars")}>Bars</button>
+    <button className={style === "line" ? "period period-active" : "period"} onClick={() => pick("line")}>Line</button>
+  </span>;
+}
+
+function RequestsTimeline({ points }: { points: TimelinePoint[] }) {
+  const [style, setStyle] = useState(timelineStyle);
+  useEffect(() => {
+    const listen = (event: Event) => setStyle((event as CustomEvent).detail as "bars" | "line");
+    window.addEventListener("local-router.timeline", listen);
+    return () => window.removeEventListener("local-router.timeline", listen);
+  }, []);
+  if (!points.length) return <EmptyState title="No requests yet" detail="The timeline fills as agents call the gateway." />;
+  const max = Math.max(...points.map((p) => p.requests), 1);
+  const width = Math.max(points.length * 34, 320);
+  const height = 150;
+  if (style === "line") {
+    const step = points.length > 1 ? (width - 30) / (points.length - 1) : 0;
+    const path = points.map((p, i) => `${i === 0 ? "M" : "L"} ${15 + i * step} ${height - 24 - (p.requests / max) * (height - 44)}`).join(" ");
+    return <div className="timeline-block"><svg viewBox={`0 0 ${width} ${height}`} className="timeline-svg"><path d={path} fill="none" stroke="var(--green)" strokeWidth="1.6" strokeLinejoin="round" />{points.map((p, i) => <circle key={p.hour} cx={15 + i * step} cy={height - 24 - (p.requests / max) * (height - 44)} r="2.4" fill="var(--green)" />)}{points.map((p, i) => (i % Math.ceil(points.length / 8) === 0 ? <text key={`t-${p.hour}`} x={15 + i * step} y={height - 6} textAnchor="middle" className="timeline-tick">{p.hour.slice(5, 13)}</text> : null))}</svg></div>;
+  }
+  return <div className="timeline-block"><div className="timeline-bars" style={{ minWidth: width }}>{points.map((p) => <div className="timeline-col" key={p.hour} title={`${p.hour}:00 — ${p.requests} requests`}><i style={{ height: `${(p.requests / max) * 100}%` }} /><span>{p.hour.slice(5, 13)}</span></div>)}</div></div>;
+}
+
+/// Every conversation the gateway has seen, titled and priced.
+function SessionsPanel({ sessions }: { sessions: SessionRow[] }) {
+  const [query, setQuery] = useState("");
+  const filtered = sessions.filter((s) => s.title.toLowerCase().includes(query.toLowerCase()) || s.id.toLowerCase().includes(query.toLowerCase()));
+  return <Panel eyebrow="USAGE / SESSIONS" title={`${sessions.length.toString().padStart(2, "0")} conversations`} action={<div className="search-box"><Icon name="search" /><input placeholder="Filter sessions" value={query} onChange={(event) => setQuery(event.target.value)} /></div>}>
+    {filtered.length ? <div className="session-table">
+      <div className="model-head session-head"><span>SESSION</span><span>REQUESTS</span><span>TOKENS</span><span>COST</span><span>LAST SEEN</span></div>
+      {filtered.map((s) => <div className="model-row session-row" key={s.id} title={s.id}>
+        <div className="model-name"><span className="model-bullet" /><strong>{s.title}</strong></div>
+        <span>{s.requests}{s.failed ? ` · ${s.failed} failed` : ""}</span>
+        <span>{formatTokens(s.input_tokens)} in / {formatTokens(s.output_tokens)} out</span>
+        <span className="usage-number">${s.cost_usd.toFixed(4)}{s.credits > 0 ? ` · ${s.credits.toFixed(1)} cr` : ""}</span>
+        <span>{s.last_seen ? formatTime(s.last_seen) : "—"}</span>
+      </div>)}
+    </div> : <EmptyState title="No sessions yet" detail="Sessions appear when an agent sends a session id (metadata.user_id or x-session-id)." />}
+  </Panel>;
+}
+
+/// Projects: usage grouped by the working directory agents run in. Rename,
+/// color, budget, and merge — the management magpie offers per folder.
+function ProjectsPanel({ projects, onChanged, notify }: { projects: ProjectRow[]; onChanged: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {
+  const [editing, setEditing] = useState<ProjectRow | null>(null);
+  const [mergeFrom, setMergeFrom] = useState<string | null>(null);
+  const save = async (id: string, patch: { name?: string; color?: string; budget_tokens?: number | null; budget_cost?: number | null }) => {
+    try {
+      await updateProject(id, patch);
+      setEditing(null);
+      await onChanged();
+      notify("Project updated");
+    } catch (error) {
+      notify((error as Error).message, true);
+    }
+  };
+  const merge = async (from: string, into: string) => {
+    if (!from || !into || from === into) return;
+    if (!window.confirm(`Merge all usage of\n${from}\ninto\n${into}? This re-keys the history.`)) return;
+    try {
+      await mergeProjects(from, into);
+      setMergeFrom(null);
+      notify("Projects merged");
+      await onChanged();
+    } catch (error) {
+      notify((error as Error).message, true);
+    }
+  };
+  return <Panel eyebrow="USAGE / PROJECTS" title={`${projects.length.toString().padStart(2, "0")} projects`} action={<Button variant="quiet" icon="refresh" onClick={() => onChanged().then(() => notify("Projects refreshed"))}>Refresh</Button>}>
+    {projects.length ? <div className="project-list">
+      {projects.map((project) => {
+        const tokenBudget = project.budget_tokens ? Math.min(1, project.input_tokens / project.budget_tokens) : null;
+        const costBudget = project.budget_cost ? Math.min(1, project.cost_usd / project.budget_cost) : null;
+        return <div className="project-card" key={project.id}>
+          <div className="project-top">
+            <span className="project-dot" style={{ background: project.color }} />
+            <div className="project-title">
+              <strong>{project.name}</strong>
+              <span title={project.id}>{project.id}</span>
+            </div>
+            <div className="project-actions">
+              <Button variant="quiet" onClick={() => setEditing(project)}>Edit</Button>
+              {mergeFrom === null
+                ? <Button variant="quiet" onClick={() => setMergeFrom(project.id)}>Merge…</Button>
+                : <select className="merge-select" defaultValue="" onChange={(event) => { const into = event.target.value; setMergeFrom(null); merge(project.id, into); }}>
+                    <option value="" disabled>Merge into…</option>
+                    {projects.filter((p) => p.id !== project.id).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+                  </select>}
+            </div>
+          </div>
+          <div className="project-stats">
+            <span>{project.requests} requests{project.failed ? ` · ${project.failed} failed` : ""}</span>
+            <span>{formatTokens(project.input_tokens)} in · {formatTokens(project.output_tokens)} out</span>
+            <span className="usage-number">${project.cost_usd.toFixed(4)}</span>
+            {project.credits > 0 && <span className="usage-credits">{project.credits.toFixed(1)} credits</span>}
+            <span className="project-last">{project.last_seen ? `last ${formatTime(project.last_seen)}` : "no requests in range"}</span>
+          </div>
+          {(tokenBudget !== null || costBudget !== null) && <div className="project-budgets">
+            {tokenBudget !== null && <div className="budget-row"><span>TOKENS</span><div className="budget-track"><i className={tokenBudget > 0.9 ? "budget-fill budget-hot" : "budget-fill"} style={{ width: `${tokenBudget * 100}%` }} /></div><span>{Math.round(tokenBudget * 100)}%</span></div>}
+            {costBudget !== null && <div className="budget-row"><span>COST</span><div className="budget-track"><i className={costBudget > 0.9 ? "budget-fill budget-hot" : "budget-fill"} style={{ width: `${costBudget * 100}%` }} /></div><span>{Math.round(costBudget * 100)}%</span></div>}
+          </div>}
+        </div>;
+      })}
+    </div> : <EmptyState title="No projects yet" detail="Projects appear when an agent reports its working directory (x-project / x-cwd header, metadata.cwd, or Claude Code's metadata.user_id)." />}
+    {editing && <ProjectEditModal project={editing} onClose={() => setEditing(null)} onSave={save} />}
+  </Panel>;
+}
+
+function ProjectEditModal({ project, onClose, onSave }: { project: ProjectRow; onClose: () => void; onSave: (id: string, patch: { name?: string; color?: string; budget_tokens?: number | null; budget_cost?: number | null }) => void }) {
+  const [name, setName] = useState(project.name);
+  const [color, setColor] = useState(project.color);
+  const [budgetTokens, setBudgetTokens] = useState(project.budget_tokens?.toString() ?? "");
+  const [budgetCost, setBudgetCost] = useState(project.budget_cost?.toString() ?? "");
+  return <Modal title="Edit project" onClose={onClose}>
+    <div className="form-stack">
+      <Field label="Name"><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder={project.id} /></Field>
+      <Field label="Color"><input value={color} onChange={(event) => setColor(event.target.value)} placeholder="#9ef0bf" /><small className="field-help">Any CSS color.</small></Field>
+      <Field label="Token budget"><input type="number" value={budgetTokens} onChange={(event) => setBudgetTokens(event.target.value)} placeholder="no budget" /><small className="field-help">A cap for the bar; leave empty for none.</small></Field>
+      <Field label="Cost budget (USD)"><input type="number" value={budgetCost} onChange={(event) => setBudgetCost(event.target.value)} placeholder="no budget" /></Field>
+    </div>
+    <div className="modal-footer">
+      <Button variant="secondary" onClick={onClose}>Cancel</Button>
+      <Button variant="primary" onClick={() => onSave(project.id, {
+        name,
+        color,
+        budget_tokens: budgetTokens.trim() ? Number(budgetTokens) : null,
+        budget_cost: budgetCost.trim() ? Number(budgetCost) : null,
+      })}>Save</Button>
+    </div>
+  </Modal>;
+}
+
+/// How full each request's window was, and what filled it.
+function ContextPanel({ usage }: { usage: UsageData }) {
+  const rows = usage.context.by_provider;
+  const t = usage.context.totals;
+  const total = t.system_tokens + t.tool_tokens + t.file_tokens + t.conversation_tokens || 1;
+  return <>
+    <Panel eyebrow="USAGE / CONTEXT" title="What fills the window">
+      {!usage.context.captured ? <EmptyState title="No context captured yet" detail="The breakdown appears after the next request through the gateway." /> : <div className="context-totals">
+        <div className="context-bar">
+          <i className="ctx-system" style={{ width: `${(t.system_tokens / total) * 100}%` }} title={`System: ${formatTokens(t.system_tokens)}`} />
+          <i className="ctx-tools" style={{ width: `${(t.tool_tokens / total) * 100}%` }} title={`Tools: ${formatTokens(t.tool_tokens)}`} />
+          <i className="ctx-files" style={{ width: `${(t.file_tokens / total) * 100}%` }} title={`Files: ${formatTokens(t.file_tokens)}`} />
+          <i className="ctx-conv" style={{ width: `${(t.conversation_tokens / total) * 100}%` }} title={`Conversation: ${formatTokens(t.conversation_tokens)}`} />
+        </div>
+        <div className="context-legend">
+          <span><i className="dot dot-system" />system {formatTokens(t.system_tokens)}</span>
+          <span><i className="dot dot-tools" />tools {formatTokens(t.tool_tokens)}</span>
+          <span><i className="dot dot-files" />files {formatTokens(t.file_tokens)}</span>
+          <span><i className="dot dot-conv" />conversation {formatTokens(t.conversation_tokens)}</span>
+        </div>
+      </div>}
+    </Panel>
+    <Panel eyebrow="USAGE / CONTEXT BY PROVIDER" title="Per platform">
+      {rows.length ? <div className="model-table">
+        <div className="model-head"><span>PROVIDER</span><span>REQUESTS</span><span>AVG FILL</span><span>SYSTEM / TOOLS / FILES / CONV</span></div>
+        {rows.map((row) => <div className="model-row" key={row.provider}>
+          <div className="model-name"><span className="model-bullet" /><strong>{row.provider}</strong></div>
+          <span>{row.requests}</span>
+          <span>{row.avg_fill > 0 ? `${Math.round(row.avg_fill * 100)}%` : "—"}</span>
+          <span>{formatTokens(row.system_tokens)} / {formatTokens(row.tool_tokens)} / {formatTokens(row.file_tokens)} / {formatTokens(row.conversation_tokens)}</span>
+        </div>)}
+      </div> : <EmptyState title="No provider breakdown" detail="Fill levels appear after the next request." />}
+    </Panel>
+  </>;
+}
+
+/// Balances and quota windows per account, the way magpie lists plans.
+function QuotaPanel({ usage }: { usage: UsageData }) {
+  const accounts = usage.quota ?? [];
+  return <Panel eyebrow="USAGE / QUOTA" title="Balances and windows">
+    {accounts.length ? <div className="quota-list">
+      {accounts.map((account) => <div className="quota-account" key={account.provider}>
+        <div className="quota-head"><strong>{account.name}</strong><span>{account.kind}{account.user ? ` · ${account.user}` : ""}{account.unlimited ? " · token-billed" : ""}</span></div>
+        {account.windows.length ? account.windows.map((w) => <div className="quota-window" key={w.name}>
+          <div className="quota-line"><span>{w.name}</span><strong>{w.display}</strong></div>
+          {!w.unlimited && <div className="budget-track quota-track"><i className={w.remaining <= 0 ? "budget-fill budget-hot" : "budget-fill"} style={{ width: `${w.used + w.remaining > 0 ? (w.used / (w.used + w.remaining)) * 100 : 0}%` }} /></div>}
+          {w.resets_at && <div className="quota-reset">resets {formatTime(w.resets_at)}</div>}
+        </div>) : <span className="quota-empty">{account.error ? account.error : "no quota windows"}</span>}
+      </div>)}
+    </div> : <EmptyState title="No accounts" detail="Add a provider to see its balance here." />}
+  </Panel>;
+}
+
+/// Bills: who paid, by caller key and by agent.
+function BillsPanel({ usage }: { usage: UsageData }) {
+  return <div className="content-grid content-grid-secondary">
+    <Panel eyebrow="BILLS / BY CALLER KEY" title="Per caller key">
+      <div className="usage-list">{usage.by_key.length ? usage.by_key.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.input_tokens + value.output_tokens)} tokens</span></div><span className="usage-number">${value.cost_usd.toFixed(4)}</span></div>) : <EmptyState title="No keys used" detail="Bills appear after the first call." />}</div>
+    </Panel>
+    <Panel eyebrow="BILLS / BY AGENT" title="Per agent">
+      <div className="usage-list">{usage.by_agent.length ? usage.by_agent.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.input_tokens + value.output_tokens)} tokens</span></div><span className="usage-number">${value.cost_usd.toFixed(4)}</span></div>) : <EmptyState title="No agents identified" detail="Agents are named from their User-Agent (claude-code, codex, pi…)." />}</div>
+    </Panel>
+  </div>;
 }
 
 function SettingsPanel({ settings, callerKeys, setCallerKeys, onChanged, notify }: { settings: Settings; callerKeys: CallerKey[]; setCallerKeys: (keys: CallerKey[]) => void; onChanged: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {

@@ -1,4 +1,4 @@
-export type Protocol = "openai_chat" | "openai_responses" | "anthropic" | "gemini";
+export type Protocol = "openai_chat" | "openai_responses" | "anthropic" | "gemini" | "qwenwork";
 
 export interface Settings {
   gateway_port: number;
@@ -11,6 +11,10 @@ export interface Settings {
   masking: boolean;
   record_usage: boolean;
   locale: string;
+  /** Origins a browser may call the gateway from. Empty means none. */
+  cors_origins: string[];
+  /** Claim the WorkBuddy account's daily check-in automatically. */
+  workbuddy_auto_checkin: boolean;
 }
 
 export interface Status {
@@ -43,8 +47,8 @@ export interface Provider {
   auto_include: string[];
   catalog?: string;
   group_only: boolean;
-  /** Where the credential comes from; "workbuddy" means the local session. */
-  auth?: "workbuddy";
+  /** Where the credential comes from; a local app's login session. */
+  auth?: "workbuddy" | "qwenwork";
   chat_path?: string;
   /** The upstream only answers streaming requests. */
   stream_only?: boolean;
@@ -121,17 +125,97 @@ export interface UsageRecord {
   ok: boolean;
   error?: string;
   agent?: string;
+  session_id?: string;
+  project?: string;
 }
 
 export type UsageStorage = "sqlite" | "jsonl";
 
+export interface SessionRow {
+  id: string;
+  title: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  credits: number;
+  failed: number;
+  last_seen: string;
+}
+
+export interface ProjectRow {
+  id: string;
+  name: string;
+  color: string;
+  created_at: string;
+  budget_tokens?: number | null;
+  budget_cost?: number | null;
+  requests: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_usd: number;
+  credits: number;
+  last_seen: string;
+}
+
+export interface TimelinePoint {
+  hour: string;
+  requests: number;
+}
+
+export interface ContextProviderRow {
+  provider: string;
+  requests: number;
+  avg_fill: number;
+  system_tokens: number;
+  tool_tokens: number;
+  file_tokens: number;
+  conversation_tokens: number;
+  cache_read_tokens: number;
+}
+
+export interface QuotaWindow {
+  name: string;
+  used: number;
+  remaining: number;
+  resets_at: string | null;
+  display: string;
+  unit: string;
+  unlimited: boolean;
+  holds_why?: string | null;
+}
+
+export interface QuotaAccount {
+  provider: string;
+  name: string;
+  kind: string;
+  user?: string;
+  windows: QuotaWindow[];
+  unlimited: boolean;
+  error?: string;
+  read_at?: string;
+}
+
 export interface UsageData {
   storage?: UsageStorage;
+  currency?: string;
   totals: UsageTotals;
   by_model: [string, UsageTotals][];
   by_provider_costs: Record<string, UsageTotals>;
   by_provider: [string, UsageTotals][];
   by_day: [string, UsageTotals][];
+  by_agent: [string, UsageTotals][];
+  by_key: [string, UsageTotals][];
+  by_project: [string, UsageTotals][];
+  by_session: SessionRow[];
+  requests_timeline: TimelinePoint[];
+  context: {
+    by_provider: ContextProviderRow[];
+    totals: { system_tokens: number; tool_tokens: number; file_tokens: number; conversation_tokens: number };
+    captured: boolean;
+  };
+  quota: QuotaAccount[];
   recent: UsageRecord[];
 }
 

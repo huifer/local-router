@@ -3,6 +3,7 @@ import type {
   Group,
   ModelItem,
   PresetGroup,
+  ProjectRow,
   Provider,
   Settings,
   Status,
@@ -77,7 +78,12 @@ export const getProviders = () => api<{ providers: Provider[] }>("/api/providers
 export const getGroups = () => api<{ groups: Group[] }>("/api/groups");
 export const getModels = () => api<{ models: ModelItem[] }>("/api/models");
 export const getPresets = () => api<{ presets: PresetGroup[] }>("/api/presets");
-export const getUsage = () => api<UsageData>("/api/usage");
+export const getUsage = (period = "7d") => api<UsageData>(`/api/usage?period=${period}`);
+export const getProjects = (period = "7d") => api<{ projects: ProjectRow[] }>(`/api/projects?period=${period}`);
+export const updateProject = (id: string, patch: { name?: string; color?: string; budget_tokens?: number | null; budget_cost?: number | null }) =>
+  api<{ ok: boolean; projects: ProjectRow[] }>(`/api/projects?id=${encodeURIComponent(id)}`, { method: "PATCH", body: patch });
+export const mergeProjects = (from: string, into: string) =>
+  api<{ ok: boolean; projects: ProjectRow[] }>("/api/projects/merge", { method: "POST", body: { from, into } });
 export const getCallerKeys = () => api<{ keys: CallerKey[] }>("/api/caller-keys");
 
 export const getWorkBuddy = () => api<WorkBuddyStatus>("/api/workbuddy");

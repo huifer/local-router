@@ -88,6 +88,9 @@ pub enum AuthKind {
     /// The WorkBuddy app's own login session, read from the machine.
     #[serde(rename = "workbuddy")]
     WorkBuddy,
+    /// A QwenWork (千问办公) device-flow login, stored in a local file.
+    #[serde(rename = "qwenwork")]
+    QwenWork,
 }
 
 fn yes() -> bool {
@@ -218,7 +221,10 @@ impl Provider {
     /// Whether this provider authenticates with a local app's session
     /// rather than a key stored in the config.
     pub fn uses_session(&self) -> bool {
-        self.auth == Some(AuthKind::WorkBuddy)
+        matches!(
+            self.auth,
+            Some(AuthKind::WorkBuddy) | Some(AuthKind::QwenWork)
+        )
     }
 }
 
@@ -244,6 +250,9 @@ impl Provider {
             Protocol::Anthropic => self.anthropic_base_url.clone().or(self.base_url.clone()),
             Protocol::OpenAiResponses => self.responses_base_url.clone().or(self.base_url.clone()),
             Protocol::Gemini => self.gemini_base_url.clone().or(self.base_url.clone()),
+            // A QwenWork provider never goes through the generic HTTP
+            // client, so any URL will do; the module uses its own host.
+            Protocol::QwenWork => self.base_url.clone(),
         };
         specific.filter(|u| !u.trim().is_empty())
     }
@@ -457,6 +466,221 @@ pub struct Config {
     pub groups: Vec<Group>,
     pub settings: Settings,
     pub caller_keys: Vec<CallerKey>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn provider(id: &str, url: &str) -> Provider {
+        Provider {
+            id: id.into(),
+            name: id.into(),
+            base_url: Some(url.into()),
+            ..Provider::default()
+        }
+    }
+
+    // ----------------------------------------------------- split_model --
+
+    #[test]
+    fn split_model_requires_both_halves() {
+        assert_eq!(
+            Config::split_model("deepseek/deepseek-chat"),
+            Some(("deepseek", "deepseek-chat"))
+        );
+        assert_eq!(
+            Config::split_model("group/backup"),
+            Some(("group", "backup"))
+        );
+        assert_eq!(Config::split_model("noslash"), None);
+        assert_eq!(Config::split_model("/noname"), None);
+        assert_eq!(Config::split_model("noprov/"), None);
+        // Only the first slash splits: the rest rides with the model id.
+        assert_eq!(Config::split_model("a/b/c"), Some(("a", "b/c")));
+    }
+
+    // -------------------------------------------------- base_url_for --
+
+    #[test]
+    fn base_url_for_falls_back_from_specific_to_generic() {
+        let mut p = provider("v", "https://api.vendor.com/v1");
+        assert_eq!(
+            p.base_url_for(Protocol::OpenAiChat).as_deref(),
+            Some("https://api.vendor.com/v1")
+        );
+        // No Anthropic URL: the generic one covers it.
+        assert_eq!(
+            p.base_url_for(Protocol::Anthropic).as_deref(),
+            Some("https://api.vendor.com/v1")
+        );
+        p.anthropic_base_url = Some("https://anthropic.vendor.com".into());
+        assert_eq!(
+            p.base_url_for(Protocol::Anthropic).as_deref(),
+            Some("https://anthropic.vendor.com")
+        );
+        p.responses_base_url = Some("https://responses.vendor.com".into());
+        assert_eq!(
+            p.base_url_for(Protocol::OpenAiResponses).as_deref(),
+            Some("https://responses.vendor.com")
+        );
+        p.gemini_base_url = Some("https://gemini.vendor.com".into());
+        assert_eq!(
+            p.base_url_for(Protocol::Gemini).as_deref(),
+            Some("https://gemini.vendor.com")
+        );
+    }
+
+    #[test]
+    fn base_url_for_treats_blank_urls_as_absent() {
+        let mut p = provider("v", "  ");
+        p.anthropic_base_url = Some("".into());
+        assert_eq!(p.base_url_for(Protocol::OpenAiChat), None);
+        assert_eq!(p.base_url_for(Protocol::Anthropic), None);
+    }
+
+    // ------------------------------------------------------ enabled_keys --
+
+    #[test]
+    fn enabled_keys_skips_disabled_and_blank() {
+        let p = Provider {
+            keys: vec![
+                ProviderKey::new("sk-live"),
+                ProviderKey {
+                    enabled: false,
+                    ..ProviderKey::new("sk-off")
+                },
+                ProviderKey::new("   "),
+            ],
+            ..Provider::default()
+        };
+        let live: Vec<&str> = p.enabled_keys().map(|k| k.key.as_str()).collect();
+        assert_eq!(live, vec!["sk-live"]);
+    }
+
+    // ---------------------------------------------------- uses_session --
+
+    #[test]
+    fn session_providers_need_no_stored_key() {
+        let mut p = Provider::default();
+        assert!(!p.uses_session());
+        p.auth = Some(AuthKind::WorkBuddy);
+        assert!(p.uses_session());
+        p.auth = Some(AuthKind::QwenWork);
+        assert!(p.uses_session());
+        p.auth = Some(AuthKind::Stored);
+        assert!(!p.uses_session());
+    }
+
+    // ------------------------------------------------------- settings --
+
+    #[test]
+    fn settings_round_trip_with_defaults_for_new_fields() {
+        // An old config file without cors_origins / workbuddy_auto_checkin
+        // must still parse; serde fills the defaults.
+        let old = r#"{
+            "gateway_port": 4000,
+            "web_port": 4001,
+            "lan": false,
+            "gateway_addr": "127.0.0.1",
+            "web_addr": "127.0.0.1",
+            "default_caller_key": "k",
+            "send_agent_user_agent": false,
+            "masking": false,
+            "record_usage": true,
+            "locale": "zh-CN"
+        }"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.gateway_port, 4000);
+        assert!(settings.cors_origins.is_empty());
+        assert!(settings.workbuddy_auto_checkin);
+    }
+
+    #[test]
+    fn routing_names_are_snake_case_on_the_wire() {
+        for routing in [
+            Routing::Smart,
+            Routing::Order,
+            Routing::Rotate,
+            Routing::Usage,
+            Routing::Weight,
+        ] {
+            let wire = serde_json::to_value(routing).unwrap();
+            let back: Routing = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, routing);
+            assert_eq!(back.as_str(), routing.as_str());
+        }
+    }
+
+    // ------------------------------------------------------ config io --
+
+    #[test]
+    fn a_config_file_round_trips_through_the_store() {
+        let dir =
+            std::env::temp_dir().join(format!("local-router-config-unit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::at(dir.join("config.json"));
+        let mut config = Config::default();
+        config
+            .providers
+            .push(provider("deepseek", "https://api.deepseek.com/v1"));
+        config.providers[0].models = vec!["deepseek-chat".into()];
+        config.groups.push(Group {
+            id: "backup".into(),
+            name: "Backup".into(),
+            models: vec!["deepseek/deepseek-chat".into()],
+            routing: Routing::Order,
+            stays: Stays::default(),
+            weights: BTreeMap::new(),
+            listed: true,
+            note: None,
+        });
+        config.caller_keys.push(CallerKey {
+            id: "k1".into(),
+            name: "laptop".into(),
+            key: "sk-caller".into(),
+            enabled: true,
+            daily_tokens: None,
+            monthly_cost: None,
+        });
+        store.save(&config).unwrap();
+
+        // The file lands with owner-only permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(store.path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "config.json must be 0600");
+        }
+
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.providers.len(), 1);
+        assert_eq!(loaded.providers[0].models, vec!["deepseek-chat"]);
+        assert_eq!(loaded.groups[0].routing, Routing::Order);
+        assert_eq!(loaded.caller_keys[0].key, "sk-caller");
+        // The mtime probe the hot reload depends on.
+        assert!(store.mtime().is_some());
+        // The usage log lives next to the config, not in a global directory.
+        assert_eq!(store.usage_path(), dir.join("usage.jsonl"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_config_file_loads_as_default() {
+        let dir =
+            std::env::temp_dir().join(format!("local-router-config-unit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::at(dir.join("config.json"));
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.settings.gateway_port, 3425);
+        assert_eq!(loaded.settings.web_port, 3426);
+        assert!(loaded.providers.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 impl Config {

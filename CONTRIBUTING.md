@@ -2,7 +2,7 @@
 
 谢谢愿意贡献！这份项目保持小而清晰：本地优先、单二进制、只做网页模式 +
 CLI。提交改动前请先读 README 的「范围与取舍」，明确不做的方向就不必提了
-（桌面客户端、TUI、订阅账号登录态等）。
+（桌面客户端、插件生态、QwenWork 企业版等）。
 
 ## 开发环境
 
@@ -12,8 +12,13 @@ CLI。提交改动前请先读 README 的「范围与取舍」，明确不做的
 ```sh
 git clone <仓库地址> && cd local-router
 npm ci --prefix frontend          # 控制台依赖（锁定文件已提交）
-cargo test                        # 47 个测试：协议翻译 / 路由 / 网关 / 控制台守卫
+cargo test                        # 220 个测试（含 src/ 内的原生单元测试）
 ```
+
+测试分两层：`src/` 内的 `#[cfg(test)]` 原生单元测试（纯逻辑，快）与
+`tests/` 内的集成测试（真起 HTTP）。改哪层就在哪层补用例；控制台的
+字段变更必须同步 `frontend/src/types.ts` 与 `tests/web.rs` 的 API 形状
+用例，两边一起变。
 
 `cargo build` 会通过 `build.rs` 自动调用 npm 构建控制台；没有 npm 的环境
 可设 `LOCAL_ROUTER_SKIP_FRONTEND=1` 用桩页面代替。
@@ -32,12 +37,13 @@ npm run build --prefix frontend
 ## 怎么改
 
 - **协议层**（`src/protocol/`）：改解析 / 格式化请同步补
-  `tests/translate.rs` 的用例，四种协议的往返都要照顾到。
+  `tests/translate.rs` 的用例，四种协议的往返都要照顾到；纯函数（形状
+  判定、名字映射）直接在同文件加 `#[cfg(test)]` 单元测试。
 - **路由**（`src/gateway/route.rs`）：新策略加进 `Routing` 枚举并在
   `tests/routing.rs` 补确定性测试（建议用 order + 粘性成员来验证顺序）。
 - **网关 / 控制台**（`src/gateway/` `src/web/`）：涉及安全的行为（鉴权、
   Origin 校验、密钥掩码）必须在 `tests/web.rs` 或 `tests/gateway.rs` 有
-  对应用例。
+  对应用例；给控制台加新 API 字段时，同步补形状用例和前端类型。
 - **控制台前端**（`frontend/`）：TypeScript 严格模式，别关 `tsc`。
 
 ## 提交信息

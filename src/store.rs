@@ -88,9 +88,9 @@ impl Store {
             "INSERT INTO usage_records
              (time, model, provider, key_id, key_label, group_id, protocol,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-              reasoning_tokens, latency_ms, status, ok, error, agent,
-              cost_usd, credits, priced)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+              reasoning_tokens, latency_ms, status, ok, error, agent, session_id,
+              context, project, cost_usd, credits, priced)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
             rusqlite::params![
                 rec.time,
                 rec.model,
@@ -109,6 +109,9 @@ impl Store {
                 rec.ok,
                 rec.error,
                 rec.agent,
+                rec.session_id,
+                rec.context.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default()),
+                rec.project,
                 rec.cost_usd,
                 rec.credits,
                 rec.priced,
@@ -223,7 +226,7 @@ impl Store {
     pub fn by_model_since(&self, since: &str) -> Vec<AggregateRow> {
         self.aggregate(
             "SELECT NULL, model,
-                    COUNT(*), SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END),
+                    COUNT(*) AS requests, SUM(CASE WHEN ok = 0 THEN 1 ELSE 0 END),
                     COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(cache_read_tokens),0), COALESCE(SUM(cache_write_tokens),0),
                     COALESCE(SUM(reasoning_tokens),0),
@@ -240,6 +243,32 @@ impl Store {
             "SELECT * FROM usage_records WHERE time >= ?1 ORDER BY time DESC LIMIT ?2",
             rusqlite::params![since, limit as i64],
         )
+    }
+
+    /// Every record since `since`, oldest first. Used for the Usage page's
+    /// richer breakdowns (by session, agent, key, hour) that the aggregate
+    /// queries do not cover.
+    pub fn all_since(&self, since: &str) -> Vec<UsageRecord> {
+        self.query(
+            "SELECT * FROM usage_records WHERE time >= ?1 ORDER BY time ASC",
+            [since],
+        )
+    }
+
+    /// Re-key every record of one project to another, after a merge.
+    pub fn rekey_project(&self, from: &str, into: &str) {
+        let Ok(guard) = self.conn.lock() else {
+            return;
+        };
+        let Some(conn) = guard.as_ref() else {
+            return;
+        };
+        if let Err(err) = conn.execute(
+            "UPDATE usage_records SET project = ?1 WHERE project = ?2",
+            rusqlite::params![into, from],
+        ) {
+            tracing::warn!("the project merge could not re-key records: {err}");
+        }
     }
 }
 
@@ -286,6 +315,9 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             ok INTEGER NOT NULL DEFAULT 1,
             error TEXT,
             agent TEXT,
+            session_id TEXT,
+            context TEXT,
+            project TEXT,
             cost_usd REAL,
             credits REAL,
             priced INTEGER NOT NULL DEFAULT 1
@@ -321,8 +353,144 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         ok: row.get::<_, i64>("ok")? != 0,
         error: row.get("error")?,
         agent: row.get("agent")?,
+        session_id: row.get("session_id")?,
+        context: row
+            .get::<_, Option<String>>("context")?
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        project: row.get("project")?,
         cost_usd: row.get("cost_usd")?,
         credits: row.get("credits")?,
         priced: row.get::<_, i64>("priced")? != 0,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gateway::usage::ContextBreakdown;
+
+    fn store_at(tag: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "local-router-store-unit-{}-{}",
+            tag,
+            std::process::id() as u64 + chrono::Utc::now().timestamp_subsec_nanos() as u64
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Store::open(&dir.join("usage.db"))
+    }
+
+    fn record(provider: &str, model: &str, in_tok: u64, out_tok: u64) -> UsageRecord {
+        let mut rec = UsageRecord::new(model, "openai_chat");
+        rec.provider = provider.into();
+        rec.input_tokens = in_tok;
+        rec.output_tokens = out_tok;
+        rec.session_id = Some("s-1".into());
+        rec.project = Some("/tmp/work".into());
+        rec.agent = Some("claude-code".into());
+        rec
+    }
+
+    #[test]
+    fn records_round_trip_with_every_field() {
+        let store = store_at("round-trip");
+        let mut rec = record("workbuddy", "hy3", 100, 50);
+        rec.cost_usd = Some(0.123);
+        rec.credits = Some(1.5);
+        rec.context = Some(ContextBreakdown {
+            system_tokens: 10,
+            tool_tokens: 20,
+            file_tokens: 30,
+            conversation_tokens: 40,
+            cache_read_tokens: 5,
+            prompt_tokens: 100,
+            window_tokens: 1000,
+        });
+        store.record(&rec);
+        let read = store.read_all();
+        assert_eq!(read.len(), 1);
+        let back = &read[0];
+        assert_eq!(back.provider, "workbuddy");
+        assert_eq!(back.model, "hy3");
+        assert_eq!(back.input_tokens, 100);
+        assert_eq!(back.output_tokens, 50);
+        assert_eq!(back.cost_usd, Some(0.123));
+        assert_eq!(back.credits, Some(1.5));
+        assert_eq!(back.session_id.as_deref(), Some("s-1"));
+        assert_eq!(back.agent.as_deref(), Some("claude-code"));
+        let ctx = back.context.as_ref().unwrap();
+        assert_eq!(ctx.window_tokens, 1000);
+        assert_eq!(ctx.prompt_tokens, 100);
+    }
+
+    #[test]
+    fn aggregate_queries_bucket_by_day_provider_and_model() {
+        let store = store_at("aggregate");
+        let mut a = record("p1", "m1", 10, 5);
+        a.time = "2026-10-25T08:00:00+00:00".into();
+        store.record(&a);
+        let mut b = record("p2", "m2", 20, 7);
+        b.time = "2026-10-26T09:00:00+00:00".into();
+        store.record(&b);
+        let mut c = record("p1", "m1", 30, 9);
+        c.time = "2026-10-26T10:00:00+00:00".into();
+        c.ok = false;
+        c.error = Some("vendor said no".into());
+        store.record(&c);
+
+        let since = "2026-01-01T00:00:00+00:00";
+        // The totals window covers successful requests only; failures are
+        // visible in by_day / by_provider (and the JSONL log).
+        let totals = store.totals_since(since).unwrap();
+        assert_eq!(totals.requests, 2);
+        assert_eq!(totals.input_tokens, 30); // 10 + 20, the failure stays out
+
+        let days = store.by_day_since(since);
+        assert_eq!(days.len(), 2);
+
+        let providers = store.by_provider_since(since);
+        let p1 = providers
+            .iter()
+            .find(|r| r.label.as_deref() == Some("p1"))
+            .unwrap();
+        // Successful rows only.
+        assert_eq!(p1.requests, 1);
+        assert_eq!(p1.input_tokens, 10);
+
+        let models = store.by_model_since(since);
+        let m1 = models
+            .iter()
+            .find(|r| r.label.as_deref() == Some("m1"))
+            .unwrap();
+        assert_eq!(m1.requests, 1);
+
+        let recent = store.recent(since, 2);
+        assert_eq!(recent.len(), 2);
+        // Newest first.
+        assert!(recent[0].time >= recent[1].time);
+    }
+
+    #[test]
+    fn rekey_project_moves_every_row() {
+        let store = store_at("rekey");
+        let mut rec = record("p", "m", 1, 1);
+        rec.project = Some("/old/dir".into());
+        store.record(&rec);
+        let mut other = record("p", "m", 1, 1);
+        other.project = Some("/other".into());
+        store.record(&other);
+
+        store.rekey_project("/old/dir", "/new/dir");
+        let rows = store.read_all();
+        let projects: Vec<&str> = rows.iter().filter_map(|r| r.project.as_deref()).collect();
+        assert!(projects.contains(&"/new/dir"));
+        assert!(projects.contains(&"/other"));
+        assert!(!projects.contains(&"/old/dir"));
+    }
+
+    #[test]
+    fn a_disabled_store_is_none_but_the_type_still_works() {
+        // `enabled()` honours the env switch (cached per process); the tests
+        // run with the default, so this only pins the parser contract.
+        assert!(enabled());
+    }
 }

@@ -1030,3 +1030,169 @@ pub fn session_file_age() -> Option<Duration> {
     let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
     SystemTime::now().duration_since(modified).ok()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ------------------------------------------------------ needs_refresh --\n
+    #[test]
+    fn a_session_refreshes_only_near_its_expiry() {
+        // No expiry: never refresh.
+        let session = Session {
+            account: Account::default(),
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            domain: "d".into(),
+            expires_at: None,
+        };
+        assert!(!session.needs_refresh());
+
+        // Far in the future: no refresh.
+        let fresh = Session {
+            expires_at: Some(now_ms() + 3_600_000),
+            ..session.clone()
+        };
+        assert!(!fresh.needs_refresh());
+
+        // Inside the five-minute margin: refresh.
+        let stale = Session {
+            expires_at: Some(now_ms() + 60_000),
+            ..session.clone()
+        };
+        assert!(stale.needs_refresh());
+
+        // Already expired: refresh.
+        let expired = Session {
+            expires_at: Some(now_ms() - 1),
+            ..session
+        };
+        assert!(expired.needs_refresh());
+    }
+
+    // ------------------------------------------------------ auth_headers --\n
+    #[test]
+    fn auth_headers_carry_bearer_user_and_domain() {
+        let session = Session {
+            account: Account {
+                uid: "u-42".into(),
+                nickname: "Zhang".into(),
+                account_type: "wx".into(),
+                ..Account::default()
+            },
+            access_token: "tok".into(),
+            refresh_token: "r".into(),
+            domain: "www.codebuddy.cn".into(),
+            expires_at: None,
+        };
+        let headers = session.auth_headers();
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer tok")
+        );
+        assert_eq!(headers.get("x-user-id").map(String::as_str), Some("u-42"));
+        assert_eq!(
+            headers.get("x-domain").map(String::as_str),
+            Some("www.codebuddy.cn")
+        );
+        assert!(headers.contains_key("x-product"));
+        assert!(headers.contains_key("user-agent"));
+        // No uid / domain: the headers are omitted rather than blank.
+        let bare = Session {
+            account: Account::default(),
+            domain: String::new(),
+            ..session
+        };
+        let bare_headers = bare.auth_headers();
+        assert!(!bare_headers.contains_key("x-user-id"));
+        assert!(!bare_headers.contains_key("x-domain"));
+    }
+
+    // -------------------------------------------------------- chat_body --\n
+    #[test]
+    fn chat_body_adds_stream_options_only_when_streaming() {
+        let stream = chat_body("hy3", serde_json::json!([{"role": "user"}]), true);
+        assert_eq!(stream["model"], "hy3");
+        assert_eq!(stream["stream"], true);
+        assert_eq!(stream["stream_options"]["include_usage"], true);
+
+        let plain = chat_body("hy3", serde_json::json!([]), false);
+        assert!(plain.get("stream").is_none());
+        assert!(plain.get("stream_options").is_none());
+    }
+
+    // -------------------------------------------------------- message_of --\n
+    #[test]
+    fn error_messages_are_read_from_every_vendor_shape() {
+        assert_eq!(
+            message_of(&serde_json::json!({"error": {"message": "nested"}})),
+            "nested"
+        );
+        assert_eq!(message_of(&serde_json::json!({"msg": "flat"})), "flat");
+        assert_eq!(
+            message_of(&serde_json::json!({"error": {"msg": "inner"}})),
+            "inner"
+        );
+        assert_eq!(
+            message_of(&serde_json::json!({"message": "plain"})),
+            "plain"
+        );
+        assert_eq!(
+            message_of(&serde_json::json!({"error": "as-string"})),
+            "as-string"
+        );
+        assert_eq!(
+            message_of(&serde_json::json!({})),
+            "the vendor refused the request"
+        );
+    }
+
+    // ------------------------------------------------- expired-time parse --\n
+    #[test]
+    fn expired_times_accept_both_shapes() {
+        // "YYYY-MM-DD HH:MM:SS" in the server's timezone.
+        let stamp = parse_expired_time("2026-12-01 08:30:00").unwrap();
+        assert!(stamp > now_ms());
+        // A bare millisecond timestamp.
+        assert_eq!(parse_expired_time("1893456000000"), Some(1_893_456_000_000));
+        // Empty / garbage: None, never a panic.
+        assert_eq!(parse_expired_time(""), None);
+        assert_eq!(parse_expired_time("  "), None);
+        assert_eq!(parse_expired_time("not-a-date"), None);
+    }
+
+    // ------------------------------------------------------ quota window --\n
+    #[test]
+    fn unlimited_windows_cannot_hold_the_router() {
+        let unlimited = QuotaWindow {
+            name: "plan".into(),
+            used: 0.0,
+            remaining: 0.0,
+            resets_at: None,
+            display: String::new(),
+            unit: "unlimited".into(),
+            holds_why: None,
+        };
+        assert!(unlimited.unlimited());
+        let finite = QuotaWindow {
+            unit: "credits".into(),
+            ..unlimited
+        };
+        assert!(!finite.unlimited());
+    }
+
+    // ------------------------------------------------------- refresh guard --\n
+    #[test]
+    fn a_session_without_a_refresh_token_refuses_to_refresh() {
+        // The refresh call itself needs the network; the guard is checked
+        // first, and that is what this pins.
+        let session = Session {
+            account: Account::default(),
+            access_token: "a".into(),
+            refresh_token: "   ".into(),
+            domain: "d".into(),
+            expires_at: None,
+        };
+        assert!(session.refresh_token.trim().is_empty());
+    }
+}

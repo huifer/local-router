@@ -370,3 +370,67 @@ pub fn weighted_order(
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn weights(pairs: &[(&str, u32)]) -> BTreeMap<String, u32> {
+        pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+    }
+
+    #[test]
+    fn weighted_order_interleaves_proportionally() {
+        // a=3, b=1 over one full cycle of four: three a for every one b.
+        let order = weighted_order(
+            &["a".into(), "b".into()],
+            &weights(&[("a", 3), ("b", 1)]),
+            None,
+        );
+        assert_eq!(order.len(), 4);
+        assert_eq!(order.iter().filter(|m| *m == "a").count(), 3);
+        assert_eq!(order.iter().filter(|m| *m == "b").count(), 1);
+        // Never twice in a row when a plain interleave is possible.
+        assert!(weighted_order(
+            &["a".into(), "b".into()],
+            &weights(&[("a", 2), ("b", 2)]),
+            None
+        )
+        .windows(2)
+        .all(|w| w[0] != w[1]));
+    }
+
+    #[test]
+    fn weighted_order_defaults_unweighted_members_to_one() {
+        let order = weighted_order(&["a".into(), "b".into()], &weights(&[("a", 5)]), None);
+        assert_eq!(order.len(), 6);
+        assert_eq!(order.iter().filter(|m| *m == "a").count(), 5);
+        assert_eq!(order.iter().filter(|m| *m == "b").count(), 1);
+    }
+
+    #[test]
+    fn weighted_order_without_weights_is_the_input_order() {
+        let members = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(weighted_order(&members, &BTreeMap::new(), None), members);
+    }
+
+    #[test]
+    fn weighted_order_ignores_zero_weight_never_loops() {
+        // Every weight zero after clamping (clamped to 1, so this passes) —
+        // but an empty member list must not hang.
+        assert!(weighted_order(&[], &weights(&[("a", 1)]), None).is_empty());
+    }
+
+    #[test]
+    fn weighted_order_weights_are_clamped_to_sane_bounds() {
+        // 0 clamps to 1, 5000 clamps to 1000.
+        let order = weighted_order(
+            &["a".into(), "b".into()],
+            &weights(&[("a", 0), ("b", 5000)]),
+            None,
+        );
+        assert_eq!(order.len(), 1001);
+        assert_eq!(order.iter().filter(|m| *m == "b").count(), 1000);
+    }
+}

@@ -23,6 +23,10 @@ pub enum Protocol {
     Anthropic,
     /// `POST /v1beta/models/{model}:generateContent`
     Gemini,
+    /// QwenWork (千问办公): the request is built and COSY-signed by the
+    /// local `qwen` module and never hits the generic OpenAI path.
+    #[serde(rename = "qwenwork")]
+    QwenWork,
 }
 
 impl Protocol {
@@ -32,6 +36,7 @@ impl Protocol {
             Protocol::OpenAiResponses => "openai_responses",
             Protocol::Anthropic => "anthropic",
             Protocol::Gemini => "gemini",
+            Protocol::QwenWork => "qwenwork",
         }
     }
 }
@@ -277,6 +282,9 @@ pub struct ChatRequest {
     pub extra_headers: Vec<(String, String)>,
     /// The caller's session id, when it sent one.
     pub session_id: Option<String>,
+    /// The working directory the caller ran from, when it reported one.
+    /// The key the Usage page groups projects by.
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -416,12 +424,12 @@ impl ChatResponse {
                 }
             }
         }
-        for (_, name, args) in &tools {
+        for (call_id, name, args) in &tools {
             if name.is_empty() && args.is_empty() {
                 continue;
             }
             content.push(ContentBlock::ToolUse {
-                id: String::new(),
+                id: call_id.clone(),
                 name: name.clone(),
                 input: serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!({})),
             });
@@ -529,3 +537,288 @@ impl ApiError {
 }
 
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    // ------------------------------------------------------------ names --
+
+    #[test]
+    fn protocol_names_round_trip_through_json() {
+        for (value, name) in [
+            (Protocol::OpenAiChat, "openai_chat"),
+            (Protocol::OpenAiResponses, "openai_responses"),
+            (Protocol::Anthropic, "anthropic"),
+            (Protocol::Gemini, "gemini"),
+            (Protocol::QwenWork, "qwenwork"),
+        ] {
+            assert_eq!(value.as_str(), name);
+            let wire = serde_json::to_value(value).unwrap();
+            assert_eq!(wire, json!(name));
+            let back: Protocol = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, value);
+        }
+    }
+
+    #[test]
+    fn role_and_stop_reason_names_round_trip() {
+        for role in [Role::System, Role::User, Role::Assistant, Role::Tool] {
+            let back: Role = serde_json::from_value(serde_json::to_value(role).unwrap()).unwrap();
+            assert_eq!(back, role);
+        }
+        for reason in [
+            StopReason::EndTurn,
+            StopReason::MaxTokens,
+            StopReason::StopSequence,
+            StopReason::ToolUse,
+            StopReason::Error,
+        ] {
+            let wire = serde_json::to_value(reason).unwrap();
+            let back: StopReason = serde_json::from_value(wire).unwrap();
+            assert_eq!(back.as_str(), reason.as_str());
+        }
+    }
+
+    // ----------------------------------------------------------- blocks --
+
+    #[test]
+    fn content_blocks_serialize_with_their_tags() {
+        let text = ContentBlock::text("hello");
+        assert_eq!(
+            serde_json::to_value(&text).unwrap(),
+            json!({"type": "text", "text": "hello"})
+        );
+        let use_ = ContentBlock::ToolUse {
+            id: "call_1".into(),
+            name: "read".into(),
+            input: json!({"path": "a.rs"}),
+        };
+        assert_eq!(
+            serde_json::to_value(&use_).unwrap(),
+            json!({"type": "tool_use", "id": "call_1", "name": "read", "input": {"path": "a.rs"}})
+        );
+    }
+
+    #[test]
+    fn plain_text_renders_every_block_kind() {
+        let blocks = [
+            ContentBlock::text("plain"),
+            ContentBlock::Thinking {
+                text: "hmm".into(),
+                signature: None,
+            },
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "QUJD".into(),
+            },
+            ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: vec![ContentBlock::text("42")],
+                is_error: false,
+            },
+        ];
+        let rendered: Vec<String> = blocks.iter().map(|b| b.plain_text()).collect();
+        assert_eq!(rendered[0], "plain");
+        assert_eq!(rendered[1], "hmm");
+        assert!(rendered[2].starts_with("[image image/png:"));
+        assert_eq!(rendered[3], "42");
+    }
+
+    #[test]
+    fn message_helpers_carry_text_only() {
+        let user = Message::user("hi");
+        assert_eq!(user.role, Role::User);
+        assert_eq!(user.text(), "hi");
+        assert!(user.tool_call_id.is_none());
+        let assistant = Message::assistant("hey");
+        assert_eq!(assistant.role, Role::Assistant);
+        assert_eq!(assistant.text(), "hey");
+    }
+
+    // -------------------------------------------------------- reasoning --
+
+    #[test]
+    fn reasoning_effort_maps_to_anthropic_budgets() {
+        assert_eq!(ReasoningEffort::None.budget_tokens(), Some(0));
+        assert_eq!(ReasoningEffort::Minimal.budget_tokens(), Some(1024));
+        assert_eq!(ReasoningEffort::Low.budget_tokens(), Some(4096));
+        assert_eq!(ReasoningEffort::Medium.budget_tokens(), Some(8192));
+        assert_eq!(ReasoningEffort::High.budget_tokens(), Some(16384));
+        assert_eq!(ReasoningEffort::Max.budget_tokens(), Some(32768));
+        assert_eq!(ReasoningEffort::High.as_str(), "high");
+    }
+
+    // ------------------------------------------------------------ usage --
+
+    #[test]
+    fn usage_totals_input_and_output_only() {
+        let usage = Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 100,
+            cache_write_tokens: 7,
+            reasoning_tokens: 3,
+        };
+        assert_eq!(usage.total(), 15);
+    }
+
+    // -------------------------------------------------------- responses --
+
+    #[test]
+    fn response_text_joins_text_blocks_only() {
+        let response = ChatResponse {
+            id: "r1".into(),
+            model: "m".into(),
+            content: vec![
+                ContentBlock::Thinking {
+                    text: "think".into(),
+                    signature: None,
+                },
+                ContentBlock::text("a"),
+                ContentBlock::ToolUse {
+                    id: "c".into(),
+                    name: "f".into(),
+                    input: json!({}),
+                },
+                ContentBlock::text("b"),
+            ],
+            stop_reason: Some(StopReason::ToolUse),
+            usage: Usage::default(),
+        };
+        assert_eq!(response.text(), "ab");
+        assert_eq!(response.tool_uses().len(), 1);
+        assert_eq!(response.tool_uses()[0].1, "f");
+        assert_eq!(response.stop_reason, Some(StopReason::ToolUse));
+    }
+
+    #[test]
+    fn from_events_folds_a_plain_text_stream() {
+        let events = vec![
+            StreamEvent::MessageStart {
+                id: "msg_1".into(),
+                model: "glm-5".into(),
+                usage: Usage::default(),
+            },
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                kind: BlockKind::Text,
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "he".into(),
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "llo".into(),
+            },
+            StreamEvent::ContentBlockStop { index: 0 },
+            StreamEvent::MessageDelta {
+                stop_reason: Some(StopReason::EndTurn),
+                usage: Usage {
+                    input_tokens: 2,
+                    output_tokens: 3,
+                    ..Usage::default()
+                },
+            },
+            StreamEvent::MessageStop,
+        ];
+        let response = ChatResponse::from_events(&events);
+        assert_eq!(response.id, "msg_1");
+        assert_eq!(response.model, "glm-5");
+        assert_eq!(response.text(), "hello");
+        assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(response.usage.output_tokens, 3);
+    }
+
+    #[test]
+    fn from_events_keeps_thinking_before_text_and_keeps_it_when_alone() {
+        // Reasoning then the text it led to, in one index.
+        let paired = ChatResponse::from_events(&[
+            StreamEvent::ThinkingDelta {
+                index: 0,
+                text: "why".into(),
+            },
+            StreamEvent::TextDelta {
+                index: 0,
+                text: "42".into(),
+            },
+        ]);
+        assert_eq!(paired.content.len(), 2);
+        assert!(matches!(&paired.content[0], ContentBlock::Thinking { text, .. } if text == "why"));
+        assert_eq!(paired.content[1].as_text(), Some("42"));
+
+        // Only reasoning arrived: the block must survive, not vanish.
+        let alone = ChatResponse::from_events(&[StreamEvent::ThinkingDelta {
+            index: 0,
+            text: "only".into(),
+        }]);
+        assert_eq!(alone.content.len(), 1);
+        assert!(matches!(&alone.content[0], ContentBlock::Thinking { text, .. } if text == "only"));
+    }
+
+    #[test]
+    fn from_events_reassembles_tool_json_shards() {
+        let response = ChatResponse::from_events(&[
+            StreamEvent::ToolUseStart {
+                index: 2,
+                id: "call_9".into(),
+                name: "write".into(),
+            },
+            StreamEvent::ToolInputDelta {
+                index: 2,
+                partial_json: "{\"path\":".into(),
+            },
+            StreamEvent::ToolInputDelta {
+                index: 2,
+                partial_json: "\"a.rs\"}".into(),
+            },
+        ]);
+        let tools = response.tool_uses();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].0, "call_9");
+        assert_eq!(tools[0].1, "write");
+        assert_eq!(tools[0].2, &json!({"path": "a.rs"}));
+    }
+
+    #[test]
+    fn from_events_ignores_an_empty_tool_slot() {
+        // A ToolUseStart with no name and no args (some vendors emit one for
+        // a cancelled call) must not produce a block.
+        let response = ChatResponse::from_events(&[StreamEvent::ToolUseStart {
+            index: 0,
+            id: String::new(),
+            name: String::new(),
+        }]);
+        assert!(response.content.is_empty());
+    }
+
+    #[test]
+    fn grow_extends_a_list_to_the_index() {
+        let mut list: Vec<u64> = Vec::new();
+        grow(&mut list, 2);
+        assert_eq!(list, vec![0, 0, 0]);
+        grow(&mut list, 1);
+        assert_eq!(list, vec![0, 0, 0]);
+    }
+
+    // ----------------------------------------------------------- errors --
+
+    #[test]
+    fn api_errors_map_to_http_statuses_and_retryability() {
+        let cases = [
+            (ApiError::BadRequest("bad".into()), 400, false),
+            (ApiError::Unauthorized("no".into()), 401, false),
+            (ApiError::NotFound("gone".into()), 404, false),
+            (ApiError::RateLimited("slow".into()), 429, true),
+            (ApiError::Upstream("vendor".into()), 502, true),
+            (ApiError::Internal("boom".into()), 500, true),
+        ];
+        for (error, status, retryable) in cases {
+            assert_eq!(error.status(), status);
+            assert_eq!(error.retryable(), retryable);
+            assert!(!error.to_string().is_empty());
+        }
+    }
+}

@@ -882,3 +882,72 @@ impl Renderer {
         frames
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Anthropic requires max_tokens: the formatter must supply a default.
+    #[test]
+    fn formatted_requests_always_carry_max_tokens() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            messages: vec![Message::user("hi")],
+            ..ChatRequest::default()
+        };
+        let body = format_request(&req, "claude-x");
+        assert_eq!(body["max_tokens"], 8192);
+        assert_eq!(body["model"], "claude-x");
+        assert_eq!(body["messages"][0]["role"], "user");
+        // An explicit cap wins.
+        let capped = format_request(
+            &ChatRequest {
+                max_tokens: Some(77),
+                ..req
+            },
+            "claude-x",
+        );
+        assert_eq!(capped["max_tokens"], 77);
+    }
+
+    // A system prompt rides top-level, not as a message.
+    #[test]
+    fn the_system_prompt_stays_top_level() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            system: vec![ContentBlock::text("Be brief.")],
+            messages: vec![Message::user("hi")],
+            ..ChatRequest::default()
+        };
+        let body = format_request(&req, "claude-x");
+        assert_eq!(body["system"], "Be brief.");
+        assert!(body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["role"] != "system"));
+    }
+
+    // format ↔ parse round trip for a plain reply.
+    #[test]
+    fn a_formatted_response_parses_back_to_the_same_text() {
+        let resp = ChatResponse {
+            id: "msg_1".into(),
+            model: "claude-x".into(),
+            content: vec![ContentBlock::text("hello")],
+            stop_reason: Some(StopReason::EndTurn),
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 2,
+                ..Usage::default()
+            },
+        };
+        let wire = format_response(&resp, "claude-x");
+        assert_eq!(wire["type"], "message");
+        assert_eq!(wire["stop_reason"], "end_turn");
+        let back = parse_response(&wire).unwrap();
+        assert_eq!(back.text(), "hello");
+        assert_eq!(back.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(back.usage.input_tokens, 3);
+    }
+}
