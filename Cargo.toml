@@ -1,9 +1,12 @@
 [package]
 name = "local-router"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.80"
 description = "A local AI gateway that gives every coding agent every model — web mode"
+repository = "https://github.com/huifer/local-router"
+homepage = "https://github.com/huifer/local-router"
+documentation = "https://github.com/huifer/local-router#readme"
 license = "MIT"
 readme = "README.md"
 keywords = ["llm", "gateway", "proxy", "openai", "anthropic"]

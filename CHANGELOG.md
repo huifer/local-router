@@ -4,7 +4,7 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.1.1] - 2026-10-27
 
 ### Added
 
@@ -198,5 +198,6 @@
   - 所有写请求校验 Origin，拒绝跨站驱动控制台。
   - `config.json` 以 0600 落盘；`LOCAL_ROUTER_DEFAULT_KEY` 只在内存。
 
-[Unreleased]: https://github.com/TODO/local-router/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/TODO/local-router/releases/tag/v0.1.0
+[Unreleased]: https://github.com/huifer/local-router/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/huifer/local-router/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/huifer/local-router/releases/tag/v0.1.0
