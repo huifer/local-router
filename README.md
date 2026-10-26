@@ -98,7 +98,7 @@ qwen-session.json       # QwenWork 设备流登录的 token（0600）
 | `cors_origins` | 允许哪些浏览器源跨域调用网关。默认空（不允许）；填 `["*"]` 或 `["http://localhost:3000"]` 才开 |
 | `default_caller_key` | 调用方默认用的 key |
 | `record_usage` | 是否记录用量 |
-| `masking` | 是否在发往上游前遮蔽提示词里的密钥 |
+| `masking` | 是否在发往上游前遮蔽提示词里的密钥（`sk-…`/`ghp_…`/长 hex 等；工具参数里名字含 key/token/secret 的字段一并遮蔽） |
 | `workbuddy_auto_checkin` | 是否自动领 WorkBuddy 每日签到（默认开） |
 | `send_agent_user_agent` | 是否把 agent 的 User-Agent 转发给上游 |
 
@@ -360,6 +360,14 @@ local-router claude qwenwork/qwen3-coder-plus   # 让 Claude Code 走 QwenWork
 - 容器里看不到宿主机登录态时，把会话文件挂进去并设
   `LOCAL_ROUTER_QWEN_SESSION`。
 
+### 模型目录与自动纳新
+
+每个 provider 的 `models` 是对外暴露的白名单；「刷新模型」（控制台按钮或
+`/api/providers/{id}/refresh`）会拉取厂商的完整目录。给 provider 配上
+`auto_include`（glob，`*` 是通配符，如 `["mock-*", "glm-4.6"]`）后，厂商
+新列出且匹配 glob 的模型会**自动并入** provider 并落盘——新模型上线不用
+改配置、不用重启。响应里的 `auto_included` 说明本次自动新增了哪些。
+
 ## 路由组
 
 ```sh
@@ -368,7 +376,7 @@ local-router claude group/backup
 ```
 
 - `order` 主备故障转移 · `rotate` 轮询 · `usage` 最少使用 · `smart` 额度感知 · `weight` 加权
-- `stays=auto|session|turn|off|strict`：会话粘性（prompt cache 还值钱时留在同一个 key 上）
+- `stays=auto|session|turn|off|strict`：会话粘性（prompt cache 还值钱时留在同一个 key 上）。`turn` 在新对话时重新选；`strict` 只认会话的目标，目标消失就报错、拒绝回退
 - 组内可嵌套组（带环检测）；一个 provider 配多把 key 会逐个尝试
 - `hold_when_exhausted`：账户配额窗口空了就不再路由到该上游（默认关；
   实测 WorkBuddy 在额度为 0 时仍可服务，所以不要对它开）

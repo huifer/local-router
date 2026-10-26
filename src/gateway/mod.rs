@@ -394,6 +394,37 @@ async fn quotas(State(g): State<Gateway>, headers: HeaderMap) -> Response {
             }
         }
     }
+    if session_based.iter().any(|id| id == "qwenwork") {
+        match crate::qwen::login::session().await {
+            Ok(session) => match crate::qwen::client::account_quota(&session).await {
+                Ok(q) => data.push(serde_json::json!({
+                    "provider": "qwenwork",
+                    "name": "QwenWork（千问办公）",
+                    "kind": "subscription",
+                    "plan": q.plan,
+                    "user": session.account.nickname,
+                    "windows": [{
+                        "name": "Credits",
+                        "used": Value::Null,
+                        "remaining": q.pools.iter().map(|p| p.balance).sum::<f64>(),
+                        "resets_at": q.resets_at,
+                        "display": q.display,
+                        "unit": "credits",
+                        "unlimited": false,
+                        "holds_why": if q.empty { Some("balance is zero".to_string()) } else { None },
+                    }],
+                    "pools": q.pools,
+                    "read_at": chrono::Utc::now().to_rfc3339(),
+                })),
+                Err(err) => {
+                    return error_response(&ApiError::Upstream(err.to_string()));
+                }
+            },
+            Err(err) => {
+                return error_response(&ApiError::Upstream(err.to_string()));
+            }
+        }
+    }
     Json(json!({"data": data})).into_response()
 }
 
@@ -1284,17 +1315,35 @@ async fn handle(
         crate::projects::note(dir);
     }
 
-    let (plan, send_agent_ua) = {
+    // Whether the request continues an exchange: any assistant or tool turn
+    // means it does, and a turn-scoped affinity stays bound.
+    let has_history = request.messages.iter().any(|m| {
+        matches!(
+            m.role,
+            crate::protocol::ir::Role::Assistant | crate::protocol::ir::Role::Tool
+        )
+    });
+
+    let (plan, send_agent_ua, masking) = {
         let config = g.state.config.read().await;
         match g
             .router
-            .plan(&config, &request.model, session.as_deref())
+            .plan(&config, &request.model, session.as_deref(), has_history)
             .await
         {
-            Ok(p) => (p, config.settings.send_agent_user_agent),
+            Ok(p) => (
+                p,
+                config.settings.send_agent_user_agent,
+                config.settings.masking,
+            ),
             Err(e) => return error_response(&e),
         }
     };
+    // Mask secrets in the prompt before they leave the machine. The request
+    // is already canonical, so this is one pass over the text blocks.
+    if masking {
+        mask_request_secrets(&mut request);
+    }
 
     let asked = request.model.clone();
     let stream = request.stream;
@@ -1599,6 +1648,143 @@ async fn qwen_attempt(
             &request.model,
         ))
         .into_response()
+    }
+}
+
+/// Mask secrets in the request's text before it leaves the machine.
+///
+/// The gateway sits between the agent and the vendor; a prompt that quotes
+/// a key ("my key is sk-...") would otherwise ship verbatim. Patterns:
+/// bearer-style API keys (`sk-…`, `Bearer …`), long hex strings, and
+/// `KEY=value` pairs whose name says secret. Tool arguments ride along.
+pub(crate) fn mask_request_secrets(request: &mut ChatRequest) {
+    for block in request.system.iter_mut().chain(
+        request
+            .messages
+            .iter_mut()
+            .flat_map(|m| m.content.iter_mut()),
+    ) {
+        match block {
+            ContentBlock::Text { text } => *text = mask_secrets(text),
+            ContentBlock::ToolUse { input, .. } => mask_value_secrets(input),
+            _ => {}
+        }
+    }
+}
+
+/// The secret patterns, as (name, regex-free matcher) described in prose.
+/// Kept hand-rolled so the mask is deterministic and testable without a
+/// regex dependency.
+pub(crate) fn mask_secrets(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in split_keep_separators(text) {
+        out.push_str(&mask_word(&word));
+    }
+    out
+}
+
+/// Split into words and the whitespace that joined them, so masking does
+/// not reflow the prompt.
+fn split_keep_separators(text: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut in_space = false;
+    for c in text.chars() {
+        let is_space = c.is_whitespace();
+        if is_space == in_space && !current.is_empty() {
+            current.push(c);
+        } else if current.is_empty() {
+            in_space = is_space;
+            current.push(c);
+        } else {
+            parts.push(std::mem::take(&mut current));
+            in_space = is_space;
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    parts
+}
+
+/// Mask one whitespace-separated word when it looks like a secret.
+fn mask_word(word: &str) -> String {
+    let trimmed = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    if looks_like_secret(trimmed) {
+        // Keep the punctuation around the word exactly where it was.
+        let prefix_len = word.len()
+            - word
+                .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
+                .len();
+        let core_len = trimmed.len();
+        let mut out = String::with_capacity(word.len());
+        out.push_str(&word[..prefix_len]);
+        out.push_str("***MASKED***");
+        out.push_str(&word[prefix_len + core_len..]);
+        out
+    } else {
+        word.to_string()
+    }
+}
+
+/// Whether a token looks like a credential worth hiding.
+fn looks_like_secret(token: &str) -> bool {
+    if token.len() < 12 {
+        return false;
+    }
+    // Prefixed keys: sk-, ghp_, AKIA, Bearer-quoted, AIza, xox…
+    let prefixes = [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "github_pat_",
+        "AKIA",
+        "AIza",
+        "xoxb-",
+        "xoxp-",
+        "Bearer ",
+        "bearer ",
+        "ey", // JWT-ish: eyJ...
+    ];
+    if prefixes.iter().any(|p| token.starts_with(p)) {
+        return true;
+    }
+    // A long hex string is usually a token or a hash.
+    token.len() >= 24
+        && token.chars().all(|c| c.is_ascii_hexdigit())
+        && token.chars().any(|c| c.is_ascii_digit())
+        && token.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Mask string values inside a tool's JSON arguments.
+fn mask_value_secrets(value: &mut Value) {
+    match value {
+        Value::String(s) => *s = mask_secrets(s),
+        Value::Array(items) => {
+            for item in items {
+                mask_value_secrets(item);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map.iter_mut() {
+                let name = key.to_ascii_lowercase();
+                if name.contains("key")
+                    || name.contains("token")
+                    || name.contains("secret")
+                    || name.contains("password")
+                {
+                    if let Value::String(s) = item {
+                        if s.len() >= 6 {
+                            *s = "***MASKED***".to_string();
+                            continue;
+                        }
+                    }
+                }
+                mask_value_secrets(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2214,4 +2400,83 @@ fn error_response(err: &ApiError) -> Response {
         }),
     };
     (status, Json(body)).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prefixed_api_keys_are_masked() {
+        let masked = mask_secrets("my key is sk-abcdef1234567890abcdef keep it safe");
+        assert!(!masked.contains("sk-abcdef1234567890abcdef"));
+        assert!(masked.contains("***MASKED***"));
+        assert!(masked.starts_with("my key is"));
+        assert!(masked.ends_with("keep it safe"));
+        // Short words and normal prose survive.
+        assert_eq!(mask_secrets("hello world"), "hello world");
+    }
+
+    #[test]
+    fn hex_tokens_and_bearer_prefixes_are_masked() {
+        let hex = mask_secrets("token deadbeefdeadbeefdeadbeef12 in config");
+        assert!(hex.contains("***MASKED***"), "{hex}");
+        assert!(!hex.contains("deadbeefdeadbeefdeadbeef12"));
+        let bearer = mask_secrets("Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9");
+        assert!(bearer.contains("***MASKED***"), "{bearer}");
+    }
+
+    #[test]
+    fn ordinary_hex_and_prose_are_left_alone() {
+        // Short hex (a color, a short hash) is not a secret.
+        assert_eq!(
+            mask_secrets("color #deadbeef size 42"),
+            "color #deadbeef size 42"
+        );
+        // A long decimal number (a timestamp, an id) is not a secret.
+        let digits = "123456789012345678901234";
+        assert_eq!(mask_secrets(digits), digits);
+        assert_eq!(mask_secrets("the quick brown fox"), "the quick brown fox");
+    }
+
+    #[test]
+    fn tool_arguments_with_secret_names_are_masked() {
+        let mut request = ChatRequest {
+            messages: vec![Message::user("run this")],
+            tools: Vec::new(),
+            ..ChatRequest::default()
+        };
+        request.messages[0].content.push(ContentBlock::ToolUse {
+            id: "c1".into(),
+            name: "set_env".into(),
+            input: serde_json::json!({
+                "api_key": "super-secret-value-123",
+                "path": "/tmp/work",
+                "nested": {"token": "abcdefgh1234", "keep": "visible"}
+            }),
+        });
+        mask_request_secrets(&mut request);
+        if let Some(ContentBlock::ToolUse { input, .. }) = &request.messages[0].content.last() {
+            assert_eq!(input["api_key"], "***MASKED***");
+            assert_eq!(input["nested"]["token"], "***MASKED***");
+            assert_eq!(input["nested"]["keep"], "visible");
+            assert_eq!(input["path"], "/tmp/work");
+        } else {
+            panic!("the tool block vanished");
+        }
+        // The prose survives untouched.
+        assert_eq!(request.messages[0].text(), "run this");
+    }
+
+    #[test]
+    fn system_and_text_blocks_are_both_covered() {
+        let mut request = ChatRequest {
+            system: vec![ContentBlock::text("use sk-abcdef1234567890abcdef")],
+            messages: vec![Message::user("see ghp_abcdefghijklmnopqrstuvwxyz0")],
+            ..ChatRequest::default()
+        };
+        mask_request_secrets(&mut request);
+        assert!(request.system[0].plain_text().contains("***MASKED***"));
+        assert!(request.messages[0].text().contains("***MASKED***"));
+    }
 }

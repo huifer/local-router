@@ -97,7 +97,7 @@ pub fn models_url(base: &str) -> String {
 }
 
 /// One vendor, one key, one model: everything needed to make a call.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Target {
     pub provider_id: String,
     pub provider_name: String,

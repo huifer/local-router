@@ -685,7 +685,88 @@ async fn api_refresh_models(
     }
     models.sort();
     models.dedup();
-    Ok(Json(json!({"models": models})))
+    // Auto-include: glob matches the vendor just listed are folded into the
+    // provider's model list on disk, so a new model shows up without a
+    // release or a manual edit.
+    let mut auto_added: Vec<String> = Vec::new();
+    if !provider.auto_include.is_empty() {
+        for m in &models {
+            if !provider.models.contains(m)
+                && provider
+                    .auto_include
+                    .iter()
+                    .any(|pat| auto_include_match(pat, m))
+            {
+                auto_added.push(m.clone());
+            }
+        }
+    }
+    if !auto_added.is_empty() {
+        let to_add = auto_added.clone();
+        let _ = state
+            .update(move |config| {
+                if let Some(p) = config.provider_mut(&id) {
+                    for m in to_add {
+                        if !p.models.contains(&m) {
+                            p.models.push(m);
+                        }
+                    }
+                    p.models.sort();
+                    Ok::<(), String>(())
+                } else {
+                    Err(format!("the provider {id} vanished mid-refresh"))
+                }
+            })
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+            })?;
+    }
+    let merged = if auto_added.is_empty() {
+        models.clone()
+    } else {
+        let mut all = models.clone();
+        all.extend(auto_added.iter().cloned());
+        all.sort();
+        all.dedup();
+        all
+    };
+    Ok(Json(json!({
+        "models": merged,
+        "auto_included": auto_added,
+    })))
+}
+pub(crate) fn auto_include_match(pattern: &str, model: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == model;
+    }
+    // Fold every `*` into two: head must prefix, tail must suffix, and the
+    // middle only has to exist (multiple stars act as one greedy star).
+    let mut split = pattern.split('*');
+    let head = split.next().unwrap_or_default();
+    let last = split.next_back().unwrap_or_default();
+    model.len() >= head.len() + last.len() && model.starts_with(head) && model.ends_with(last)
+}
+
+#[cfg(test)]
+mod auto_include_tests {
+    use super::auto_include_match as m;
+
+    #[test]
+    fn globs_match_prefix_suffix_and_exact() {
+        assert!(m("mock-*", "mock-small"));
+        assert!(m("mock-*", "mock-"));
+        assert!(!m("mock-*", "not-mock-small"));
+        assert!(m("*-turbo", "glm-5-turbo"));
+        assert!(!m("*-turbo", "glm-5-turbo-v"));
+        assert!(m("glm-4.6", "glm-4.6"));
+        assert!(!m("glm-4.6", "glm-4.5"));
+        assert!(m("*", "anything"));
+        assert!(m("*mini*", "gpt-4o-mini-2024"));
+    }
 }
 
 /// Send a tiny request to a provider, to see whether it answers.
@@ -809,8 +890,6 @@ async fn api_models(State(state): State<AppState>) -> Json<Value> {
     }
     Json(json!({"models": out}))
 }
-
-// ----------------------------------------------------------------- groups --
 
 async fn api_groups(State(state): State<AppState>) -> Json<Value> {
     let config = state.config.read().await;
@@ -1324,6 +1403,47 @@ async fn quota_summary(state: &AppState) -> Value {
                 "windows": [],
                 "unlimited": true,
             }));
+            continue;
+        }
+        if provider.id == "qwenwork" {
+            match crate::qwen::login::session().await {
+                Ok(session) => match crate::qwen::client::account_quota(&session).await {
+                    Ok(q) => accounts.push(json!({
+                        "provider": "qwenwork",
+                        "name": "QwenWork（千问办公）",
+                        "kind": "subscription",
+                        "user": session.account.nickname,
+                        "windows": [{
+                            "name": "Credits",
+                            "used": Value::Null,
+                            "remaining": q.pools.iter().map(|p| p.balance).sum::<f64>(),
+                            "resets_at": q.resets_at,
+                            "display": q.display,
+                            "unit": "credits",
+                            "unlimited": false,
+                            "holds_why": if q.empty { Some("balance is zero".to_string()) } else { None },
+                        }],
+                        "unlimited": false,
+                        "read_at": chrono::Utc::now().to_rfc3339(),
+                    })),
+                    Err(err) => accounts.push(json!({
+                        "provider": "qwenwork",
+                        "name": "QwenWork（千问办公）",
+                        "kind": "token",
+                        "windows": [],
+                        "unlimited": true,
+                        "error": err.to_string(),
+                    })),
+                },
+                Err(err) => accounts.push(json!({
+                    "provider": "qwenwork",
+                    "name": "QwenWork（千问办公）",
+                    "kind": "token",
+                    "windows": [],
+                    "unlimited": true,
+                    "error": err.to_string(),
+                })),
+            }
             continue;
         }
         match crate::workbuddy::quota().await {

@@ -14,7 +14,7 @@ use crate::protocol::ir::ApiError;
 use super::client::Target;
 
 /// A plan for one request: the targets to try, and why.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct RoutePlan {
     pub targets: Vec<Target>,
     /// The group the request went through, when it went through one.
@@ -121,19 +121,29 @@ impl Router {
         self.state.lock().await.affinity.get(session).cloned()
     }
 
+    /// Forget where a session last went, so the next request picks again.
+    pub async fn clear_affinity(&self, session: &str) {
+        self.state.lock().await.affinity.remove(session);
+    }
+
     /// Work out who should answer `requested`.
+    ///
+    /// `has_history` says the request carries conversation history (any
+    /// assistant or tool turn); a turn-scoped affinity only binds while it
+    /// does, so a fresh exchange picks again.
     pub async fn plan(
         &self,
         config: &Config,
         requested: &str,
         session: Option<&str>,
+        has_history: bool,
     ) -> Result<RoutePlan, ApiError> {
         let requested = requested.trim();
         if let Some(group_id) = requested.strip_prefix("group/") {
             let group = config.group(group_id).ok_or_else(|| {
                 ApiError::NotFound(format!("there is no group called {group_id}"))
             })?;
-            return self.plan_group(config, group, session).await;
+            return self.plan_group(config, group, session, has_history).await;
         }
 
         let (provider_id, model) = Config::split_model(requested).ok_or_else(|| {
@@ -175,6 +185,7 @@ impl Router {
         config: &Config,
         group: &Group,
         session: Option<&str>,
+        has_history: bool,
     ) -> Result<RoutePlan, ApiError> {
         if group.models.is_empty() {
             return Err(ApiError::BadRequest(format!(
@@ -248,7 +259,12 @@ impl Router {
             )));
         }
 
-        // A conversation stays with the target that answered it.
+        // A conversation stays with the target that answered it. The modes:
+        //   auto / session — prefer the target that answered this session;
+        //   turn           — the same, but the affinity only lives for the
+        //                    turn (the caller passes a fresh turn id);
+        //   strict         — the session's target is the ONLY target when
+        //                    one is known: no failover to other members.
         let mut reason = format!(
             "the group {} routes by {}",
             group.id,
@@ -256,11 +272,33 @@ impl Router {
         );
         if !matches!(group.stays, crate::config::Stays::Off) {
             if let Some(session) = session {
+                // A turn-scoped affinity only binds while the conversation
+                // continues: a fresh exchange (no assistant or tool turns in
+                // the request) picks again. Session/auto bind regardless.
+                let fresh_conversation =
+                    matches!(group.stays, crate::config::Stays::Turn) && !has_history;
+                if fresh_conversation {
+                    self.clear_affinity(session).await;
+                }
                 if let Some(previous) = self.affinity_of(session).await {
-                    if let Some(pos) = targets.iter().position(|t| t.key_id == previous) {
-                        let target = targets.remove(pos);
-                        targets.insert(0, target);
-                        reason.push_str("; the conversation stays where it was");
+                    match targets.iter().position(|t| t.key_id == previous) {
+                        Some(pos) => {
+                            let target = targets.remove(pos);
+                            if matches!(group.stays, crate::config::Stays::Strict) {
+                                targets.clear();
+                                targets.push(target);
+                                reason.push_str("; strict: only the session's target may answer");
+                            } else {
+                                targets.insert(0, target);
+                                reason.push_str("; the conversation stays where it was");
+                            }
+                        }
+                        None if matches!(group.stays, crate::config::Stays::Strict) => {
+                            return Err(ApiError::NotFound(format!(
+                                "the session's target ({previous}) is gone; strict mode refuses to fail over"
+                            )));
+                        }
+                        None => {}
                     }
                 }
             }

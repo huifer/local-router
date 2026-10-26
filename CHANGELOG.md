@@ -30,6 +30,21 @@
 
 ### Fixed
 
+- **`settings.masking` 一直是空配置**：README 声称「发往上游前遮蔽提示词里的
+  密钥」，但网关从未读取该字段，实测 `sk-…` 明文直通上游。现已实现：开启后
+  对系统/消息文本与工具参数做遮蔽（前缀型 key `sk-`/`ghp_`/`AKIA`/`AIza`/
+  `xox`/JWT、长十六进制串、名字含 key/token/secret/password 的工具参数），
+  并有单元测试与行为级冒烟守护。
+- **`auto_include` 一直是死配置**：provider 的 glob 字段可保存但无消费点。
+  现在「刷新模型」会把 vendor 新列出且匹配 glob 的模型自动并入 provider
+  （落盘、无需重启），响应带 `auto_included` 说明新增了哪些。
+- **`stays=turn` / `stays=strict` 语义未实现**：此前所有粘性模式都只是
+  「把上次的目标提到最前」。现在 `turn` 在新对话（请求不含 assistant/tool
+  历史）时清除粘性重新选；`strict` 只返回会话的目标（目标消失时报错，
+  拒绝回退其它成员）。
+- **QwenWork 额度未进额度视图**：`/v1/local-router/quotas` 与控制台
+  Usage 页 Quota 面板此前只看 WorkBuddy；qwenwork 登录态的余额、钱包池与
+  重置时间现已并入。
 - **控制台「按模型」聚合一直是空的**：`usage.db` 的 by-model 查询里
   `ORDER BY requests` 引用了不存在的列别名（`COUNT(*)` 未命名），SQL 准备
   失败后被静默吞掉返回空列表；加 `AS requests` 后修复，并有聚合单元测试
