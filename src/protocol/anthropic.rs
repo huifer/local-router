@@ -27,7 +27,10 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
         ..Default::default()
     };
 
-    req.max_tokens = obj.get("max_tokens").and_then(Value::as_u64).map(|v| v as u32);
+    req.max_tokens = obj
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .map(|v| v as u32);
     req.temperature = obj.get("temperature").and_then(Value::as_f64);
     req.top_p = obj.get("top_p").and_then(Value::as_f64);
     req.top_k = obj.get("top_k").and_then(Value::as_u64).map(|v| v as u32);
@@ -83,7 +86,11 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
             Some("auto") => Some(ToolChoice::Auto),
             Some("any") => Some(ToolChoice::Required),
             Some("tool") => Some(ToolChoice::Tool {
-                name: m.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+                name: m
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
             }),
             _ => None,
         },
@@ -132,7 +139,10 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
 fn parse_block(p: &Value) -> ContentBlock {
     match p.get("type").and_then(Value::as_str).unwrap_or("text") {
         "text" => ContentBlock::text(
-            p.get("text").and_then(Value::as_str).unwrap_or_default().to_string(),
+            p.get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         ),
         "thinking" => ContentBlock::Thinking {
             text: p
@@ -147,14 +157,19 @@ fn parse_block(p: &Value) -> ContentBlock {
         },
         "redacted_thinking" => ContentBlock::Thinking {
             text: String::new(),
-            signature: p
-                .get("data")
-                .and_then(Value::as_str)
-                .map(|s| s.to_string()),
+            signature: p.get("data").and_then(Value::as_str).map(|s| s.to_string()),
         },
         "tool_use" => ContentBlock::ToolUse {
-            id: p.get("id").and_then(Value::as_str).unwrap_or_default().to_string(),
-            name: p.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+            id: p
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            name: p
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             input: p.get("input").cloned().unwrap_or_else(|| json!({})),
         },
         "tool_result" => {
@@ -201,7 +216,10 @@ fn parse_block(p: &Value) -> ContentBlock {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                name: p.get("title").and_then(Value::as_str).map(|s| s.to_string()),
+                name: p
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(|s| s.to_string()),
             }
         }
         _ => ContentBlock::text(String::new()),
@@ -530,10 +548,7 @@ impl StreamCollector for Collector {
                     self.block_kinds.push(BlockKind::Text);
                 }
                 self.block_kinds[index] = bkind;
-                out.push(StreamEvent::ContentBlockStart {
-                    index,
-                    kind: bkind,
-                });
+                out.push(StreamEvent::ContentBlockStart { index, kind: bkind });
                 if bkind == BlockKind::ToolUse {
                     out.push(StreamEvent::ToolUseStart {
                         index,
@@ -705,7 +720,8 @@ impl Renderer {
         };
         out.push(SseFrame::named(
             "content_block_start",
-            json!({"type": "content_block_start", "index": index, "content_block": block}).to_string(),
+            json!({"type": "content_block_start", "index": index, "content_block": block})
+                .to_string(),
         ));
     }
 
@@ -846,7 +862,10 @@ impl Renderer {
             StreamEvent::MessageStop => {
                 if !self.stopped {
                     self.stopped = true;
-                    frames.push(SseFrame::named("message_stop", "{\"type\":\"message_stop\"}"));
+                    frames.push(SseFrame::named(
+                        "message_stop",
+                        "{\"type\":\"message_stop\"}",
+                    ));
                 }
             }
             StreamEvent::Error { message } => {

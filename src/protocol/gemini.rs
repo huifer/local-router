@@ -23,14 +23,14 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
 
     let mut req = ChatRequest {
         model,
-        stream: obj
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        stream: obj.get("stream").and_then(Value::as_bool).unwrap_or(false),
         ..Default::default()
     };
 
-    if let Some(si) = obj.get("systemInstruction").or_else(|| obj.get("system_instruction")) {
+    if let Some(si) = obj
+        .get("systemInstruction")
+        .or_else(|| obj.get("system_instruction"))
+    {
         if let Some(parts) = si.get("parts").and_then(Value::as_array) {
             for p in parts {
                 if let Some(t) = p.get("text").and_then(Value::as_str) {
@@ -40,7 +40,10 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
         }
     }
 
-    if let Some(gc) = obj.get("generationConfig").or_else(|| obj.get("generation_config")) {
+    if let Some(gc) = obj
+        .get("generationConfig")
+        .or_else(|| obj.get("generation_config"))
+    {
         req.max_tokens = gc
             .get("maxOutputTokens")
             .and_then(Value::as_u64)
@@ -56,7 +59,10 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
             }
         }
         if let Some(tc) = gc.get("thinkingConfig") {
-            let budget = tc.get("thinkingBudget").and_then(Value::as_u64).unwrap_or(0);
+            let budget = tc
+                .get("thinkingBudget")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             req.reasoning_effort = Some(match budget {
                 0 => ReasoningEffort::None,
                 1..=2048 => ReasoningEffort::Low,
@@ -147,7 +153,11 @@ fn parse_part(p: &Value) -> ContentBlock {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-            name: fc.get("name").and_then(Value::as_str).unwrap_or_default().to_string(),
+            name: fc
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
             input: fc.get("args").cloned().unwrap_or_else(|| json!({})),
         };
     }
@@ -398,10 +408,7 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
                 })
             })
             .collect();
-        body.insert(
-            "tools".into(),
-            json!([{"functionDeclarations": decls}]),
-        );
+        body.insert("tools".into(), json!([{"functionDeclarations": decls}]));
     }
     if let Some(choice) = &req.tool_choice {
         let mode = match choice {
@@ -753,7 +760,8 @@ impl Renderer {
             }
             StreamEvent::Error { message } => {
                 frames.push(SseFrame::data(
-                    json!({"error": {"code": 500, "message": message, "status": "INTERNAL"}}).to_string(),
+                    json!({"error": {"code": 500, "message": message, "status": "INTERNAL"}})
+                        .to_string(),
                 ));
             }
         }

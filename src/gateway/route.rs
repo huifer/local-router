@@ -55,7 +55,13 @@ impl Router {
     }
 
     pub async fn usage_of(&self, model: &str) -> u64 {
-        self.state.lock().await.usage.get(model).copied().unwrap_or(0)
+        self.state
+            .lock()
+            .await
+            .usage
+            .get(model)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub async fn note_affinity(&self, session: &str, target_key: &str) {
@@ -169,7 +175,11 @@ impl Router {
             }
             Routing::Weight => {
                 let state = self.state.lock().await;
-                weighted_order(&members, &group.weights, state.usage.get("__rotate__").copied())
+                weighted_order(
+                    &members,
+                    &group.weights,
+                    state.usage.get("__rotate__").copied(),
+                )
             }
             Routing::Order => members,
         };

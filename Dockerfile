@@ -1,8 +1,8 @@
 # ---- stage 1: React console ----
 FROM node:24-alpine AS console
 WORKDIR /build
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm install
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
@@ -13,16 +13,16 @@ RUN apk add --no-cache musl-dev pkgconfig
 # Dependencies first, so a source change does not rebuild the world.
 COPY Cargo.toml Cargo.lock build.rs ./
 # The dependency warm-up builds with a stub console (no npm in this image);
-# the real dist lands in the next stage.
-ENV LOCAL_ROUTER_SKIP_FRONTEND=1
+# the env is scoped to this RUN only, so the real build below sees no flag.
 RUN mkdir src && echo "pub fn placeholder() {}" > src/lib.rs && \
     echo "fn main() {}" > src/main.rs && \
-    cargo build --release && rm -rf src
-ENV LOCAL_ROUTER_SKIP_FRONTEND=0
+    LOCAL_ROUTER_SKIP_FRONTEND=1 cargo build --release && rm -rf src
 COPY src/ ./src/
 COPY tests/ ./tests/
 COPY --from=console /build/dist ./frontend/dist
-RUN touch frontend/src && cargo build --release --bin local-router
+# The crate recompiles because src changed, and build.rs picks up the real
+# dist: it exists, and frontend holds no newer source than it.
+RUN cargo build --release --bin local-router
 
 # ---- stage 3: runtime ----
 FROM alpine:3.21

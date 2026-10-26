@@ -16,7 +16,9 @@ fn provider(id: &str, models: &[&str], keys: usize) -> Provider {
         anthropic_base_url: None,
         responses_base_url: None,
         gemini_base_url: None,
-        keys: (0..keys).map(|_| ProviderKey::new(format!("sk-{id}"))).collect(),
+        keys: (0..keys)
+            .map(|_| ProviderKey::new(format!("sk-{id}")))
+            .collect(),
         models: models.iter().map(|m| m.to_string()).collect(),
         auto_include: Vec::new(),
         catalog: None,

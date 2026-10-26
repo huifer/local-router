@@ -85,8 +85,14 @@ usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
 | `LOCAL_ROUTER_LAN` | `1` 等价于 `--lan` |
 | `LOCAL_ROUTER_LOG` | 日志过滤（如 `debug`） |
 
-> 鉴权：网关请求需要 `Authorization: Bearer <key>`，key 取
-> `LOCAL_ROUTER_DEFAULT_KEY` → 设置里的默认 key → caller keys 任一匹配。
+> 鉴权：网关请求需要 `Authorization: Bearer <key>`（也接受 `x-api-key` /
+> `x-goog-api-key` / `api-key`），key 取 `LOCAL_ROUTER_DEFAULT_KEY` →
+> 设置里的默认 key → caller keys 任一匹配；一把 key 都没有时拒绝一切请求。
+>
+> 控制台：回环地址上免鉴权（本机信任）；页面绑到非回环地址（`--lan`、
+> 容器）时 `/api` 需要同一套 key，控制台会提示输入一次。所有写请求校验
+> `Origin`，跨站写一律 403。`config.json` 以 0600 落盘；
+> `LOCAL_ROUTER_DEFAULT_KEY` 只在进程内存。
 
 ## 网关端点
 
@@ -118,14 +124,22 @@ local-router claude group/backup
 ## 开发
 
 ```sh
-cargo test                 # 41 个测试：协议翻译 / 路由 / HTTP 端到端
-cargo clippy --all-targets # 0 警告
-cd frontend && npm run dev # 控制台热更新（API 代理到 :3426）
+cargo fmt --all -- --check   # 格式
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test                   # 47 个测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫
+cd frontend && npm run dev   # 控制台热更新（API 代理到 :3426）
 ```
 
 `cargo build` 会通过 `build.rs` 自动构建 `frontend/`（检测到源码变化或
 `dist` 缺失时）。CI / 无 npm 环境可设 `LOCAL_ROUTER_SKIP_FRONTEND=1` 用
-桩页面代替。
+桩页面代替。手工冒烟可配合 `scripts/mock_vendor.py` 起一个假厂商。
+
+## 参与贡献
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)：环境搭建、提交前检查、怎么改
+- [SECURITY.md](SECURITY.md)：漏洞私下报告渠道与安全模型
+- [CHANGELOG.md](CHANGELOG.md)：每个版本的变更
+- 行为准则：[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 
 ## 范围与取舍
 

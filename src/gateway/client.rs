@@ -151,14 +151,8 @@ pub fn auth_headers(
 
 /// A vendor's reply, either whole or streamed.
 pub enum UpstreamReply {
-    Whole {
-        status: u16,
-        body: Value,
-    },
-    Stream {
-        status: u16,
-        bytes: ByteStream,
-    },
+    Whole { status: u16, body: Value },
+    Stream { status: u16, bytes: ByteStream },
 }
 
 /// Send a request to a vendor.
@@ -191,18 +185,19 @@ pub async fn send(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let really_streaming = stream
-        && (200..300).contains(&status)
-        && content_type.contains("event-stream");
+    let really_streaming =
+        stream && (200..300).contains(&status) && content_type.contains("event-stream");
     if really_streaming {
         let bytes: ByteStream = Box::pin(resp.bytes_stream());
         Ok(UpstreamReply::Stream { status, bytes })
     } else {
         let text = resp.text().await.unwrap_or_default();
-        let parsed: Value = serde_json::from_str(&text).unwrap_or_else(|_| {
-            serde_json::json!({"error": {"message": text}})
-        });
-        Ok(UpstreamReply::Whole { status, body: parsed })
+        let parsed: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|_| serde_json::json!({"error": {"message": text}}));
+        Ok(UpstreamReply::Whole {
+            status,
+            body: parsed,
+        })
     }
 }
 

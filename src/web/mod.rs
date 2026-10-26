@@ -1,11 +1,18 @@
 //! The web page and the API behind it.
+//!
+//! The console trusts its own machine: on a loopback address every page and
+//! API answers without a key. Bound anywhere else — a container, `--lan` —
+//! the `/api` surface needs the same bearer key the gateway asks for, and
+//! every write checks the Origin header so a web page in the user's browser
+//! cannot drive the console cross-site.
 
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use axum::response::{Html, IntoResponse};
+use axum::http::{HeaderMap, Method, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -15,9 +22,18 @@ use crate::gateway::client;
 use crate::gateway::usage;
 use crate::presets;
 
-const INDEX_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/frontend/dist/index.html"));
-const APP_JS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/frontend/dist/assets/app.js"));
-const STYLE_CSS: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/frontend/dist/assets/style.css"));
+const INDEX_HTML: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/frontend/dist/index.html"
+));
+const APP_JS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/frontend/dist/assets/app.js"
+));
+const STYLE_CSS: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/frontend/dist/assets/style.css"
+));
 
 /// Build the web server's routes.
 pub fn router(state: AppState) -> Router {
@@ -33,10 +49,7 @@ pub fn router(state: AppState) -> Router {
             patch(api_update_provider).delete(api_delete_provider),
         )
         .route("/api/providers/{id}/keys", post(api_add_key))
-        .route(
-            "/api/providers/{id}/keys/{key_id}",
-            delete(api_delete_key),
-        )
+        .route("/api/providers/{id}/keys/{key_id}", delete(api_delete_key))
         .route("/api/providers/{id}/models", post(api_set_models))
         .route("/api/providers/{id}/refresh", post(api_refresh_models))
         .route("/api/providers/{id}/test", post(api_test_provider))
@@ -47,10 +60,87 @@ pub fn router(state: AppState) -> Router {
             patch(api_update_group).delete(api_delete_group),
         )
         .route("/api/settings", get(api_settings).put(api_save_settings))
-        .route("/api/caller-keys", get(api_caller_keys).post(api_add_caller_key))
+        .route(
+            "/api/caller-keys",
+            get(api_caller_keys).post(api_add_caller_key),
+        )
         .route("/api/caller-keys/{id}", delete(api_delete_caller_key))
         .route("/api/usage", get(api_usage))
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
         .with_state(state)
+}
+
+/// The one guard every console request passes through.
+async fn guard(State(state): State<AppState>, req: axum::extract::Request, next: Next) -> Response {
+    // A cross-site write: browsers always send Origin on cross-site posts,
+    // and a same-origin post's authority matches the host. Tools that talk
+    // to the API directly send no Origin and pass untouched.
+    if matches!(
+        *req.method(),
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        if let Some(origin) = req
+            .headers()
+            .get(axum::http::header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+        {
+            if !same_origin(origin, req.headers()) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({"error": "cross-origin request refused"})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Away from loopback the API needs a key — the same keys the gateway
+    // accepts. The static page itself stays open; it holds no secrets.
+    let remote = !listens_locally(&state).await;
+    if remote && req.uri().path().starts_with("/api") {
+        let presented = crate::gateway::presented_key(req.headers());
+        let accepted = presented
+            .filter(|k| {
+                let keys = crate::gateway::allowed_keys(&state);
+                !keys.is_empty() && keys.contains(k)
+            })
+            .is_some();
+        if !accepted {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "send Authorization: Bearer <key>"})),
+            )
+                .into_response();
+        }
+    }
+
+    next.run(req).await
+}
+
+/// True when an Origin header names the host the request was sent to.
+fn same_origin(origin: &str, headers: &HeaderMap) -> bool {
+    let Some(host) = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return false;
+    };
+    let authority = origin
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(origin);
+    authority.eq_ignore_ascii_case(host)
+}
+
+/// The console only trusts the machine when the page binds a loopback address.
+async fn listens_locally(state: &AppState) -> bool {
+    let addr = state.web_bind().await;
+    if addr.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    addr.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 // ------------------------------------------------------------------ pages --
@@ -61,13 +151,19 @@ async fn index() -> Html<&'static str> {
 
 async fn app_js() -> impl IntoResponse {
     (
-        [(axum::http::header::CONTENT_TYPE, "application/javascript; charset=utf-8")],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )],
         APP_JS,
     )
 }
 
 async fn style_css() -> impl IntoResponse {
-    ([(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")], STYLE_CSS)
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        STYLE_CSS,
+    )
 }
 
 // ------------------------------------------------------------------- api --
@@ -206,7 +302,9 @@ async fn api_add_provider(
             }
         },
         _ => {
-            let protocol = input.protocol.unwrap_or(crate::protocol::ir::Protocol::OpenAiChat);
+            let protocol = input
+                .protocol
+                .unwrap_or(crate::protocol::ir::Protocol::OpenAiChat);
             let mut p = crate::presets::custom_provider(
                 &input.name,
                 input.base_url.as_deref(),
@@ -233,7 +331,12 @@ async fn api_add_provider(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::CONFLICT, Json(json!({"error": e}))))?;
 
     Ok(Json(json!({"ok": true, "id": id, "name": name})))
@@ -306,7 +409,12 @@ async fn api_update_provider(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true})))
 }
@@ -328,7 +436,12 @@ async fn api_delete_provider(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true})))
 }
@@ -365,7 +478,12 @@ async fn api_add_key(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true})))
 }
@@ -383,7 +501,12 @@ async fn api_delete_key(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true})))
 }
@@ -413,7 +536,12 @@ async fn api_set_models(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true})))
 }
@@ -433,10 +561,12 @@ async fn api_refresh_models(
             Json(json!({"error": "there is no provider with that id"})),
         ));
     };
-    let base = provider
-        .base_url
-        .clone()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": "the provider has no url"}))))?;
+    let base = provider.base_url.clone().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the provider has no url"})),
+        )
+    })?;
     let url = client::models_url(&base);
     let key = provider
         .enabled_keys()
@@ -446,15 +576,22 @@ async fn api_refresh_models(
     let http = reqwest::Client::builder()
         .user_agent(format!("local-router/{}", client::VERSION))
         .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     let mut req = http.get(&url);
     if !key.is_empty() {
         req = req.bearer_auth(&key);
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, Json(json!({"error": e.to_string()}))))?;
+    let resp = req.send().await.map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
     let status = resp.status().as_u16();
     let text = resp.text().await.unwrap_or_default();
     if !(200..300).contains(&status) {
@@ -524,10 +661,12 @@ async fn api_test_provider(
             Json(json!({"error": "the provider exposes no model"})),
         ));
     };
-    let base = provider
-        .base_url
-        .clone()
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({"error": "the provider has no url"}))))?;
+    let base = provider.base_url.clone().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "the provider has no url"})),
+        )
+    })?;
     let url = client::url_for(&base, provider.protocol, Some(&model), false);
     let body = json!({
         "model": model,
@@ -538,7 +677,12 @@ async fn api_test_provider(
     let http = reqwest::Client::builder()
         .user_agent(format!("local-router/{}", client::VERSION))
         .build()
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?;
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
     let mut req = http.post(&url).json(&body);
     for (name, value) in &headers {
         req = req.header(name.as_str(), value.as_str());
@@ -650,7 +794,12 @@ async fn api_add_group(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::CONFLICT, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true, "id": id})))
 }
@@ -695,7 +844,12 @@ async fn api_update_group(
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true})))
 }
@@ -712,14 +866,17 @@ async fn api_delete_group(
                 return Err("there is no group with that id".to_string());
             }
             for group in &mut config.groups {
-                group
-                    .models
-                    .retain(|m| m != &format!("group/{id}"));
+                group.models.retain(|m| m != &format!("group/{id}"));
             }
             Ok(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
     Ok(Json(json!({"ok": true})))
 }
@@ -766,7 +923,12 @@ async fn api_save_settings(
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .ok();
     Ok(Json(json!({"ok": true})))
 }
@@ -824,7 +986,12 @@ async fn api_add_caller_key(
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .ok();
     Ok(Json(json!({"ok": true})))
 }
@@ -839,7 +1006,12 @@ async fn api_delete_caller_key(
             Ok::<(), String>(())
         })
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))))?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
         .ok();
     Ok(Json(json!({"ok": true})))
 }

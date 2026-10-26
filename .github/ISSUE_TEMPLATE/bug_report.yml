@@ -1,0 +1,48 @@
+name: 🐛 问题报告
+description: 报告 local-router 的缺陷或异常行为
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交前请先搜索现有 Issue。**安全问题请勿在此公开**，走
+        [SECURITY.md](../blob/master/SECURITY.md) 的私下报告渠道。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 发生了什么？
+      description: 现象与预期行为，尽量最小复现（脱敏：去掉真实 key、URL 与对话内容）。
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: 诊断信息
+      description: `local-router doctor` 的输出（已自动脱敏可直接粘贴）。
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: `local-router --version`
+    validations:
+      required: true
+  - type: dropdown
+    id: env
+    attributes:
+      label: 运行环境
+      options:
+        - macOS（本地二进制）
+        - Linux（本地二进制）
+        - Docker / compose
+        - Windows
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: `LOCAL_ROUTER_LOG=debug` 下的相关日志片段（脱敏）。
+      render: text

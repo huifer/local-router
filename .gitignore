@@ -1,2 +1,10 @@
 /target
 *.local-router-backup
+
+# 前端：依赖、构建产物与增量缓存都不入库（构建由 build.rs / Docker 负责）
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
+
+# macOS
+.DS_Store

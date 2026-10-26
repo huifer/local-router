@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.80"
 description = "A local AI gateway that gives every coding agent every model — web mode"
 license = "MIT"
+readme = "README.md"
+keywords = ["llm", "gateway", "proxy", "openai", "anthropic"]
+categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 default-run = "local-router"
 
 [[bin]]

@@ -44,14 +44,11 @@ pub fn set_claude(gateway: &Gateway, model: Option<&str>) -> anyhow::Result<Path
     let obj = root
         .as_object_mut()
         .context("the Claude settings file is not an object")?;
-    let env = obj
-        .entry("env")
-        .or_insert_with(|| json!({}));
-    let env = env.as_object_mut().context("the env block is not an object")?;
-    env.insert(
-        "ANTHROPIC_BASE_URL".into(),
-        json!(gateway.base_url.clone()),
-    );
+    let env = obj.entry("env").or_insert_with(|| json!({}));
+    let env = env
+        .as_object_mut()
+        .context("the env block is not an object")?;
+    env.insert("ANTHROPIC_BASE_URL".into(), json!(gateway.base_url.clone()));
     env.insert("ANTHROPIC_AUTH_TOKEN".into(), json!(gateway.key.clone()));
     if let Some(model) = model {
         env.insert("ANTHROPIC_MODEL".into(), json!(model));
@@ -140,9 +137,7 @@ pub fn set_opencode(gateway: &Gateway, model: Option<&str>) -> anyhow::Result<Pa
 
 pub fn opencode_config_path() -> PathBuf {
     if let Ok(dir) = std::env::var("XDG_CONFIG_HOME") {
-        return PathBuf::from(dir)
-            .join("opencode")
-            .join("opencode.json");
+        return PathBuf::from(dir).join("opencode").join("opencode.json");
     }
     home()
         .join(".config")

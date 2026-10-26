@@ -9,16 +9,52 @@ import type {
   UsageData,
 } from "./types";
 
-export async function api<T>(path: string, init: Omit<RequestInit, "body"> & { body?: unknown } = {}): Promise<T> {
+// The console needs no key on loopback. When the page is served from a LAN
+// address, /api answers 401 until a key is set — the same key the gateway
+// takes (LOCAL_ROUTER_DEFAULT_KEY, the default key, or any caller key).
+const WEB_KEY_STORAGE = "local-router.web-key";
+
+function getWebKey(): string {
+  try {
+    return localStorage.getItem(WEB_KEY_STORAGE) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberWebKey(key: string): void {
+  try {
+    localStorage.setItem(WEB_KEY_STORAGE, key);
+  } catch {
+    // Private mode: keep working without persistence.
+  }
+}
+
+export async function api<T>(
+  path: string,
+  init: Omit<RequestInit, "body"> & { body?: unknown } = {},
+  retried = false,
+): Promise<T> {
   const { body, headers, ...rest } = init;
+  const key = getWebKey();
   const response = await fetch(path, {
     ...rest,
     headers: {
       "content-type": "application/json",
+      ...(key ? { authorization: `Bearer ${key}` } : {}),
       ...(headers ?? {}),
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
+  if (response.status === 401 && !retried) {
+    const input = window.prompt(
+      "控制台需要访问密钥（LOCAL_ROUTER_DEFAULT_KEY / 默认密钥 / 任一 caller key）：",
+    );
+    if (input !== null) {
+      rememberWebKey(input.trim());
+      return api(path, init, true);
+    }
+  }
   const text = await response.text();
   let data: unknown = null;
   try {

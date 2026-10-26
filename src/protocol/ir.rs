@@ -104,11 +104,21 @@ impl ContentBlock {
             ContentBlock::Text { text } => text.clone(),
             ContentBlock::Thinking { text, .. } => text.clone(),
             ContentBlock::Image { media_type, data } => format!("[image {media_type}:{data}]"),
-            ContentBlock::Document { media_type, data, name } => {
-                format!("[document {media_type}:{data}{}]", name.as_deref().unwrap_or(""))
+            ContentBlock::Document {
+                media_type,
+                data,
+                name,
+            } => {
+                format!(
+                    "[document {media_type}:{data}{}]",
+                    name.as_deref().unwrap_or("")
+                )
             }
             ContentBlock::ToolUse { name, input, .. } => {
-                format!("[tool_use {name}:{}]", serde_json::to_string(input).unwrap_or_default())
+                format!(
+                    "[tool_use {name}:{}]",
+                    serde_json::to_string(input).unwrap_or_default()
+                )
             }
             ContentBlock::ToolResult { content, .. } => content
                 .iter()
@@ -202,7 +212,9 @@ pub enum ToolChoice {
     None,
     Required,
     /// Force a specific tool.
-    Tool { name: String },
+    Tool {
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -246,8 +258,7 @@ impl Usage {
 }
 
 /// A normalised chat request.
-#[derive(Debug, Clone, PartialEq)]
-#[derive(Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ChatRequest {
     /// The model as the caller asked for it: `provider/model` or `group/id`.
     pub model: String,
@@ -267,7 +278,6 @@ pub struct ChatRequest {
     /// The caller's session id, when it sent one.
     pub session_id: Option<String>,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -334,20 +344,11 @@ pub enum StreamEvent {
         usage: Usage,
     },
     /// A content block of the given kind has begun.
-    ContentBlockStart {
-        index: usize,
-        kind: BlockKind,
-    },
+    ContentBlockStart { index: usize, kind: BlockKind },
     /// More text in the current block.
-    TextDelta {
-        index: usize,
-        text: String,
-    },
+    TextDelta { index: usize, text: String },
     /// More reasoning in the current block.
-    ThinkingDelta {
-        index: usize,
-        text: String,
-    },
+    ThinkingDelta { index: usize, text: String },
     /// A tool call has begun.
     ToolUseStart {
         index: usize,
@@ -355,15 +356,9 @@ pub enum StreamEvent {
         name: String,
     },
     /// More of a tool call's JSON arguments.
-    ToolInputDelta {
-        index: usize,
-        partial_json: String,
-    },
+    ToolInputDelta { index: usize, partial_json: String },
     /// A thinking block was signed by the vendor.
-    ThinkingSignature {
-        index: usize,
-        signature: String,
-    },
+    ThinkingSignature { index: usize, signature: String },
     /// The current content block is finished.
     ContentBlockStop { index: usize },
     /// The message's own end: the stop reason and the final usage.

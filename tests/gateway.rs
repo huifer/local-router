@@ -99,7 +99,9 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         anthropic_base_url: None,
         responses_base_url: None,
         gemini_base_url: None,
-        keys: (0..keys).map(|_| ProviderKey::new(format!("sk-{id}"))).collect(),
+        keys: (0..keys)
+            .map(|_| ProviderKey::new(format!("sk-{id}")))
+            .collect(),
         models: models.iter().map(|m| m.to_string()).collect(),
         auto_include: Vec::new(),
         catalog: None,
@@ -142,7 +144,9 @@ async fn world(config: Config) -> World {
 
     let v = vendor.clone();
     tokio::spawn(async move {
-        axum::serve(vendor_listener, vendor_router(v)).await.unwrap();
+        axum::serve(vendor_listener, vendor_router(v))
+            .await
+            .unwrap();
     });
     tokio::spawn(async move {
         let app = Router::new().route("/v1/messages", post(anthropic_vendor));
@@ -349,7 +353,9 @@ async fn openai_in_anthropic_upstream_translates() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_group_fails_over_to_the_next_member() {
     let mut config = base_config();
-    config.providers.push(provider("dead", dead_port(), &["ghost"], 1));
+    config
+        .providers
+        .push(provider("dead", dead_port(), &["ghost"], 1));
     config.groups.push(Group {
         id: "g".into(),
         name: "g".into(),
@@ -375,7 +381,9 @@ async fn a_group_fails_over_to_the_next_member() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_group_of_dead_members_reports_the_error() {
     let mut config = base_config();
-    config.providers.push(provider("dead", dead_port(), &["ghost"], 1));
+    config
+        .providers
+        .push(provider("dead", dead_port(), &["ghost"], 1));
     config.groups.push(Group {
         id: "g".into(),
         name: "g".into(),
@@ -463,7 +471,10 @@ async fn a_rate_limited_key_reports_the_error() {
         )
         .await;
     assert_eq!(status, 429);
-    assert!(body["error"]["message"].as_str().unwrap().contains("refused"));
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("refused"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

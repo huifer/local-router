@@ -169,8 +169,8 @@ async fn route_info(State(g): State<Gateway>) -> Json<Value> {
 
 // ------------------------------------------------------------------ auth --
 
-/// The keys a caller may use.
-fn allowed_keys(state: &AppState) -> Vec<String> {
+/// The keys a caller may use. Shared with the web console's remote guard.
+pub(crate) fn allowed_keys(state: &AppState) -> Vec<String> {
     let Ok(config) = state.config.try_read() else {
         return Vec::new();
     };
@@ -191,11 +191,9 @@ fn allowed_keys(state: &AppState) -> Vec<String> {
     keys
 }
 
-fn presented_key(headers: &HeaderMap) -> Option<String> {
-    if let Some(v) = headers
-        .get("authorization")
-        .and_then(|v| v.to_str().ok())
-    {
+/// The key a caller presented, over any of the header styles agents use.
+pub(crate) fn presented_key(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
         let v = v.trim();
         let raw = v.strip_prefix("Bearer ").unwrap_or(v).trim();
         if !raw.is_empty() {
@@ -370,7 +368,9 @@ async fn handle(
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => {
-            return error_response(&ApiError::BadRequest(format!("the body is not json: {err}")))
+            return error_response(&ApiError::BadRequest(format!(
+                "the body is not json: {err}"
+            )))
         }
     };
 
@@ -400,7 +400,11 @@ async fn handle(
 
     let (plan, send_agent_ua) = {
         let config = g.state.config.read().await;
-        match g.router.plan(&config, &request.model, session.as_deref()).await {
+        match g
+            .router
+            .plan(&config, &request.model, session.as_deref())
+            .await
+        {
             Ok(p) => (p, config.settings.send_agent_user_agent),
             Err(e) => return error_response(&e),
         }
@@ -525,7 +529,11 @@ async fn whole_attempt(
         target.protocol,
         provider,
         &target.secret,
-        if send_agent_ua { agent_user_agent } else { None },
+        if send_agent_ua {
+            agent_user_agent
+        } else {
+            None
+        },
     );
 
     let client = match g.client_for(&target.provider_id, provider).await {
@@ -610,7 +618,11 @@ async fn stream_attempt(
         target.protocol,
         provider,
         &target.secret,
-        if send_agent_ua { agent_user_agent } else { None },
+        if send_agent_ua {
+            agent_user_agent
+        } else {
+            None
+        },
     );
     let client = match g.client_for(&target.provider_id, provider).await {
         Ok(c) => c,
@@ -671,13 +683,11 @@ async fn stream_attempt(
             rec.latency_ms = started.elapsed().as_millis() as u64;
             rec.status = status;
 
-            let mut events = vec![
-                StreamEvent::MessageStart {
-                    id: parsed.id.clone(),
-                    model: request.model.clone(),
-                    usage: parsed.usage,
-                },
-            ];
+            let mut events = vec![StreamEvent::MessageStart {
+                id: parsed.id.clone(),
+                model: request.model.clone(),
+                usage: parsed.usage,
+            }];
             let mut index = 0usize;
             let mut text_open = false;
             for block in &parsed.content {
@@ -896,11 +906,7 @@ pub type Rendered = Box<dyn FnMut(&StreamEvent) -> Vec<sse::SseFrame> + Send>;
 
 /// A renderer for the protocol the caller speaks.
 #[allow(clippy::type_complexity)]
-fn make_renderer(
-    protocol: Protocol,
-    id: String,
-    model: String,
-) -> Rendered {
+fn make_renderer(protocol: Protocol, id: String, model: String) -> Rendered {
     match protocol {
         Protocol::OpenAiChat => {
             let mut r = openai_chat::Renderer::new(id, model);
@@ -942,8 +948,7 @@ fn error_message(payload: &Value) -> String {
 
 /// Turn an error into the shape the caller expects.
 fn error_response(err: &ApiError) -> Response {
-    let status =
-        StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status = StatusCode::from_u16(err.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let body = match err {
         ApiError::Unauthorized(_) => json!({
             "type": "error",

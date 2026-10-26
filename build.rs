@@ -19,17 +19,29 @@ fn main() {
     println!("cargo:rerun-if-changed=frontend/vite.config.ts");
 
     let source_newer = |built: &Path| -> bool {
-        let Some(built_time) = mtime(built) else { return true };
-        newest_source(&frontend).map(|t| t > built_time).unwrap_or(false)
+        let Some(built_time) = mtime(built) else {
+            return true;
+        };
+        newest_source(&frontend)
+            .map(|t| t > built_time)
+            .unwrap_or(false)
     };
 
     if !index.exists() || source_newer(&index) {
         // Doubles as an escape hatch: in a Docker dependency-warmup stage
         // there is no frontend source, so a stub dist keeps cargo happy.
-        if std::env::var("LOCAL_ROUTER_SKIP_FRONTEND").is_ok() {
+        // Only an explicit truthy value counts — "0" must not stub.
+        let skip = std::env::var("LOCAL_ROUTER_SKIP_FRONTEND")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        if skip {
             println!("cargo:warning=LOCAL_ROUTER_SKIP_FRONTEND is set; using a stub console");
             std::fs::create_dir_all(dist.join("assets")).ok();
-            std::fs::write(dist.join("index.html"), "<!doctype html><title>stub</title>").ok();
+            std::fs::write(
+                dist.join("index.html"),
+                "<!doctype html><title>stub</title>",
+            )
+            .ok();
             std::fs::write(dist.join("assets/app.js"), "").ok();
             std::fs::write(dist.join("assets/style.css"), "").ok();
             return;
@@ -61,10 +73,15 @@ fn newest_source(root: &Path) -> Option<std::time::SystemTime> {
     let mut newest = None;
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.file_name().is_some_and(|n| n == "node_modules" || n == "dist") {
+            if path
+                .file_name()
+                .is_some_and(|n| n == "node_modules" || n == "dist")
+            {
                 continue;
             }
             if path.is_dir() {

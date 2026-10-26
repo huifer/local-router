@@ -12,7 +12,9 @@ use crate::gateway::client::StreamCollector;
 // ---------------------------------------------------------------- parsing --
 
 pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
-    let obj = v.as_object().ok_or_else(|| ApiError::BadRequest("the body must be an object".into()))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| ApiError::BadRequest("the body must be an object".into()))?;
     let model = obj
         .get("model")
         .and_then(Value::as_str)
@@ -93,7 +95,9 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                 .and_then(|f| f.get("name"))
                 .and_then(Value::as_str)
                 .or_else(|| m.get("name").and_then(Value::as_str));
-            name.map(|n| ToolChoice::Tool { name: n.to_string() })
+            name.map(|n| ToolChoice::Tool {
+                name: n.to_string(),
+            })
         }
         _ => None,
     };
@@ -259,7 +263,9 @@ pub fn parse_json_loose(s: &str) -> Value {
 }
 
 pub fn parse_response(v: &Value) -> ApiResult<ChatResponse> {
-    let obj = v.as_object().ok_or_else(|| ApiError::Upstream("the reply was not an object".into()))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| ApiError::Upstream("the reply was not an object".into()))?;
     let id = obj
         .get("id")
         .and_then(Value::as_str)
@@ -288,7 +294,11 @@ pub fn parse_response(v: &Value) -> ApiResult<ChatResponse> {
                 });
             }
         }
-        if let Some(t) = msg.get("reasoning").and_then(|r| r.get("content")).and_then(Value::as_str) {
+        if let Some(t) = msg
+            .get("reasoning")
+            .and_then(|r| r.get("content"))
+            .and_then(Value::as_str)
+        {
             if !t.is_empty() {
                 content.push(ContentBlock::Thinking {
                     text: t.to_string(),
@@ -687,8 +697,10 @@ impl StreamCollector for Collector {
                 let u = parse_usage(Some(usage));
                 self.usage.input_tokens = u.input_tokens.max(self.usage.input_tokens);
                 self.usage.output_tokens = u.output_tokens.max(self.usage.output_tokens);
-                self.usage.cache_read_tokens = u.cache_read_tokens.max(self.usage.cache_read_tokens);
-                self.usage.cache_write_tokens = u.cache_write_tokens.max(self.usage.cache_write_tokens);
+                self.usage.cache_read_tokens =
+                    u.cache_read_tokens.max(self.usage.cache_read_tokens);
+                self.usage.cache_write_tokens =
+                    u.cache_write_tokens.max(self.usage.cache_write_tokens);
                 self.usage.reasoning_tokens = u.reasoning_tokens.max(self.usage.reasoning_tokens);
             }
         }
@@ -766,7 +778,11 @@ impl StreamCollector for Collector {
         if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for c in calls {
                 let slot = c.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let existing = self.tool_indices.iter().find(|(s, _)| *s == slot).map(|(_, i)| *i);
+                let existing = self
+                    .tool_indices
+                    .iter()
+                    .find(|(s, _)| *s == slot)
+                    .map(|(_, i)| *i);
                 let index = match existing {
                     Some(i) => i,
                     None => {
@@ -922,7 +938,10 @@ impl Renderer {
                     None,
                 ));
             }
-            StreamEvent::ToolInputDelta { index, partial_json } => {
+            StreamEvent::ToolInputDelta {
+                index,
+                partial_json,
+            } => {
                 let slot = self
                     .tool_slots
                     .iter()

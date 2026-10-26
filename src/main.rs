@@ -218,6 +218,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         settings.web_addr = "0.0.0.0".to_string();
     }
     drop(config);
+    // Handlers that care — the console's remote guard — must see the real
+    // bind address, not the file's.
+    state.set_web_bind(&settings.web_addr).await;
 
     let gateway = gateway::Gateway::new(state.clone());
     let gateway_addr = format!("{}:{}", settings.gateway_addr, settings.gateway_port);
@@ -264,6 +267,7 @@ async fn web_only(args: WebArgs) -> anyhow::Result<()> {
     let store = Arc::new(Store::new());
     let state = AppState::load(store).await?;
     let settings = state.config.read().await.settings.clone().from_env();
+    state.set_web_bind(&settings.web_addr).await;
 
     let gateway = gateway::Gateway::new(state.clone());
     let gateway_addr = format!("{}:{}", settings.gateway_addr, args.gateway_port);
@@ -502,7 +506,10 @@ async fn test_provider(provider: &config::Provider) -> anyhow::Result<(u128, Str
         .models
         .first()
         .context("the provider exposes no model")?;
-    let base = provider.base_url.clone().context("the provider has no url")?;
+    let base = provider
+        .base_url
+        .clone()
+        .context("the provider has no url")?;
     let url = gateway::client::url_for(&base, provider.protocol, Some(model), false);
     let body = serde_json::json!({
         "model": model,
@@ -679,7 +686,9 @@ async fn usage(args: UsageArgs) -> anyhow::Result<()> {
         .collect();
 
     if args.csv {
-        println!("time,model,provider,input_tokens,output_tokens,cache_read,cache_write,latency_ms,ok");
+        println!(
+            "time,model,provider,input_tokens,output_tokens,cache_read,cache_write,latency_ms,ok"
+        );
         for r in &recent {
             println!(
                 "{},{},{},{},{},{},{},{},{}",
@@ -715,7 +724,11 @@ async fn usage(args: UsageArgs) -> anyhow::Result<()> {
 async fn set_agent(which: &str, args: AgentModelArgs) -> anyhow::Result<()> {
     let config = load_config()?;
     let settings = config.settings.clone();
-    let gateway = local_router::agents::Gateway::new(&settings.gateway_addr, settings.gateway_port, &settings.default_caller_key);
+    let gateway = local_router::agents::Gateway::new(
+        &settings.gateway_addr,
+        settings.gateway_port,
+        &settings.default_caller_key,
+    );
 
     let path = match which {
         "claude" => local_router::agents::set_claude(&gateway, Some(&args.model))?,
@@ -724,7 +737,11 @@ async fn set_agent(which: &str, args: AgentModelArgs) -> anyhow::Result<()> {
         "opencode" => local_router::agents::set_opencode(&gateway, Some(&args.model))?,
         other => anyhow::bail!("{other} is not an agent local-router knows"),
     };
-    println!("{which} now uses {} — written to {}", args.model, path.display());
+    println!(
+        "{which} now uses {} — written to {}",
+        args.model,
+        path.display()
+    );
     println!("start a new session for it to take effect");
     Ok(())
 }
@@ -732,12 +749,15 @@ async fn set_agent(which: &str, args: AgentModelArgs) -> anyhow::Result<()> {
 async fn doctor() -> anyhow::Result<()> {
     let config = load_config()?;
     println!("local-router {}", gateway::client::VERSION);
+    println!("  config      {}", config::config_file().display());
     println!(
-        "  config      {}",
-        config::config_file().display()
+        "  gateway     http://{}:{}",
+        config.settings.gateway_addr, config.settings.gateway_port
     );
-    println!("  gateway     http://{}:{}", config.settings.gateway_addr, config.settings.gateway_port);
-    println!("  web         http://{}:{}", config.settings.web_addr, config.settings.web_port);
+    println!(
+        "  web         http://{}:{}",
+        config.settings.web_addr, config.settings.web_port
+    );
     println!("  providers   {}", config.providers.len());
     println!("  groups      {}", config.groups.len());
     println!("  models      {}", config.model_ids().len());
@@ -755,7 +775,10 @@ async fn doctor() -> anyhow::Result<()> {
         for m in &g.models {
             if let Some((pid, _)) = config::Config::split_model(m) {
                 if config.provider(pid).is_none() {
-                    problems.push(format!("the group {} names an unknown provider {pid}", g.id));
+                    problems.push(format!(
+                        "the group {} names an unknown provider {pid}",
+                        g.id
+                    ));
                 }
             }
         }

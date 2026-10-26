@@ -134,7 +134,9 @@ fn default_protocol() -> Protocol {
 
 impl Provider {
     pub fn enabled_keys(&self) -> impl Iterator<Item = &ProviderKey> {
-        self.keys.iter().filter(|k| k.enabled && !k.key.trim().is_empty())
+        self.keys
+            .iter()
+            .filter(|k| k.enabled && !k.key.trim().is_empty())
     }
 
     /// The base URL to use for a given protocol.
@@ -142,10 +144,7 @@ impl Provider {
         let specific = match protocol {
             Protocol::OpenAiChat => self.base_url.clone(),
             Protocol::Anthropic => self.anthropic_base_url.clone().or(self.base_url.clone()),
-            Protocol::OpenAiResponses => self
-                .responses_base_url
-                .clone()
-                .or(self.base_url.clone()),
+            Protocol::OpenAiResponses => self.responses_base_url.clone().or(self.base_url.clone()),
             Protocol::Gemini => self.gemini_base_url.clone().or(self.base_url.clone()),
         };
         specific.filter(|u| !u.trim().is_empty())
@@ -459,7 +458,9 @@ impl Store {
     /// When the file was last written, so a running local-router can tell whether
     /// another one — the CLI, say — changed it.
     pub fn mtime(&self) -> Option<std::time::SystemTime> {
-        std::fs::metadata(&self.path).and_then(|m| m.modified()).ok()
+        std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok()
     }
 }
 
@@ -469,6 +470,10 @@ pub struct AppState {
     pub config: Arc<tokio::sync::RwLock<Config>>,
     pub store: Arc<Store>,
     pub started: chrono::DateTime<chrono::Utc>,
+    /// The address the web page actually listens on. Startup overlays the
+    /// environment and the command line on the file; handlers that care —
+    /// the console's remote guard — read this, not the file.
+    pub web_bind: Arc<tokio::sync::RwLock<String>>,
     /// The file's mtime the last time it was read, so a change made by the
     /// CLI is picked up without a restart.
     mtime: Arc<tokio::sync::Mutex<Option<std::time::SystemTime>>>,
@@ -478,12 +483,25 @@ impl AppState {
     pub async fn load(store: Arc<Store>) -> anyhow::Result<Self> {
         let config = store.load()?;
         let mtime = store.mtime();
+        let web_bind = config.settings.web_addr.clone();
         Ok(AppState {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             store,
             started: chrono::Utc::now(),
+            web_bind: Arc::new(tokio::sync::RwLock::new(web_bind)),
             mtime: Arc::new(tokio::sync::Mutex::new(mtime)),
         })
+    }
+
+    /// Record where the web page really listens, after the environment and
+    /// the command line have had their say.
+    pub async fn set_web_bind(&self, addr: &str) {
+        *self.web_bind.write().await = addr.to_string();
+    }
+
+    /// Where the web page is actually listening right now.
+    pub async fn web_bind(&self) -> String {
+        self.web_bind.read().await.clone()
     }
 
     /// Pick up changes another local-router made to the file.

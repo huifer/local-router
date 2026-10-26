@@ -330,7 +330,10 @@ fn gemini_response_formats() {
     };
     let out = gemini::format_response(&resp, "mock/mock-small");
     assert_eq!(out["candidates"][0]["finishReason"], "STOP");
-    assert_eq!(out["candidates"][0]["content"]["parts"][0]["text"], "the answer");
+    assert_eq!(
+        out["candidates"][0]["content"]["parts"][0]["text"],
+        "the answer"
+    );
     assert_eq!(out["usageMetadata"]["promptTokenCount"], 9);
 }
 
@@ -365,7 +368,15 @@ fn openai_stream_to_anthropic_stream() {
     // One text block, one set of deltas, one close.
     let starts = events
         .iter()
-        .filter(|e| matches!(e, StreamEvent::ContentBlockStart { kind: BlockKind::Text, .. }))
+        .filter(|e| {
+            matches!(
+                e,
+                StreamEvent::ContentBlockStart {
+                    kind: BlockKind::Text,
+                    ..
+                }
+            )
+        })
         .count();
     assert_eq!(starts, 1);
     let stops = events
@@ -526,16 +537,31 @@ fn url_building_matches_the_protocol() {
         "https://api.x.com/v1/chat/completions"
     );
     assert_eq!(
-        u("https://api.anthropic.com", Protocol::Anthropic, None, false),
+        u(
+            "https://api.anthropic.com",
+            Protocol::Anthropic,
+            None,
+            false
+        ),
         "https://api.anthropic.com/v1/messages"
     );
     assert_eq!(
-        u("https://api.anthropic.com/v1", Protocol::Anthropic, None, false),
+        u(
+            "https://api.anthropic.com/v1",
+            Protocol::Anthropic,
+            None,
+            false
+        ),
         "https://api.anthropic.com/v1/messages"
     );
     // A relay that only speaks Anthropic on /v1 must not grow a second one.
     assert_eq!(
-        u("https://relay.example.com/v1/", Protocol::Anthropic, None, false),
+        u(
+            "https://relay.example.com/v1/",
+            Protocol::Anthropic,
+            None,
+            false
+        ),
         "https://relay.example.com/v1/messages"
     );
     assert_eq!(

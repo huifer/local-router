@@ -32,7 +32,11 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
         .map(|v| v as u32);
     req.temperature = obj.get("temperature").and_then(Value::as_f64);
     req.top_p = obj.get("top_p").and_then(Value::as_f64);
-    if let Some(effort) = obj.get("reasoning").and_then(|r| r.get("effort")).and_then(Value::as_str) {
+    if let Some(effort) = obj
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str)
+    {
         req.reasoning_effort = match effort {
             "none" => Some(ReasoningEffort::None),
             "minimal" => Some(ReasoningEffort::Minimal),
@@ -88,7 +92,9 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
         Some(Value::Object(m)) => m
             .get("name")
             .and_then(Value::as_str)
-            .map(|n| ToolChoice::Tool { name: n.to_string() }),
+            .map(|n| ToolChoice::Tool {
+                name: n.to_string(),
+            }),
         _ => None,
     };
 
@@ -115,7 +121,9 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                                     .unwrap_or_default()
                                     .to_string(),
                                 input: super::openai_chat::parse_json_loose(
-                                    item.get("arguments").and_then(Value::as_str).unwrap_or("{}"),
+                                    item.get("arguments")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("{}"),
                                 ),
                             }],
                             tool_call_id: None,
@@ -179,8 +187,10 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                             Some(Value::String(s)) => blocks.push(ContentBlock::text(s.clone())),
                             Some(Value::Array(parts)) => {
                                 for p in parts {
-                                    let ptype =
-                                        p.get("type").and_then(Value::as_str).unwrap_or("input_text");
+                                    let ptype = p
+                                        .get("type")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("input_text");
                                     match ptype {
                                         "input_text" | "output_text" | "text" | "summary_text" => {
                                             if let Some(t) = p.get("text").and_then(Value::as_str) {
@@ -283,7 +293,9 @@ pub fn parse_response(v: &Value) -> ApiResult<ChatResponse> {
                             .unwrap_or_default()
                             .to_string(),
                         input: super::openai_chat::parse_json_loose(
-                            item.get("arguments").and_then(Value::as_str).unwrap_or("{}"),
+                            item.get("arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}"),
                         ),
                     });
                 }
@@ -401,7 +413,11 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
                                 "content": [{"type": "output_text", "text": text}],
                             }));
                         }
-                        ContentBlock::ToolUse { id, name, input: args } => {
+                        ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input: args,
+                        } => {
                             input.push(json!({
                                 "type": "function_call",
                                 "call_id": id,
@@ -603,7 +619,10 @@ impl StreamCollector for Collector {
             }
             "response.output_item.added" => {
                 let item = chunk.get("item").cloned().unwrap_or(Value::Null);
-                let itype = item.get("type").and_then(Value::as_str).unwrap_or("message");
+                let itype = item
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("message");
                 let index = self.next_index;
                 self.next_index += 1;
                 match itype {
@@ -921,7 +940,10 @@ impl Renderer {
                 ));
                 self.output_index += 1;
             }
-            StreamEvent::ToolInputDelta { index, partial_json } => {
+            StreamEvent::ToolInputDelta {
+                index,
+                partial_json,
+            } => {
                 frames.push(self.event(
                     "response.function_call_arguments.delta",
                     json!({
