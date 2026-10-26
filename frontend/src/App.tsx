@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, getCallerKeys, getGroups, getModels, getPresets, getProviders, getStatus, getUsage, getWorkBuddy, saveSettings } from "./api";
-import type { CallerKey, Group, ModelItem, Preset, Provider, Settings, Status, UsageData, WorkBuddyStatus } from "./types";
+import type { CallerKey, Group, ModelItem, Preset, Provider, Settings, Status, UsageData, UsageTotals, WorkBuddyStatus } from "./types";
 import { Button, EmptyState, formatTime, formatTokens, Icon, Panel, StatusDot } from "./components";
 import "./styles.css";
 
@@ -102,6 +102,34 @@ function WorkBuddyPanel({ status }: { status: WorkBuddyStatus | null }) {
   </div>;
 }
 
+/// 按天柱状图：请求数 + 每天的美元成本。
+function DayChart({ data }: { data: [string, UsageTotals][] }) {
+  if (!data.length) return <EmptyState title="No daily activity" detail="The activity graph will populate automatically." />;
+  const days = data.slice(-14);
+  const maxReq = Math.max(...days.map(([, v]) => v.requests), 1);
+  const maxCost = Math.max(...days.map(([, v]) => v.cost_usd), 0.000001);
+  return <div className="chart-block"><div className="bar-chart">{days.map(([day, v]) => <div className="bar-col" key={day} title={`${day}: ${v.requests} requests · $${v.cost_usd.toFixed(4)}`}><div className="bar-stack"><i className="bar-cost" style={{ height: `${(v.cost_usd / maxCost) * 100}%` }} /><i className="bar-req" style={{ height: `${(v.requests / maxReq) * 100}%` }} /></div><span>{day.slice(5)}</span></div>)}</div><div className="chart-legend"><span><i className="dot dot-req" />requests</span><span><i className="dot dot-cost" />cost (scaled)</span></div></div>;
+}
+
+/// 每平台成本横条：谁是花钱大头一眼可见。
+function ProviderCostChart({ data }: { data: [string, UsageTotals][] }) {
+  if (!data.length) return <EmptyState title="No platform usage" detail="Platform costs appear after the first call." />;
+  const maxCost = Math.max(...data.map(([, v]) => v.cost_usd), 0.000001);
+  const maxCredits = Math.max(...data.map(([, v]) => v.credits), 0.000001);
+  return <div className="hbar-chart">{data.map(([name, v]) => <div className="hbar-row" key={name}><div className="hbar-head"><strong>{name}</strong><span>{v.requests} req · ${v.cost_usd.toFixed(4)} · {v.credits.toFixed(1)} credits</span></div><div className="hbar-track"><i className="hbar-usd" style={{ width: `${(v.cost_usd / maxCost) * 100}%` }} /><i className="hbar-credits" style={{ width: `${(v.credits / maxCredits) * 100}%` }} /></div></div>)}</div>;
+}
+
+/// 模型占比甜甜圈：SVG 手绘，无第三方依赖。
+function ModelDonut({ data }: { data: [string, UsageTotals][] }) {
+  const models = data.filter(([, v]) => v.requests > 0).slice(0, 8);
+  if (!models.length) return <EmptyState title="No model usage" detail="The mix appears after the first call." />;
+  const total = models.reduce((sum, [, v]) => sum + v.requests, 0);
+  const colors = ["#9ef0bf", "#5ec9a8", "#3e9e7e", "#7ec9e8", "#a89ef0", "#f0d29e", "#f09e9e", "#9ef0e0"];
+  const radius = 52, stroke = 16, circumference = 2 * Math.PI * radius;
+  let offset = 0;
+  return <div className="donut-block"><svg viewBox="0 0 140 140" className="donut">{models.map(([name, v], i) => { const frac = v.requests / total; const dash = frac * circumference; const el = <circle key={name} cx="70" cy="70" r={radius} fill="none" stroke={colors[i % colors.length]} strokeWidth={stroke} strokeDasharray={`${dash} ${circumference - dash}`} strokeDashoffset={-offset} transform="rotate(-90 70 70)" />; offset += dash; return el; })}</svg><div className="donut-legend">{models.map(([name, v], i) => <div className="legend-row" key={name}><i style={{ background: colors[i % colors.length] }} /><span title={name}>{name}</span><strong>{Math.round((v.requests / total) * 100)}%</strong></div>)}</div></div>;
+}
+
 function RequestRow({ record }: { record: UsageData["recent"][number] }) {
   return <div className="request-row"><span className={`request-status ${record.ok ? "ok" : "fail"}`} /><div className="request-model"><strong>{record.model}</strong><span>{record.provider} / {record.protocol}</span></div><span className="request-time">{formatTime(record.time)}</span><span className="request-latency">{record.latency_ms}ms</span><span className={`request-result ${record.ok ? "" : "result-fail"}`}>{record.ok ? "OK" : "FAIL"}</span></div>;
 }
@@ -137,7 +165,7 @@ function Usage({ usage, notify }: { usage: UsageData | null; notify: (text: stri
   if (!usage) return <div className="skeleton-page"><div /><div /><div /></div>;
   const totals = usage.totals;
   const perProvider = Object.entries(usage.by_provider_costs ?? {});
-  return <div className="page-grid"><div className="metric-strip"><Metric label="REQUESTS" value={totals.requests.toLocaleString()} /><Metric label="FAILED" value={totals.failed.toLocaleString()} danger={totals.failed > 0} /><Metric label="INPUT TOKENS" value={formatTokens(totals.input_tokens)} /><Metric label="OUTPUT TOKENS" value={formatTokens(totals.output_tokens)} /><Metric label="COST (USD)" value={`$${totals.cost_usd.toFixed(4)}`} /><Metric label="CREDITS" value={totals.credits.toFixed(1)} /></div><Panel eyebrow="USAGE / BY PLATFORM" title="What each provider cost"><div className="usage-list">{perProvider.length ? perProvider.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.input_tokens)} in · {formatTokens(value.output_tokens)} out</span></div><div className="usage-money"><span className="usage-number">${value.cost_usd.toFixed(4)}</span><span className="usage-credits">{value.credits.toFixed(1)} credits{value.unpriced > 0 ? ` · ${value.unpriced} unpriced` : ""}</span></div></div>) : <EmptyState title="No platform usage" detail="Platform costs appear after the first call." />}</div></Panel><div className="content-grid content-grid-secondary"><Panel eyebrow="USAGE / BY MODEL" title="Model distribution"><div className="usage-list">{usage.by_model.length ? usage.by_model.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.output_tokens)} output</span></div><span className="usage-number">{value.requests}</span></div>) : <EmptyState title="No usage data" detail="Request data appears after the first call." />}</div></Panel><Panel eyebrow="USAGE / BY DAY" title="Daily activity"><div className="day-bars">{usage.by_day.length ? usage.by_day.slice(-10).map(([day, value]) => <div className="day-bar" key={day}><div className="bar-track"><i style={{ height: `${Math.max(8, Math.min(100, value.requests * 12))}%` }} /></div><span>{day.slice(5)}</span></div>) : <EmptyState title="No daily activity" detail="The activity graph will populate automatically." />}</div></Panel></div><Panel eyebrow="USAGE / REQUEST LOG" title="Recent requests" action={<Button variant="quiet" onClick={() => getUsage().then(() => notify("Usage refreshed"))}>Refresh log</Button>}>{usage.recent.length ? <div className="request-list">{usage.recent.map((record, index) => <RequestRow key={`${record.time}-${index}`} record={record} />)}</div> : <EmptyState title="No requests yet" detail="Connect an agent to start collecting telemetry." />}</Panel></div>;
+  return <div className="page-grid"><span className="storage-tag">{usage.storage === "sqlite" ? "SQLITE" : "JSONL"}</span><div className="metric-strip"><Metric label="REQUESTS" value={totals.requests.toLocaleString()} /><Metric label="FAILED" value={totals.failed.toLocaleString()} danger={totals.failed > 0} /><Metric label="INPUT TOKENS" value={formatTokens(totals.input_tokens)} /><Metric label="OUTPUT TOKENS" value={formatTokens(totals.output_tokens)} /><Metric label="COST (USD)" value={`$${totals.cost_usd.toFixed(4)}`} /><Metric label="CREDITS" value={totals.credits.toFixed(1)} /></div><Panel eyebrow="USAGE / BY PLATFORM" title="What each provider cost"><div className="usage-list">{perProvider.length ? perProvider.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.input_tokens)} in · {formatTokens(value.output_tokens)} out</span></div><div className="usage-money"><span className="usage-number">${value.cost_usd.toFixed(4)}</span><span className="usage-credits">{value.credits.toFixed(1)} credits{value.unpriced > 0 ? ` · ${value.unpriced} unpriced` : ""}</span></div></div>) : <EmptyState title="No platform usage" detail="Platform costs appear after the first call." />}</div></Panel><div className="content-grid content-grid-secondary"><Panel eyebrow="USAGE / BY MODEL" title="Model distribution"><div className="usage-list">{usage.by_model.length ? usage.by_model.map(([name, value]) => <div className="usage-row" key={name}><div><strong>{name}</strong><span>{value.requests} requests · {formatTokens(value.output_tokens)} output</span></div><span className="usage-number">{value.requests}</span></div>) : <EmptyState title="No usage data" detail="Request data appears after the first call." />}</div></Panel><Panel eyebrow="USAGE / BY DAY" title="Daily activity"><DayChart data={usage.by_day} /></Panel></div><div className="content-grid content-grid-secondary"><Panel eyebrow="USAGE / COST BY PLATFORM" title="Spending per platform"><ProviderCostChart data={perProvider} /></Panel><Panel eyebrow="USAGE / SHARE" title="Model mix"><ModelDonut data={usage.by_model} /></Panel></div><Panel eyebrow="USAGE / REQUEST LOG" title="Recent requests" action={<Button variant="quiet" onClick={() => getUsage().then(() => notify("Usage refreshed"))}>Refresh log</Button>}>{usage.recent.length ? <div className="request-list">{usage.recent.map((record, index) => <RequestRow key={`${record.time}-${index}`} record={record} />)}</div> : <EmptyState title="No requests yet" detail="Connect an agent to start collecting telemetry." />}</Panel></div>;
 }
 
 function SettingsPanel({ settings, callerKeys, setCallerKeys, onChanged, notify }: { settings: Settings; callerKeys: CallerKey[]; setCallerKeys: (keys: CallerKey[]) => void; onChanged: () => Promise<void>; notify: (text: string, error?: boolean) => void }) {

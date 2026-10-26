@@ -136,3 +136,84 @@ fn the_builtin_table_prices_a_workbuddy_request_in_both_units() {
     let cost = local_router::pricing::cost_of("workbuddy", "no-such-model", 1, 1, 0, 0);
     assert!(cost.usd.is_none());
 }
+
+#[test]
+fn the_sqlite_store_round_trips_every_field() {
+    let dir = std::env::temp_dir().join(format!(
+        "local-router-sqlite-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("usage.db");
+    let store = local_router::store::Store::open(&path);
+
+    let mut rec = record("workbuddy/hy3");
+    rec.provider = "workbuddy".into();
+    rec.key_id = Some("k1".into());
+    rec.group = Some("g1".into());
+    rec.output_tokens = 640;
+    rec.reasoning_tokens = 320;
+    rec.cost_usd = Some(0.0007);
+    rec.credits = Some(0.077);
+    rec.priced = true;
+    store.record(&rec);
+
+    let mut failed = record("openai/broken");
+    failed.provider = "openai".into();
+    failed.ok = false;
+    failed.status = 429;
+    failed.error = Some("the vendor refused".into());
+    failed.priced = false;
+    store.record(&failed);
+
+    let all = store.read_all();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].model, "workbuddy/hy3");
+    assert_eq!(all[0].output_tokens, 640);
+    assert_eq!(all[0].cost_usd, Some(0.0007));
+    assert_eq!(all[0].credits, Some(0.077));
+    assert!(all[0].priced);
+    assert!(!all[1].ok);
+    assert_eq!(all[1].status, 429);
+    assert!(!all[1].priced);
+
+    // Aggregates come straight from SQL.
+    let since = "2000-01-01";
+    let totals = store.totals_since(since).expect("totals row");
+    assert_eq!(totals.requests, 1); // only the ok one counts
+    assert_eq!(totals.output_tokens, 640);
+    assert!((totals.cost_usd.unwrap() - 0.0007).abs() < 1e-9);
+    assert!((totals.credits.unwrap() - 0.077).abs() < 1e-9);
+
+    let by_provider = store.by_provider_since(since);
+    assert_eq!(by_provider.len(), 1);
+    assert_eq!(by_provider[0].label.as_deref(), Some("workbuddy"));
+
+    let by_day = store.by_day_since(since);
+    assert_eq!(by_day.len(), 1);
+    assert!(by_day[0].day.as_deref().unwrap_or("").starts_with("20"));
+
+    let recent = store.recent(since, 1);
+    assert_eq!(recent.len(), 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_unopenable_store_degrades_to_no_writes() {
+    // A path in a directory that is a file: opening fails, and every write
+    // is a no-op instead of a panic.
+    let dir = std::env::temp_dir().join(format!("local-router-sqlite-bad-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let blocker = dir.join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let store = local_router::store::Store::open(&blocker.join("nested").join("usage.db"));
+    store.record(&record("m/model")); // must not panic
+    assert!(store.read_all().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}

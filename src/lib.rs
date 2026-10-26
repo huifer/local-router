@@ -6,5 +6,6 @@ pub mod gateway;
 pub mod presets;
 pub mod pricing;
 pub mod protocol;
+pub mod store;
 pub mod web;
 pub mod workbuddy;

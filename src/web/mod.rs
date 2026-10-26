@@ -1086,30 +1086,127 @@ async fn api_delete_caller_key(
 
 // ------------------------------------------------------------------ usage --
 
-async fn api_usage(State(state): State<AppState>) -> Json<Value> {
-    let records = usage::read_all(&state.usage_path());
-    let totals = usage::totals(&records);
-    let by_model = usage::group_by(&records, |r| r.model.clone());
-    let by_provider = usage::group_by(&records, |r| r.provider.clone());
-    let by_day = usage::by_day(&records);
-    // The per-provider money view: what each platform cost this period.
-    let by_provider_costs: BTreeMap<String, usage::Totals> =
-        usage::group_by(&records, |r| r.provider.clone())
-            .into_iter()
+async fn api_usage(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let period = query.get("period").map(|s| s.as_str()).unwrap_or("7d");
+    let days: i64 = match period {
+        "today" | "24h" => 1,
+        "30d" => 30,
+        "all" => 36500,
+        _ => 7,
+    };
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+
+    // The queries come from SQLite when it is on; the JSONL log is the
+    // fallback for a gateway that runs with it off.
+    let (totals, by_model, by_provider, by_day, recent) = if let Some(store) = &state.sqlite {
+        let totals = store
+            .totals_since(&cutoff)
+            .map(|row| {
+                json!({
+                    "requests": row.requests,
+                    "failed": row.failed,
+                    "input_tokens": row.input_tokens,
+                    "output_tokens": row.output_tokens,
+                    "cache_read_tokens": row.cache_read_tokens,
+                    "cache_write_tokens": row.cache_write_tokens,
+                    "reasoning_tokens": row.reasoning_tokens,
+                    "cost_usd": row.cost_usd.unwrap_or(0.0),
+                    "credits": row.credits.unwrap_or(0.0),
+                    "unpriced": 0,
+                })
+            })
+            .unwrap_or(json!({"requests": 0}));
+        let map_row = |row: &crate::store::AggregateRow| {
+            json!([
+                row.label.clone().unwrap_or_default(),
+                {
+                    "requests": row.requests,
+                    "failed": row.failed,
+                    "input_tokens": row.input_tokens,
+                    "output_tokens": row.output_tokens,
+                    "cache_read_tokens": row.cache_read_tokens,
+                    "cache_write_tokens": row.cache_write_tokens,
+                    "reasoning_tokens": row.reasoning_tokens,
+                    "cost_usd": row.cost_usd.unwrap_or(0.0),
+                    "credits": row.credits.unwrap_or(0.0),
+                    "unpriced": 0,
+                }
+            ])
+        };
+        let by_model: Vec<Value> = store.by_model_since(&cutoff).iter().map(map_row).collect();
+        let by_provider: Vec<Value> = store
+            .by_provider_since(&cutoff)
+            .iter()
+            .map(map_row)
             .collect();
-    let recent: Vec<Value> = records
-        .iter()
-        .rev()
-        .take(200)
-        .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
-        .collect();
+        let by_day: Vec<Value> = store
+            .by_day_since(&cutoff)
+            .iter()
+            .map(|row| {
+                json!([
+                    row.day.clone().unwrap_or_default(),
+                    {
+                        "requests": row.requests,
+                        "failed": row.failed,
+                        "input_tokens": row.input_tokens,
+                        "output_tokens": row.output_tokens,
+                        "cost_usd": row.cost_usd.unwrap_or(0.0),
+                        "credits": row.credits.unwrap_or(0.0),
+                    }
+                ])
+            })
+            .collect();
+        let recent: Vec<Value> = store
+            .recent(&cutoff, 200)
+            .iter()
+            .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
+            .collect();
+        (
+            totals,
+            Value::Array(by_model),
+            Value::Array(by_provider),
+            Value::Array(by_day),
+            recent,
+        )
+    } else {
+        let records = usage::read_all(&state.usage_path());
+        let records: Vec<_> = records
+            .into_iter()
+            .filter(|r| r.time.as_str() >= cutoff.as_str())
+            .collect();
+        let totals = usage::totals(&records);
+        let by_model = usage::group_by(&records, |r| r.model.clone());
+        let by_provider = usage::group_by(&records, |r| r.provider.clone());
+        let _by_provider_costs: BTreeMap<String, usage::Totals> =
+            usage::group_by(&records, |r| r.provider.clone())
+                .into_iter()
+                .collect();
+        let by_day = usage::by_day(&records);
+        let recent: Vec<Value> = records
+            .iter()
+            .rev()
+            .take(200)
+            .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
+            .collect();
+        (
+            serde_json::to_value(totals).unwrap_or(json!({})),
+            serde_json::to_value(by_model).unwrap_or(json!([])),
+            serde_json::to_value(by_provider).unwrap_or(json!([])),
+            serde_json::to_value(by_day).unwrap_or(json!([])),
+            recent,
+        )
+    };
+
     Json(json!({
         "totals": totals,
         "by_model": by_model,
         "by_provider": by_provider,
-        "by_provider_costs": by_provider_costs,
         "by_day": by_day,
         "recent": recent,
+        "storage": if state.sqlite.is_some() { "sqlite" } else { "jsonl" },
     }))
 }
 

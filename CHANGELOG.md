@@ -70,6 +70,17 @@
   - 顺带修复：CLI 的 `usage` 读的是全局目录的 usage.jsonl（多实例时看不到
     本实例的记录），现与网关写入路径一致。
 
+### Added
+
+- **SQLite 用量存储**：新增 `usage.db`（跟 config 同目录，rusqlite bundled，
+  WAL 模式），每条用量记录（含 cost_usd / credits）双写 SQLite + JSONL；
+  聚合查询（总账/按天/按平台/按模型/最近请求）改走 SQL，数据量大也不卡。
+  `LOCAL_ROUTER_DISABLE_SQLITE=1` 可退回纯 JSONL。数据库文件可直接用
+  sqlite3 客户端查询。
+- **控制台可视化**：Usage 页新增三张图（纯 SVG，零前端依赖）——按天
+  请求/成本柱状图、每平台美元+credits 成本横条、模型占比甜甜圈；页面
+  标明当前存储（SQLITE / JSONL）。
+
 ### Fixed
 
 - 流式请求的用量记录此前 token 恒为 0（绝大多数 agent 走流式，用量页看不到
@@ -85,7 +96,7 @@
 
 ### Changed
 
-- 测试从 47 个增加到 77 个：新增 WorkBuddy 会话、续期、agent 配置写入、用量
+- 测试从 47 个增加到 79 个：新增 WorkBuddy 会话、续期、agent 配置写入、用量
   日志与「流式上游 → 整段回复」的端到端用例。
 
 ## [0.1.0] - 2026-10-26

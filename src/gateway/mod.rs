@@ -23,6 +23,7 @@ use crate::config::{AppState, Provider};
 use crate::gateway::usage::UsageRecord;
 use crate::protocol::ir::*;
 use crate::protocol::{anthropic, gemini, openai_chat, openai_responses, sse};
+use crate::store;
 
 use client::{Target, UpstreamReply};
 
@@ -46,6 +47,8 @@ pub struct Gateway {
     /// Video tasks are asynchronous upstream resources. Keep the route to
     /// the provider long enough for status/content/delete calls.
     media_tasks: Arc<Mutex<HashMap<String, MediaTask>>>,
+    /// The SQLite store, when it is on.
+    pub sqlite: Option<store::Store>,
 }
 
 impl Gateway {
@@ -55,6 +58,7 @@ impl Gateway {
             router: Arc::new(Router::new()),
             clients: Arc::new(Mutex::new(HashMap::new())),
             media_tasks: Arc::new(Mutex::new(HashMap::new())),
+            sqlite: store::Store::shared(),
         }
     }
 
@@ -1240,7 +1244,7 @@ async fn handle(
                 let record = g.state.config.read().await.settings.record_usage;
                 if record {
                     crate::pricing::price_record(&mut rec);
-                    usage::record(&g.state.usage_path(), &rec);
+                    persist_usage(&g.state, &g.sqlite, &rec);
                 }
                 last_error = err;
                 if !last_error.retryable() {
@@ -1284,6 +1288,15 @@ async fn note_route_trace(
             },
         )
         .await;
+}
+
+/// Write one usage record to its sinks: SQLite when it is on, and the
+/// JSONL log for anyone tailing it.
+fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::UsageRecord) {
+    if let Some(store) = sqlite {
+        store.record(rec);
+    }
+    usage::record(&state.usage_path(), rec);
 }
 
 /// The headers to send to a target, and the secret behind them.
@@ -1406,7 +1419,7 @@ async fn whole_attempt(
             let outbound = downstream_response(caller_protocol, &parsed, &request.model);
             let record = g.state.config.read().await.settings.record_usage;
             if record {
-                usage::record(&g.state.usage_path(), &rec);
+                persist_usage(&g.state, &g.sqlite, &rec);
             }
             return Ok(Json(outbound).into_response());
         }
@@ -1509,6 +1522,7 @@ async fn stream_attempt(
                 usage_path,
                 record_usage,
                 started,
+                g.sqlite.clone(),
             ))
         }
         UpstreamReply::Whole { status, body } => {
@@ -1619,6 +1633,7 @@ async fn stream_attempt(
                 usage_path,
                 record_usage,
                 started,
+                g.sqlite.clone(),
             ))
         }
     }
@@ -1657,6 +1672,7 @@ struct UsageGuard {
     record: bool,
     started: Instant,
     done: bool,
+    sqlite: Option<store::Store>,
 }
 
 impl UsageGuard {
@@ -1670,6 +1686,9 @@ impl UsageGuard {
             // Pricing runs at write time: the tokens only arrived with the
             // stream's last events.
             crate::pricing::price_record(&mut self.rec);
+            if let Some(store) = &self.sqlite {
+                store.record(&self.rec);
+            }
             usage::record(&self.path, &self.rec);
         }
     }
@@ -1691,10 +1710,18 @@ fn events_to_stream(
     usage_path: PathBuf,
     record_usage: bool,
     started: Instant,
+    sqlite: Option<store::Store>,
 ) -> Response {
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let body_stream = async_stream::stream! {
-        let mut guard = UsageGuard { rec, path: usage_path, record: record_usage, started, done: false };
+        let mut guard = UsageGuard {
+            rec,
+            path: usage_path,
+            record: record_usage,
+            started,
+            done: false,
+            sqlite,
+        };
         let mut renderer = make_renderer(caller_protocol, id.clone(), asked_model.clone());
         for ev in &events {
             for out in renderer(ev) {
@@ -1725,10 +1752,18 @@ fn build_stream(
     usage_path: PathBuf,
     record_usage: bool,
     started: Instant,
+    sqlite: Option<store::Store>,
 ) -> Response {
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let body_stream = async_stream::stream! {
-        let mut guard = UsageGuard { rec, path: usage_path, record: record_usage, started, done: false };
+        let mut guard = UsageGuard {
+            rec,
+            path: usage_path,
+            record: record_usage,
+            started,
+            done: false,
+            sqlite,
+        };
         let mut collector: Box<dyn client::StreamCollector> = match upstream_protocol {
             Protocol::OpenAiChat => Box::new(openai_chat::Collector::new()),
             Protocol::OpenAiResponses => Box::new(openai_responses::Collector::new()),

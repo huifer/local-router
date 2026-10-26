@@ -123,7 +123,10 @@ export interface UsageRecord {
   agent?: string;
 }
 
+export type UsageStorage = "sqlite" | "jsonl";
+
 export interface UsageData {
+  storage?: UsageStorage;
   totals: UsageTotals;
   by_model: [string, UsageTotals][];
   by_provider_costs: Record<string, UsageTotals>;

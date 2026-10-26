@@ -3,7 +3,7 @@
 //! The web page and the gateway are the same process. `local-router` starts both;
 //! `local-router serve` starts the gateway alone.
 
-use local_router::{config, gateway, presets, pricing, protocol, web, workbuddy};
+use local_router::{config, gateway, presets, pricing, protocol, store, web, workbuddy};
 
 use std::sync::Arc;
 
@@ -999,22 +999,22 @@ async fn ls() -> anyhow::Result<()> {
 }
 
 async fn usage(args: UsageArgs) -> anyhow::Result<()> {
-    let records = gateway::usage::read_all(&Store::new().usage_path());
-    let days: i64 = match args.period.as_str() {
+    // SQLite answers with aggregates; the JSONL log is the fallback.
+    let period_days: i64 = match args.period.as_str() {
         "today" => 1,
         "7d" => 7,
         "30d" => 30,
         _ => 3650,
     };
-    let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
-    let recent: Vec<_> = records
-        .into_iter()
-        .filter(|r| {
-            chrono::DateTime::parse_from_rfc3339(&r.time)
-                .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
-                .unwrap_or(true)
-        })
-        .collect();
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(period_days)).to_rfc3339();
+    let records = match store::Store::shared() {
+        Some(store) => store.recent(&cutoff, usize::MAX),
+        None => gateway::usage::read_all(&Store::new().usage_path())
+            .into_iter()
+            .filter(|r| r.time.as_str() >= cutoff.as_str())
+            .collect(),
+    };
+    let recent = records;
 
     if args.csv {
         println!(

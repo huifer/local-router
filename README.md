@@ -88,6 +88,24 @@ usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
 `usage.jsonl` 跟 `config.json` 放在同一个目录；超过 8 MB 会自动翻页成
 `usage.jsonl.1`（可用 `LOCAL_ROUTER_USAGE_MAX_BYTES` 改这个上限）。
 
+### SQLite 存储
+
+用量记录同时写入 **SQLite**（`usage.db`，跟 config 同目录）：
+
+- 写入走单连接 + WAL，本地网关的开销可以忽略；
+- 控制台 / HTTP API 的聚合（按天、按平台、按模型、总账）直接用 SQL 查询，
+  不再扫全量日志，数据量大了也不卡；
+- JSONL 日志保留（兼容导出/人工查看），两者内容一致；
+- 设 `LOCAL_ROUTER_DISABLE_SQLITE=1` 可关掉，退回纯 JSONL。
+
+可以直接用任何 SQLite 客户端查：
+
+```sql
+sqlite3 ~/.config/local-router/usage.db \
+  "SELECT provider, count(*), sum(cost_usd), sum(credits)
+   FROM usage_records WHERE time >= '2026-10-26' GROUP BY provider;"
+```
+
 ### 额度与开销统计
 
 每个请求的记录里都带钱：
@@ -118,7 +136,13 @@ curl -H "Authorization: Bearer <key>" \
 ```
 
 控制台 Usage 页有「BY PLATFORM」面板：每个平台一段时期的请求数、token、
-美元成本、credits 消耗一目了然。
+美元成本、credits 消耗一目了然。可视化图表：
+
+- **按天柱状图**（近 14 天）：请求数 + 成本双维度；
+- **每平台成本横条**：美元与 credits 双条，谁是花钱大头一眼可见；
+- **模型占比甜甜圈**：请求份额按模型分布。
+
+数据来自 SQLite 聚合查询（页面顶部有 `SQLITE` / `JSONL` 标签标明当前存储）。
 
 **改价格 / 加新厂商**：写 `~/.config/local-router/prices.json`（不用重启）：
 

@@ -48,3 +48,7 @@ tokio = { version = "1", features = ["full", "test-util"] }
 opt-level = 3
 lto = "thin"
 strip = true
+
+[dependencies.rusqlite]
+version = "0.32"
+features = ["bundled"]
