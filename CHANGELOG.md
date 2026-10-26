@@ -81,6 +81,16 @@
   请求/成本柱状图、每平台美元+credits 成本横条、模型占比甜甜圈；页面
   标明当前存储（SQLITE / JSONL）。
 
+- **终端仪表盘**：`local-router dashboard` —— 与控制台同源的实时数据
+  （providers / 7 天流量与开销 / 每平台条形 / 按天趋势 / 最近请求），ANSI
+  绘制、2 秒刷新、`q` 退出，零 UI 依赖。
+- **守护进程**：`local-router daemon start|stop|status|logs` —— 后台运行
+  （网关 + 控制台同一进程），pid 文件管理，start 等端口就绪才返回，stop
+  SIGTERM 优雅退出（卡死自动 SIGKILL），logs 即 `tail -f`。
+- **端口与绑定全量可配**：`serve`/`daemon` 均支持 `--port` / `--web-port`
+  （0 = 关闭页面）/ `--addr` / `--web-addr`（控制台与网关分开绑定）/
+  `--lan`，环境变量与 config.json 同序。
+
 ### Fixed
 
 - 流式请求的用量记录此前 token 恒为 0（绝大多数 agent 走流式，用量页看不到

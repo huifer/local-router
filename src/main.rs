@@ -53,11 +53,51 @@ enum Command {
     Opencode(AgentModelArgs),
     /// Check that everything is in order.
     Doctor,
+    /// The terminal dashboard: live providers, traffic and spend.
+    Dashboard,
+    /// Manage the background daemon (start, stop, status, logs).
+    #[command(subcommand)]
+    Daemon(DaemonCmd),
     /// WorkBuddy: the local login session, its credits and its models.
     #[command(name = "workbuddy", subcommand)]
     WorkBuddy(WorkBuddyCmd),
     /// Show the price table the gateway bills with.
     Prices,
+}
+
+#[derive(Subcommand, Debug)]
+enum DaemonCmd {
+    /// Start the daemon in the background (gateway + console, one process).
+    Start {
+        /// The gateway port.
+        #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
+        port: u16,
+        /// The console port (0 turns it off).
+        #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 3426)]
+        web_port: u16,
+        /// The address the gateway binds to.
+        #[arg(long, env = "LOCAL_ROUTER_GATEWAY_ADDR", default_value = "127.0.0.1")]
+        addr: String,
+        /// The address the console binds to.
+        #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR", default_value = "127.0.0.1")]
+        web_addr: Option<String>,
+        /// Bind on the local network (both addresses become 0.0.0.0).
+        #[arg(long)]
+        lan: bool,
+        /// Wait until the ports answer, then return.
+        #[arg(long, default_value_t = true)]
+        wait: bool,
+    },
+    /// Stop the running daemon.
+    Stop,
+    /// Whether the daemon is running, and where.
+    Status,
+    /// Follow the daemon's log.
+    Logs {
+        /// Only show the last N lines first.
+        #[arg(long, default_value_t = 40)]
+        lines: usize,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -84,6 +124,9 @@ impl Default for ServeArgs {
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
+            web_addr: std::env::var("LOCAL_ROUTER_WEB_ADDR")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 }
@@ -103,6 +146,9 @@ struct ServeArgs {
     /// The address the gateway binds to.
     #[arg(long, env = "LOCAL_ROUTER_GATEWAY_ADDR", default_value = "127.0.0.1")]
     addr: String,
+    /// The address the console binds to. Defaults to the gateway address.
+    #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR")]
+    web_addr: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -214,6 +260,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Doctor) => doctor().await,
         Some(Command::WorkBuddy(cmd)) => workbuddy_cmd(cmd).await,
         Some(Command::Prices) => prices().await,
+        Some(Command::Dashboard) => local_router::dashboard::run().await,
+        Some(Command::Daemon(cmd)) => daemon_cmd(cmd).await,
         None => serve(ServeArgs::default()).await,
     }
 }
@@ -237,6 +285,9 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     settings.gateway_port = args.port;
     settings.web_port = args.web_port;
     settings.gateway_addr = args.addr.clone();
+    if let Some(web_addr) = &args.web_addr {
+        settings.web_addr = web_addr.clone();
+    }
     if args.lan {
         settings.gateway_addr = "0.0.0.0".to_string();
         settings.web_addr = "0.0.0.0".to_string();
@@ -329,6 +380,17 @@ async fn web_only(args: WebArgs) -> anyhow::Result<()> {
 }
 
 async fn shutdown() {
+    // The daemon form has no terminal: it is stopped with SIGTERM.
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate()).expect("the SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
     println!("\nstopping");
 }
@@ -811,6 +873,241 @@ async fn login() -> anyhow::Result<()> {
 
     println!();
     println!("  done — try it: local-router workbuddy credits");
+    Ok(())
+}
+
+// ---------------------------------------------------------------- daemon --
+
+/// Where the daemon's bookkeeping lives.
+fn daemon_dir() -> std::path::PathBuf {
+    config::config_dir().join("daemon")
+}
+
+fn pid_file() -> std::path::PathBuf {
+    daemon_dir().join("daemon.pid")
+}
+
+fn log_file() -> std::path::PathBuf {
+    daemon_dir().join("daemon.log")
+}
+
+/// The pid of the running daemon, if there is one and it is alive.
+fn running_pid() -> Option<u32> {
+    let pid: u32 = std::fs::read_to_string(pid_file())
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // A pid file without a live process is a leftover: clean it up.
+    let alive = std::path::Path::new(&format!("/proc/{pid}")).exists()
+        || std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if alive {
+        Some(pid)
+    } else {
+        let _ = std::fs::remove_file(pid_file());
+        None
+    }
+}
+
+/// The arguments the daemon was started with, for `status` and `restart`.
+fn save_start_args(args: &DaemonStart) -> anyhow::Result<()> {
+    let path = daemon_dir().join("start.json");
+    let body = serde_json::json!({
+        "port": args.port,
+        "web_port": args.web_port,
+        "addr": args.addr,
+        "web_addr": args.web_addr,
+        "lan": args.lan,
+    });
+    std::fs::create_dir_all(daemon_dir())?;
+    std::fs::write(path, serde_json::to_string_pretty(&body)?)?;
+    Ok(())
+}
+
+async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
+    match cmd {
+        DaemonCmd::Start {
+            port,
+            web_port,
+            addr,
+            web_addr,
+            lan,
+            wait,
+        } => {
+            let args = DaemonStart {
+                port,
+                web_port,
+                addr,
+                web_addr,
+                lan,
+            };
+            if let Some(pid) = running_pid() {
+                println!("already running (pid {pid}) — stop it first: local-router daemon stop");
+                return Ok(());
+            }
+            start_daemon(&args)?;
+            if wait {
+                // Wait until both ports answer, or say what went wrong.
+                let gateway = format!("http://{}:{port}/health", args.addr);
+                let web = if args.web_port == 0 {
+                    None
+                } else {
+                    Some(format!(
+                        "http://{}:{}/",
+                        args.web_addr.clone().unwrap_or_else(|| args.addr.clone()),
+                        args.web_port
+                    ))
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    let gateway_up = reqwest::get(&gateway)
+                        .await
+                        .map(|r| r.status().is_success())
+                        .unwrap_or(false);
+                    let web_up = match &web {
+                        Some(url) => reqwest::get(url)
+                            .await
+                            .map(|r| r.status().is_success())
+                            .unwrap_or(false),
+                        None => true,
+                    };
+                    if gateway_up && web_up {
+                        break;
+                    }
+                    if std::time::Instant::now() > deadline {
+                        anyhow::bail!(
+                            "the daemon did not come up in time; see {}",
+                            log_file().display()
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+            println!(
+                "daemon started  gateway http://{}:{}  console http://{}:{}",
+                args.addr,
+                args.port,
+                args.web_addr.as_deref().unwrap_or(&args.addr),
+                args.web_port
+            );
+            println!("logs: {}", log_file().display());
+            Ok(())
+        }
+        DaemonCmd::Stop => {
+            let Some(pid) = running_pid() else {
+                println!("not running");
+                let _ = std::fs::remove_file(pid_file());
+                return Ok(());
+            };
+            // SIGTERM first (graceful); a stuck process gets SIGKILL.
+            let _ = std::process::Command::new("kill")
+                .arg(pid.to_string())
+                .status();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while running_pid() == Some(pid) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            if running_pid() == Some(pid) {
+                let _ = std::process::Command::new("kill")
+                    .arg("-9")
+                    .arg(pid.to_string())
+                    .status();
+                let _ = tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let _ = std::fs::remove_file(pid_file());
+            println!("daemon stopped (was pid {pid})");
+            Ok(())
+        }
+        DaemonCmd::Status => {
+            match running_pid() {
+                Some(pid) => {
+                    let args = read_start_args().unwrap_or_default();
+                    println!("running    yes (pid {pid})");
+                    println!("gateway    http://{}:{}", args.addr, args.port);
+                    if args.web_port > 0 {
+                        println!(
+                            "console    http://{}:{}",
+                            args.web_addr.as_deref().unwrap_or(&args.addr),
+                            args.web_port
+                        );
+                    }
+                    println!("logs       {}", log_file().display());
+                }
+                None => println!("running    no"),
+            }
+            Ok(())
+        }
+        DaemonCmd::Logs { lines } => {
+            let path = log_file();
+            if !path.exists() {
+                println!("no log yet at {}", path.display());
+                return Ok(());
+            }
+            // `tail -f` is the honest way to follow a file.
+            let status = std::process::Command::new("tail")
+                .arg("-n")
+                .arg(lines.to_string())
+                .arg("-f")
+                .arg(&path)
+                .status()?;
+            let _ = status;
+            Ok(())
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+struct DaemonStart {
+    port: u16,
+    web_port: u16,
+    addr: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_addr: Option<String>,
+    #[serde(default)]
+    lan: bool,
+}
+
+fn read_start_args() -> Option<DaemonStart> {
+    let text = std::fs::read_to_string(daemon_dir().join("start.json")).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// Spawn this same binary as a detached background process.
+fn start_daemon(args: &DaemonStart) -> anyhow::Result<()> {
+    std::fs::create_dir_all(daemon_dir())?;
+    let exe = std::env::current_exe()?;
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file())?;
+
+    let mut command = std::process::Command::new(exe);
+    command
+        .arg("serve")
+        .arg("--port")
+        .arg(args.port.to_string())
+        .arg("--web-port")
+        .arg(args.web_port.to_string())
+        .arg("--addr")
+        .arg(&args.addr)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    if let Some(web_addr) = &args.web_addr {
+        command.arg("--web-addr").arg(web_addr);
+    }
+    if args.lan {
+        command.arg("--lan");
+    }
+    let child = command.spawn().context("the daemon could not be spawned")?;
+    std::fs::write(pid_file(), child.id().to_string())?;
+    save_start_args(args)?;
     Ok(())
 }
 

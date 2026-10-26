@@ -50,15 +50,21 @@ export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3425  GEMINI_API_KEY=local-router
 ## CLI
 
 ```sh
-local-router                                   # 网关 + 控制台（前台）
-local-router serve [--port N] [--web-port N] [--lan]
+local-router                                   # 网关 + 控制台（前台，一个进程）
+local-router serve [--port N] [--web-port N] [--addr A] [--web-addr A] [--lan]
 local-router web [--port N]
+
+# 后台守护进程：同一进程提供网关 + 控制台，断开终端也活着
+local-router daemon start  [--port N] [--web-port N] [--addr A] [--web-addr A] [--lan]
+local-router daemon status | stop | logs
 
 local-router provider add <preset|名字> --key sk-… [--url …] [--models a,b]
 local-router provider list | rm | models | expose | media | test | key
 local-router models                            # 模型目录
 local-router group add <名字> --models a/m1,b/m2 --routing order | list | rm
-local-router ls | usage [--csv] | doctor
+local-router ls | usage [--csv] | doctor | prices
+local-router dashboard                        # 终端仪表盘（实时刷新，q 退出）
+local-router daemon start|stop|status|logs    # 后台守护进程
 local-router claude|codex|gemini|opencode <model>
 ```
 
@@ -152,6 +158,30 @@ curl -H "Authorization: Bearer <key>" \
 
 价目是估算：订阅制厂商的 credit 折算率来自套餐额度与公开价的比例，可能与
 厂商实际扣减有偏差；`prices.json` 可随时校准。
+
+### 守护进程与端口
+
+两种常驻方式，**同一个进程**同时提供网关（API）和控制台（React 页面）：
+
+```sh
+local-router daemon start              # 后台运行，默认 3425/3426
+local-router daemon status             # 运行中？端口？日志在哪
+local-router daemon logs               # tail -f 日志
+local-router daemon stop               # 优雅停止（SIGTERM，卡死自动 SIGKILL）
+```
+
+端口与绑定（CLI 参数 > 环境变量 > config.json > 默认值）：
+
+| 参数 | 作用 |
+| --- | --- |
+| `--port` / `LOCAL_ROUTER_GATEWAY_PORT` | 网关端口（默认 3425） |
+| `--web-port` / `LOCAL_ROUTER_WEB_PORT` | 控制台端口（默认 3426；**0 = 关闭页面，只跑网关**） |
+| `--addr` / `LOCAL_ROUTER_GATEWAY_ADDR` | 网关绑定地址（默认 127.0.0.1） |
+| `--web-addr` / `LOCAL_ROUTER_WEB_ADDR` | 控制台绑定地址（默认同网关地址） |
+| `--lan` / `LOCAL_ROUTER_LAN=1` | 两个地址都改绑 `0.0.0.0`（局域网可访问） |
+
+`daemon start` 会等两个端口就绪才返回；stop 会在 5 秒内退不干净时自动
+SIGKILL。日志在 `~/.config/local-router/daemon/daemon.log`。
 
 ### 环境变量
 
