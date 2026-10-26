@@ -20,10 +20,13 @@
 
 ### 本地运行
 
+需要 Rust 1.80+ 与 Node.js 24+（仅构建控制台用）：
+
 ```sh
 npm install && npm run build --prefix frontend   # 构建 React 控制台（cargo 也会自动调）
 cargo build --release
 ./target/release/local-router                    # 网关 :3425 + 控制台 :3426
+local-router --version                           # 0.1.1
 ```
 
 ### Docker
