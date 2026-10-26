@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>local-router</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🪺</text></svg>">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo">🪺</span>
+    <span class="name">local-router</span>
+    <span class="version" id="version"></span>
+  </div>
+  <nav class="tabs" id="tabs">
+    <button data-tab="overview" class="active">概览</button>
+    <button data-tab="providers">服务商</button>
+    <button data-tab="models">模型</button>
+    <button data-tab="groups">路由组</button>
+    <button data-tab="usage">用量</button>
+    <button data-tab="settings">设置</button>
+  </nav>
+  <div class="right">
+    <span class="addr" id="gateway-addr"></span>
+  </div>
+</header>
+
+<main>
+  <!-- 概览 -->
+  <section id="overview" class="panel active">
+    <div class="tiles" id="tiles"></div>
+    <div class="cols">
+      <div class="card">
+        <h2>网关</h2>
+        <p class="muted">把你的 agent 指到网关，它就能用上你加的每一个模型。</p>
+        <pre id="env-box" class="code"></pre>
+      </div>
+      <div class="card">
+        <h2>最近请求</h2>
+        <div id="overview-requests" class="list"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 服务商 -->
+  <section id="providers" class="panel">
+    <div class="head">
+      <h2>服务商</h2>
+      <button class="primary" id="add-provider">添加服务商</button>
+    </div>
+    <div id="providers-list" class="list"></div>
+  </section>
+
+  <!-- 模型 -->
+  <section id="models" class="panel">
+    <div class="head">
+      <h2>模型</h2>
+      <input id="model-search" class="search" placeholder="搜索模型…">
+    </div>
+    <div id="models-list" class="list"></div>
+  </section>
+
+  <!-- 路由组 -->
+  <section id="groups" class="panel">
+    <div class="head">
+      <h2>路由组</h2>
+      <button class="primary" id="add-group">添加路由组</button>
+    </div>
+    <p class="muted">一个路由组把几个模型当成一个来用，agent 只填 <code>group/&lt;id&gt;</code>，网关在成员之间调度。</p>
+    <div id="groups-list" class="list"></div>
+  </section>
+
+  <!-- 用量 -->
+  <section id="usage" class="panel">
+    <div class="head">
+      <h2>用量</h2>
+      <button id="refresh-usage" class="ghost">刷新</button>
+    </div>
+    <div class="tiles" id="usage-tiles"></div>
+    <div class="cols">
+      <div class="card">
+        <h2>按模型</h2>
+        <div id="usage-models" class="list"></div>
+      </div>
+      <div class="card">
+        <h2>按天</h2>
+        <div id="usage-days" class="list"></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>请求</h2>
+      <div id="usage-recent" class="list"></div>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section id="settings" class="panel">
+    <div class="head"><h2>设置</h2><button class="primary" id="save-settings">保存</button></div>
+    <div class="card form" id="settings-form"></div>
+    <div class="card">
+      <h2>调用密钥</h2>
+      <p class="muted">给别的电脑或别的程序用。每个密钥可以单独停用。</p>
+      <div id="caller-keys" class="list"></div>
+      <button class="ghost" id="add-caller-key">新建密钥</button>
+    </div>
+  </section>
+</main>
+
+<!-- 添加服务商 -->
+<div class="modal" id="provider-modal" hidden>
+  <div class="sheet">
+    <div class="sheet-head">
+      <h2>添加服务商</h2>
+      <button class="close" data-close>×</button>
+    </div>
+    <div class="sheet-body">
+      <div id="preset-tiles" class="tiles presets"></div>
+      <div class="form">
+        <label>名称 <input id="p-name" placeholder="例如：我的中转"></label>
+        <label>地址 <input id="p-url" placeholder="https://example.com/v1"></label>
+        <label>密钥 <input id="p-key" placeholder="sk-…" type="password"></label>
+        <label>模型 <input id="p-models" placeholder="gpt-5.2, claude-sonnet-4-5"></label>
+      </div>
+      <p class="hint" id="p-hint">先选一个厂商预设，密钥只留一个就够。</p>
+    </div>
+    <div class="sheet-foot">
+      <button class="ghost" data-close>取消</button>
+      <button class="primary" id="save-provider">添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- 路由组 -->
+<div class="modal" id="group-modal" hidden>
+  <div class="sheet">
+    <div class="sheet-head">
+      <h2 id="group-modal-title">添加路由组</h2>
+      <button class="close" data-close>×</button>
+    </div>
+    <div class="sheet-body">
+      <div class="form">
+        <label>名称 <input id="g-name" placeholder="例如：Opus anywhere"></label>
+        <label>成员 <input id="g-models" placeholder="deepseek/deepseek-chat, openai/gpt-5.2"></label>
+        <label>调度
+          <select id="g-routing">
+            <option value="order">order — 第一个，直到它答不了</option>
+            <option value="rotate">rotate — 每轮换一个</option>
+            <option value="usage">usage — 用得少的先来</option>
+            <option value="smart">smart — 快到期额度先用</option>
+            <option value="weight">weight — 按权重分配</option>
+          </select>
+        </label>
+        <label>粘性
+          <select id="g-stays">
+            <option value="auto">auto — 缓存还值钱时</option>
+            <option value="session">session — 整个会话</option>
+            <option value="turn">turn — 当前轮</option>
+            <option value="off">off — 不粘</option>
+            <option value="strict">strict — 永不换，出错也给它</option>
+          </select>
+        </label>
+        <label class="check"><input type="checkbox" id="g-listed" checked> 在模型列表里显示</label>
+      </div>
+    </div>
+    <div class="sheet-foot">
+      <button class="ghost" data-close>取消</button>
+      <button class="primary" id="save-group">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast" hidden></div>
+<script src="/app.js"></script>
+</body>
+</html>

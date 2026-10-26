@@ -1,0 +1,29 @@
+services:
+  local-router:
+    build: .
+    image: local-router:latest
+    container_name: local-router
+    restart: unless-stopped
+    ports:
+      # 按需改成宿主机端口；容器内固定 3425/3426
+      - "3425:3425"
+      - "3426:3426"
+    environment:
+      LOCAL_ROUTER_HOME: /data
+      LOCAL_ROUTER_GATEWAY_ADDR: 0.0.0.0
+      LOCAL_ROUTER_WEB_ADDR: 0.0.0.0
+      LOCAL_ROUTER_GATEWAY_PORT: "3425"
+      LOCAL_ROUTER_WEB_PORT: "3426"
+      # 默认调用密钥（建议改成自己的）
+      LOCAL_ROUTER_DEFAULT_KEY: ${LOCAL_ROUTER_DEFAULT_KEY:-local-router}
+      LOCAL_ROUTER_LOG: ${LOCAL_ROUTER_LOG:-info}
+    volumes:
+      - local-router-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3425/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+
+volumes:
+  local-router-data:

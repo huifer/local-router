@@ -1,0 +1,771 @@
+//! local-router: a local gateway that gives every coding agent every model.
+//!
+//! The web page and the gateway are the same process. `local-router` starts both;
+//! `local-router serve` starts the gateway alone.
+
+use local_router::{config, gateway, presets, protocol, web};
+
+use std::sync::Arc;
+
+use anyhow::Context;
+use clap::{Args, Parser, Subcommand};
+
+use crate::config::{AppState, Config, ProviderKey, Routing, Stays, Store};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "local-router",
+    version,
+    about = "A local gateway that gives every coding agent every model",
+    disable_help_subcommand = true
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Start the gateway, and the web page with it.
+    Serve(ServeArgs),
+    /// Start only the web page.
+    Web(WebArgs),
+    /// Manage the providers.
+    #[command(subcommand)]
+    Provider(ProviderCmd),
+    /// List the models the gateway serves.
+    Models,
+    /// Manage the routing groups.
+    #[command(subcommand)]
+    Group(GroupCmd),
+    /// Show what is configured.
+    Ls,
+    /// Show the recorded usage.
+    Usage(UsageArgs),
+    /// Point Claude Code at a model.
+    Claude(AgentModelArgs),
+    /// Point Codex at a model.
+    Codex(AgentModelArgs),
+    /// Point Gemini CLI at a model.
+    Gemini(AgentModelArgs),
+    /// Point OpenCode at a model.
+    Opencode(AgentModelArgs),
+    /// Check that everything is in order.
+    Doctor,
+}
+
+impl Default for ServeArgs {
+    fn default() -> Self {
+        ServeArgs {
+            port: env_port("LOCAL_ROUTER_GATEWAY_PORT", 3425),
+            web_port: env_port("LOCAL_ROUTER_WEB_PORT", 3426),
+            lan: false,
+            addr: std::env::var("LOCAL_ROUTER_GATEWAY_ADDR")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+        }
+    }
+}
+
+#[derive(Args, Debug, Clone)]
+struct ServeArgs {
+    /// The port the gateway listens on.
+    /// Defaults to LOCAL_ROUTER_GATEWAY_PORT, then the file, then 3425.
+    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
+    port: u16,
+    /// The port the web page listens on. Zero turns the page off.
+    #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 3426)]
+    web_port: u16,
+    /// Bind on the local network, so other computers can use the gateway.
+    #[arg(long)]
+    lan: bool,
+    /// The address the gateway binds to.
+    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_ADDR", default_value = "127.0.0.1")]
+    addr: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct WebArgs {
+    /// The port the web page listens on.
+    #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 3426)]
+    port: u16,
+    /// The port the gateway listens on.
+    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
+    gateway_port: u16,
+}
+
+#[derive(Args, Debug, Clone)]
+struct UsageArgs {
+    /// Print csv instead of a table.
+    #[arg(long)]
+    csv: bool,
+    /// Only show the last day.
+    #[arg(long, default_value = "7d")]
+    period: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct AgentModelArgs {
+    /// The model, as `provider/model` or `group/id`.
+    model: String,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderCmd {
+    /// Add a provider: a preset needs only a key.
+    Add {
+        /// The preset id, or `custom`.
+        preset: String,
+        /// The vendor key.
+        #[arg(long)]
+        key: Option<String>,
+        /// A name, for a custom provider.
+        #[arg(long)]
+        name: Option<String>,
+        /// The base url, for a custom provider.
+        #[arg(long)]
+        url: Option<String>,
+        /// The models to expose, comma separated.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+    },
+    /// List the providers.
+    List,
+    /// Remove a provider.
+    Rm { id: String },
+    /// Fetch the vendor's own list of models.
+    Models { id: String },
+    /// Set the models a provider exposes.
+    Expose { id: String, models: Vec<String> },
+    /// Send a tiny request to a provider.
+    Test { id: String },
+    /// Add a key to a provider.
+    Key { id: String, key: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum GroupCmd {
+    /// Add a routing group.
+    Add {
+        /// The group's name.
+        name: String,
+        /// The members, comma separated.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+        /// How the group picks: smart, order, rotate, usage or weight.
+        #[arg(long, default_value = "order")]
+        routing: String,
+        /// How long a conversation stays: auto, session, turn, off or strict.
+        #[arg(long, default_value = "auto")]
+        stays: String,
+    },
+    /// List the groups.
+    List,
+    /// Remove a group.
+    Rm { id: String },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("LOCAL_ROUTER_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .init();
+
+    let cli = Cli::parse();
+    match cli.command {
+        Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Web(args)) => web_only(args).await,
+        Some(Command::Provider(cmd)) => provider_cmd(cmd).await,
+        Some(Command::Models) => models().await,
+        Some(Command::Group(cmd)) => group_cmd(cmd).await,
+        Some(Command::Ls) => ls().await,
+        Some(Command::Usage(args)) => usage(args).await,
+        Some(Command::Claude(args)) => set_agent("claude", args).await,
+        Some(Command::Codex(args)) => set_agent("codex", args).await,
+        Some(Command::Gemini(args)) => set_agent("gemini", args).await,
+        Some(Command::Opencode(args)) => set_agent("opencode", args).await,
+        Some(Command::Doctor) => doctor().await,
+        None => serve(ServeArgs::default()).await,
+    }
+}
+
+/// Read a port from the environment, falling back when absent or odd.
+fn env_port(name: &str, fallback: u16) -> u16 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(fallback)
+}
+
+// ---------------------------------------------------------------- servers --
+
+async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    let store = Arc::new(Store::new());
+    let state = AppState::load(store).await?;
+    let config = state.config.read().await;
+    // Environment first (containers), then the command line (people).
+    let mut settings = config.settings.clone().from_env();
+    settings.gateway_port = args.port;
+    settings.web_port = args.web_port;
+    settings.gateway_addr = args.addr.clone();
+    if args.lan {
+        settings.gateway_addr = "0.0.0.0".to_string();
+        settings.web_addr = "0.0.0.0".to_string();
+    }
+    drop(config);
+
+    let gateway = gateway::Gateway::new(state.clone());
+    let gateway_addr = format!("{}:{}", settings.gateway_addr, settings.gateway_port);
+    let gateway_router = gateway::router(gateway);
+    let listener = tokio::net::TcpListener::bind(&gateway_addr)
+        .await
+        .with_context(|| format!("the gateway could not listen on {gateway_addr}"))?;
+
+    let web_addr = format!("{}:{}", settings.web_addr, settings.web_port);
+    let web_listener = if settings.web_port == 0 {
+        None
+    } else {
+        Some(
+            tokio::net::TcpListener::bind(&web_addr)
+                .await
+                .with_context(|| format!("the web page could not listen on {web_addr}"))?,
+        )
+    };
+
+    println!("local-router {}", gateway::client::VERSION);
+    println!("  gateway  http://{gateway_addr}");
+    if web_listener.is_some() {
+        println!("  web      http://{web_addr}");
+    }
+    println!("  press ctrl-c to stop");
+
+    if let Some(listener) = web_listener {
+        let web_router = web::router(state.clone());
+        tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, web_router).await {
+                eprintln!("the web page stopped: {err}");
+            }
+        });
+    }
+
+    axum::serve(listener, gateway_router)
+        .with_graceful_shutdown(shutdown())
+        .await
+        .context("the gateway stopped")?;
+    Ok(())
+}
+
+async fn web_only(args: WebArgs) -> anyhow::Result<()> {
+    let store = Arc::new(Store::new());
+    let state = AppState::load(store).await?;
+    let settings = state.config.read().await.settings.clone().from_env();
+
+    let gateway = gateway::Gateway::new(state.clone());
+    let gateway_addr = format!("{}:{}", settings.gateway_addr, args.gateway_port);
+    let gateway_router = gateway::router(gateway);
+    match tokio::net::TcpListener::bind(&gateway_addr).await {
+        Ok(listener) => {
+            println!("  gateway  http://{gateway_addr}");
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, gateway_router).await;
+            });
+        }
+        Err(err) => {
+            eprintln!("  gateway  not started on {gateway_addr}: {err}");
+        }
+    }
+
+    let web_addr = format!("{}:{}", settings.web_addr, args.port);
+    let listener = tokio::net::TcpListener::bind(&web_addr)
+        .await
+        .with_context(|| format!("the web page could not listen on {web_addr}"))?;
+    println!("  web      http://{web_addr}");
+    println!("  press ctrl-c to stop");
+    axum::serve(listener, web::router(state))
+        .with_graceful_shutdown(shutdown())
+        .await
+        .context("the web page stopped")?;
+    Ok(())
+}
+
+async fn shutdown() {
+    let _ = tokio::signal::ctrl_c().await;
+    println!("\nstopping");
+}
+
+// -------------------------------------------------------------- providers --
+
+fn load_config() -> anyhow::Result<Config> {
+    Store::new().load()
+}
+
+fn save_config(config: &Config) -> anyhow::Result<()> {
+    Store::new().save(config)
+}
+
+async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
+    let mut config = load_config()?;
+    match cmd {
+        ProviderCmd::Add {
+            preset,
+            key,
+            name,
+            url,
+            models,
+        } => {
+            let provider = match presets::get(&preset) {
+                Some(p) => {
+                    let mut p = presets::to_provider(p, key.as_deref());
+                    if let Some(url) = &url {
+                        p.base_url = Some(url.trim_end_matches('/').to_string());
+                    }
+                    if !models.is_empty() {
+                        p.models = models;
+                    }
+                    p
+                }
+                None => {
+                    // Not a preset: a provider the user described by hand.
+                    let name = name.unwrap_or_else(|| preset.clone());
+                    let mut p = presets::custom_provider(
+                        &name,
+                        url.as_deref(),
+                        None,
+                        protocol::ir::Protocol::OpenAiChat,
+                        key.as_deref(),
+                        &models,
+                    );
+                    p.kind = "custom".to_string();
+                    p
+                }
+            };
+            let id = provider.id.clone();
+            if config.providers.iter().any(|p| p.id == id) {
+                anyhow::bail!("there is already a provider called {id}");
+            }
+            config.providers.push(provider);
+            save_config(&config)?;
+            println!("added the provider {id}");
+        }
+        ProviderCmd::List => {
+            if config.providers.is_empty() {
+                println!("no providers yet");
+                return Ok(());
+            }
+            println!("{:<16} {:<22} {:<6} MODELS", "ID", "HOST", "KEYS");
+            for p in &config.providers {
+                let host = p
+                    .base_url
+                    .clone()
+                    .unwrap_or_default()
+                    .replace("https://", "")
+                    .replace("http://", "")
+                    .trim_end_matches('/')
+                    .to_string();
+                println!(
+                    "{:<16} {:<22} {:<6} {}",
+                    p.id,
+                    host,
+                    p.keys.len(),
+                    p.models.join(", ")
+                );
+            }
+        }
+        ProviderCmd::Rm { id } => {
+            let before = config.providers.len();
+            config.providers.retain(|p| p.id != id);
+            if config.providers.len() == before {
+                anyhow::bail!("there is no provider called {id}");
+            }
+            for group in &mut config.groups {
+                group.models.retain(|m| !m.starts_with(&format!("{id}/")));
+            }
+            save_config(&config)?;
+            println!("removed the provider {id}");
+        }
+        ProviderCmd::Models { id } => {
+            let Some(provider) = config.provider(&id) else {
+                anyhow::bail!("there is no provider called {id}");
+            };
+            let models = fetch_models(provider).await?;
+            println!("the vendor lists {} models:", models.len());
+            for m in models {
+                println!("  {m}");
+            }
+        }
+        ProviderCmd::Expose { id, models } => {
+            let count = {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.models = models;
+                p.models.len()
+            };
+            save_config(&config)?;
+            println!("{id} now exposes {count} models");
+        }
+        ProviderCmd::Test { id } => {
+            let Some(provider) = config.provider(&id) else {
+                anyhow::bail!("there is no provider called {id}");
+            };
+            let provider = provider.clone();
+            match test_provider(&provider).await {
+                Ok((latency, reply)) => {
+                    println!("{id} answered in {latency} ms");
+                    println!("  {reply}");
+                }
+                Err(err) => {
+                    println!("{id} did not answer: {err}");
+                }
+            }
+        }
+        ProviderCmd::Key { id, key } => {
+            let count = {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.keys.push(ProviderKey::new(key));
+                p.keys.len()
+            };
+            save_config(&config)?;
+            println!("{id} now has {count} keys");
+        }
+    }
+    Ok(())
+}
+
+async fn fetch_models(provider: &config::Provider) -> anyhow::Result<Vec<String>> {
+    let base = provider
+        .base_url
+        .clone()
+        .context("the provider has no url")?;
+    let url = gateway::client::models_url(&base);
+    let key = provider.enabled_keys().next().map(|k| k.key.clone());
+    let http = reqwest::Client::builder()
+        .user_agent(format!("local-router/{}", gateway::client::VERSION))
+        .build()?;
+    let mut req = http.get(&url);
+    if let Some(k) = key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("the vendor answered {status}: {text}");
+    }
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let mut models: Vec<String> = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.get("id").and_then(serde_json::Value::as_str))
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if models.is_empty() {
+        models = value
+            .get("models")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| {
+                        i.get("name")
+                            .or_else(|| i.get("id"))
+                            .and_then(serde_json::Value::as_str)
+                    })
+                    .map(|s| s.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+async fn test_provider(provider: &config::Provider) -> anyhow::Result<(u128, String)> {
+    let key = provider
+        .enabled_keys()
+        .next()
+        .context("the provider has no key")?;
+    let model = provider
+        .models
+        .first()
+        .context("the provider exposes no model")?;
+    let base = provider.base_url.clone().context("the provider has no url")?;
+    let url = gateway::client::url_for(&base, provider.protocol, Some(model), false);
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 16,
+    });
+    let headers = gateway::client::auth_headers(provider.protocol, provider, &key.key, None);
+    let http = reqwest::Client::builder()
+        .user_agent(format!("local-router/{}", gateway::client::VERSION))
+        .build()?;
+    let mut req = http.post(&url).json(&body);
+    for (name, value) in &headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    let started = std::time::Instant::now();
+    let resp = req.send().await?;
+    let status = resp.status();
+    let latency = started.elapsed().as_millis();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("{}", text.chars().take(200).collect::<String>());
+    }
+    Ok((latency, text.chars().take(200).collect()))
+}
+
+// ---------------------------------------------------------------- groups --
+
+async fn group_cmd(cmd: GroupCmd) -> anyhow::Result<()> {
+    let mut config = load_config()?;
+    match cmd {
+        GroupCmd::Add {
+            name,
+            models,
+            routing,
+            stays,
+        } => {
+            let id = slugify(&name);
+            let routing = match routing.as_str() {
+                "smart" => Routing::Smart,
+                "order" => Routing::Order,
+                "rotate" => Routing::Rotate,
+                "usage" => Routing::Usage,
+                "weight" => Routing::Weight,
+                other => anyhow::bail!("{other} is not a routing mode"),
+            };
+            let stays = match stays.as_str() {
+                "auto" => Stays::Auto,
+                "session" => Stays::Session,
+                "turn" => Stays::Turn,
+                "off" => Stays::Off,
+                "strict" => Stays::Strict,
+                other => anyhow::bail!("{other} is not a stays mode"),
+            };
+            if config.groups.iter().any(|g| g.id == id) {
+                anyhow::bail!("there is already a group called {id}");
+            }
+            config.groups.push(config::Group {
+                id: id.clone(),
+                name,
+                models,
+                routing,
+                weights: Default::default(),
+                stays,
+                listed: true,
+                note: None,
+            });
+            save_config(&config)?;
+            println!("added the group {id}");
+        }
+        GroupCmd::List => {
+            if config.groups.is_empty() {
+                println!("no groups yet");
+                return Ok(());
+            }
+            for g in &config.groups {
+                println!(
+                    "{:<16} {:<8} {:<8} {}",
+                    g.id,
+                    g.routing.as_str(),
+                    g.stays.as_str(),
+                    g.models.join(", ")
+                );
+            }
+        }
+        GroupCmd::Rm { id } => {
+            let before = config.groups.len();
+            config.groups.retain(|g| g.id != id);
+            if config.groups.len() == before {
+                anyhow::bail!("there is no group called {id}");
+            }
+            save_config(&config)?;
+            println!("removed the group {id}");
+        }
+    }
+    Ok(())
+}
+
+fn slugify(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "group".to_string()
+    } else {
+        out
+    }
+}
+
+// ----------------------------------------------------------------- views --
+
+async fn models() -> anyhow::Result<()> {
+    let config = load_config()?;
+    for id in config.model_ids() {
+        println!("{id}");
+    }
+    Ok(())
+}
+
+async fn ls() -> anyhow::Result<()> {
+    let config = load_config()?;
+    println!("providers:");
+    if config.providers.is_empty() {
+        println!("  (none yet — add one with: local-router provider add deepseek sk-…)");
+    }
+    for p in &config.providers {
+        println!(
+            "  {:<16} {:<6} {} model(s), {} key(s)",
+            p.id,
+            if p.enabled { "on" } else { "off" },
+            p.models.len(),
+            p.keys.len()
+        );
+    }
+    println!();
+    println!("groups:");
+    if config.groups.is_empty() {
+        println!("  (none yet)");
+    }
+    for g in &config.groups {
+        println!(
+            "  {:<16} {:<8} {}",
+            g.id,
+            g.routing.as_str(),
+            g.models.join(", ")
+        );
+    }
+    Ok(())
+}
+
+async fn usage(args: UsageArgs) -> anyhow::Result<()> {
+    let records = gateway::usage::read_all(&config::usage_file());
+    let days: i64 = match args.period.as_str() {
+        "today" => 1,
+        "7d" => 7,
+        "30d" => 30,
+        _ => 3650,
+    };
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+    let recent: Vec<_> = records
+        .into_iter()
+        .filter(|r| {
+            chrono::DateTime::parse_from_rfc3339(&r.time)
+                .map(|t| t.with_timezone(&chrono::Utc) >= cutoff)
+                .unwrap_or(true)
+        })
+        .collect();
+
+    if args.csv {
+        println!("time,model,provider,input_tokens,output_tokens,cache_read,cache_write,latency_ms,ok");
+        for r in &recent {
+            println!(
+                "{},{},{},{},{},{},{},{},{}",
+                r.time,
+                r.model,
+                r.provider,
+                r.input_tokens,
+                r.output_tokens,
+                r.cache_read_tokens,
+                r.cache_write_tokens,
+                r.latency_ms,
+                r.ok
+            );
+        }
+        return Ok(());
+    }
+
+    let totals = gateway::usage::totals(&recent);
+    println!(
+        "{} requests, {} failed, {} in, {} out",
+        totals.requests, totals.failed, totals.input_tokens, totals.output_tokens
+    );
+    println!();
+    for (model, t) in gateway::usage::group_by(&recent, |r| r.model.clone()) {
+        println!(
+            "  {:<32} {:>5} requests  {:>9} in  {:>8} out",
+            model, t.requests, t.input_tokens, t.output_tokens
+        );
+    }
+    Ok(())
+}
+
+async fn set_agent(which: &str, args: AgentModelArgs) -> anyhow::Result<()> {
+    let config = load_config()?;
+    let settings = config.settings.clone();
+    let gateway = local_router::agents::Gateway::new(&settings.gateway_addr, settings.gateway_port, &settings.default_caller_key);
+
+    let path = match which {
+        "claude" => local_router::agents::set_claude(&gateway, Some(&args.model))?,
+        "codex" => local_router::agents::set_codex(&gateway, Some(&args.model))?,
+        "gemini" => local_router::agents::set_gemini(&gateway, Some(&args.model))?,
+        "opencode" => local_router::agents::set_opencode(&gateway, Some(&args.model))?,
+        other => anyhow::bail!("{other} is not an agent local-router knows"),
+    };
+    println!("{which} now uses {} — written to {}", args.model, path.display());
+    println!("start a new session for it to take effect");
+    Ok(())
+}
+
+async fn doctor() -> anyhow::Result<()> {
+    let config = load_config()?;
+    println!("local-router {}", gateway::client::VERSION);
+    println!(
+        "  config      {}",
+        config::config_file().display()
+    );
+    println!("  gateway     http://{}:{}", config.settings.gateway_addr, config.settings.gateway_port);
+    println!("  web         http://{}:{}", config.settings.web_addr, config.settings.web_port);
+    println!("  providers   {}", config.providers.len());
+    println!("  groups      {}", config.groups.len());
+    println!("  models      {}", config.model_ids().len());
+
+    let mut problems = Vec::new();
+    for p in &config.providers {
+        if p.enabled && p.keys.is_empty() && p.id != "ollama" && p.id != "lmstudio" {
+            problems.push(format!("the provider {} has no key", p.id));
+        }
+        if p.enabled && p.base_url.is_none() {
+            problems.push(format!("the provider {} has no url", p.id));
+        }
+    }
+    for g in &config.groups {
+        for m in &g.models {
+            if let Some((pid, _)) = config::Config::split_model(m) {
+                if config.provider(pid).is_none() {
+                    problems.push(format!("the group {} names an unknown provider {pid}", g.id));
+                }
+            }
+        }
+    }
+    if problems.is_empty() {
+        println!("  everything looks in order");
+    } else {
+        for p in problems {
+            println!("  ! {p}");
+        }
+    }
+    Ok(())
+}

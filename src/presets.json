@@ -1,0 +1,308 @@
+{
+  "presets": [
+    {
+      "id": "anthropic",
+      "name": "Anthropic",
+      "group": "vendor",
+      "protocol": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "catalog": "anthropic",
+      "default_models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
+      "key_hint": "sk-ant-…",
+      "docs": "https://docs.anthropic.com/en/api/getting-started"
+    },
+    {
+      "id": "openai",
+      "name": "OpenAI",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.openai.com/v1",
+      "catalog": "openai",
+      "default_models": ["gpt-5.2", "gpt-5.2-mini", "gpt-5.1", "gpt-4.1", "o4-mini"],
+      "key_hint": "sk-…",
+      "docs": "https://platform.openai.com/docs/api-reference"
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini",
+      "group": "vendor",
+      "protocol": "gemini",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta",
+      "catalog": "google",
+      "default_models": ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash"],
+      "key_hint": "AIza…",
+      "docs": "https://ai.google.dev/gemini-api/docs"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.deepseek.com/v1",
+      "catalog": "deepseek",
+      "default_models": ["deepseek-chat", "deepseek-reasoner"],
+      "key_hint": "sk-…",
+      "docs": "https://api-docs.deepseek.com"
+    },
+    {
+      "id": "kimi",
+      "name": "Kimi (Moonshot)",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.moonshot.cn/v1",
+      "catalog": "moonshotai",
+      "default_models": ["kimi-k2-0905-preview", "moonshot-v1-128k"],
+      "key_hint": "sk-…",
+      "docs": "https://platform.moonshot.cn/docs"
+    },
+    {
+      "id": "glm",
+      "name": "Zhipu GLM",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "catalog": "zhipuai",
+      "default_models": ["glm-4.6", "glm-4.5-air", "glm-4.5-flash"],
+      "key_hint": "…",
+      "docs": "https://open.bigmodel.cn/dev/api"
+    },
+    {
+      "id": "minimax",
+      "name": "MiniMax",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.minimaxi.com/v1",
+      "catalog": "minimax",
+      "default_models": ["MiniMax-M2.1", "MiniMax-M2", "MiniMax-M2.5"],
+      "key_hint": "eyJ…",
+      "docs": "https://platform.minimaxi.com/document"
+    },
+    {
+      "id": "qwen",
+      "name": "Qwen (DashScope)",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "catalog": "alibaba",
+      "default_models": ["qwen3-max", "qwen3-coder-plus", "qwen-plus"],
+      "key_hint": "sk-…",
+      "docs": "https://help.aliyun.com/zh/model-studio/compatibility-of-openai-with-dashscope"
+    },
+    {
+      "id": "stepfun",
+      "name": "StepFun",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.stepfun.com/v1",
+      "catalog": "stepfun-ai",
+      "default_models": ["step-3.5-flash", "step-2-mini"],
+      "key_hint": "…",
+      "docs": "https://platform.stepfun.com/docs"
+    },
+    {
+      "id": "volcengine",
+      "name": "Volcengine Ark",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "catalog": "volcengine",
+      "default_models": ["doubao-seed-1-6", "doubao-seed-1-6-lite"],
+      "key_hint": "…",
+      "docs": "https://www.volcengine.com/docs/82379"
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.groq.com/openai/v1",
+      "catalog": "groq",
+      "default_models": ["llama-3.3-70b-versatile", "qwen-3-32b"],
+      "key_hint": "gsk_…",
+      "docs": "https://console.groq.com/docs/openai"
+    },
+    {
+      "id": "xai",
+      "name": "xAI",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.x.ai/v1",
+      "catalog": "xai",
+      "default_models": ["grok-4", "grok-3", "grok-3-mini"],
+      "key_hint": "xai-…",
+      "docs": "https://docs.x.ai/docs/api-reference"
+    },
+    {
+      "id": "mistral",
+      "name": "Mistral",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.mistral.ai/v1",
+      "catalog": "mistral",
+      "default_models": ["mistral-large-latest", "codestral-latest", "ministral-8b-latest"],
+      "key_hint": "…",
+      "docs": "https://docs.mistral.ai/api"
+    },
+    {
+      "id": "perplexity",
+      "name": "Perplexity",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.perplexity.ai",
+      "catalog": "perplexity",
+      "default_models": ["sonar", "sonar-pro", "sonar-reasoning"],
+      "key_hint": "pplx-…",
+      "docs": "https://docs.perplexity.ai"
+    },
+    {
+      "id": "baidu",
+      "name": "Baidu Qianfan",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://qianfan.baidubce.com/v2",
+      "catalog": "baidu",
+      "default_models": ["ernie-4.5-turbo-128k", "ernie-4.5-8k"],
+      "key_hint": "bce-…",
+      "docs": "https://cloud.baidu.com/doc/WENXINWORKSHOP"
+    },
+    {
+      "id": "tencent",
+      "name": "Tencent Hunyuan",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
+      "catalog": "tencent",
+      "default_models": ["hunyuan-turbos-latest", "hunyuan-a13b"],
+      "key_hint": "…",
+      "docs": "https://cloud.tencent.com/document/product/1729"
+    },
+    {
+      "id": "huawei",
+      "name": "Huawei Cloud MaaS",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.modelarts-maas.com/v1",
+      "catalog": "huawei",
+      "default_models": ["deepseek-v3.2", "qwen3-235b-a22b"],
+      "key_hint": "…",
+      "docs": "https://support.huaweicloud.com/modelarts"
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter",
+      "group": "relay",
+      "protocol": "openai_chat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "catalog": "openrouter",
+      "default_models": [],
+      "key_hint": "sk-or-v1-…",
+      "docs": "https://openrouter.ai/docs"
+    },
+    {
+      "id": "siliconflow",
+      "name": "SiliconFlow",
+      "group": "relay",
+      "protocol": "openai_chat",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "catalog": "siliconflow-cn",
+      "default_models": [],
+      "key_hint": "sk-…",
+      "docs": "https://docs.siliconflow.cn"
+    },
+    {
+      "id": "together",
+      "name": "Together AI",
+      "group": "relay",
+      "protocol": "openai_chat",
+      "base_url": "https://api.together.xyz/v1",
+      "catalog": "together",
+      "default_models": [],
+      "key_hint": "…",
+      "docs": "https://docs.together.ai"
+    },
+    {
+      "id": "fireworks",
+      "name": "Fireworks AI",
+      "group": "relay",
+      "protocol": "openai_chat",
+      "base_url": "https://api.fireworks.ai/inference/v1",
+      "catalog": "fireworks-ai",
+      "default_models": [],
+      "key_hint": "…",
+      "docs": "https://docs.fireworks.ai"
+    },
+    {
+      "id": "nvidia",
+      "name": "NVIDIA NIM",
+      "group": "relay",
+      "protocol": "openai_chat",
+      "base_url": "https://integrate.api.nvidia.com/v1",
+      "catalog": "nvidia",
+      "default_models": [],
+      "key_hint": "nvapi-…",
+      "docs": "https://docs.api.nvidia.com"
+    },
+    {
+      "id": "modelscope",
+      "name": "ModelScope",
+      "group": "relay",
+      "protocol": "openai_chat",
+      "base_url": "https://api-inference.modelscope.cn/v1",
+      "catalog": "modelscope",
+      "default_models": [],
+      "key_hint": "…",
+      "docs": "https://www.modelscope.cn/docs"
+    },
+    {
+      "id": "nous",
+      "name": "Nous Portal",
+      "group": "relay",
+      "protocol": "openai_chat",
+      "base_url": "https://inference-api.nousresearch.com/v1",
+      "catalog": "nousresearch",
+      "default_models": [],
+      "key_hint": "…",
+      "docs": "https://portal.nousresearch.com"
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama",
+      "group": "local",
+      "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "default_models": [],
+      "key_hint": "(none needed)",
+      "docs": "https://github.com/ollama/ollama/blob/main/docs/openai.md"
+    },
+    {
+      "id": "lmstudio",
+      "name": "LM Studio",
+      "group": "local",
+      "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "default_models": [],
+      "key_hint": "(none needed)",
+      "docs": "https://lmstudio.ai/docs/developer/openai-compat"
+    },
+    {
+      "id": "vllm",
+      "name": "vLLM",
+      "group": "local",
+      "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:8000/v1",
+      "default_models": [],
+      "key_hint": "(none needed)",
+      "docs": "https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html"
+    },
+    {
+      "id": "llamacpp",
+      "name": "llama.cpp",
+      "group": "local",
+      "protocol": "openai_chat",
+      "base_url": "http://127.0.0.1:8080/v1",
+      "default_models": [],
+      "key_hint": "(none needed)",
+      "docs": "https://github.com/ggml-org/llama.cpp/tree/master/examples/server"
+    }
+  ]
+}

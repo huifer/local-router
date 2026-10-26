@@ -1,0 +1,6 @@
+target
+.git
+frontend/node_modules
+frontend/dist
+.memory
+*.local-router-backup
