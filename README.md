@@ -88,6 +88,47 @@ usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
 `usage.jsonl` 跟 `config.json` 放在同一个目录；超过 8 MB 会自动翻页成
 `usage.jsonl.1`（可用 `LOCAL_ROUTER_USAGE_MAX_BYTES` 改这个上限）。
 
+### 额度与开销统计
+
+每个请求的记录里都带钱：
+
+```json
+{"model":"workbuddy/hy3","input_tokens":15,"output_tokens":128,
+ "cost_usd":0.000148,"credits":0.0172,"priced":true}
+```
+
+- **cost_usd**：按厂商公开价目表算的美元成本（每百万 tokens）。
+- **credits**：订阅制厂商（如 WorkBuddy）自己额度单位的估算消耗。
+- **priced=false** 表示该模型没有价格记录，钱无法估算（用量页会计数）。
+
+看总账：
+
+```sh
+local-router usage --period today    # 按 provider / 按模型，含 $ 与 credits 列
+local-router usage --csv             # 机器可读，含 cost_usd / credits 列
+local-router prices                  # 当前价目表（29+ 模型）
+```
+
+HTTP API（`period=today|24h|7d|30d|all`）：
+
+```sh
+curl -H "Authorization: Bearer <key>" \
+  'http://127.0.0.1:3425/v1/local-router/usage?period=7d'
+# → cost_usd / credits / unpriced 汇总 + per_provider[] 每个平台的账单
+```
+
+控制台 Usage 页有「BY PLATFORM」面板：每个平台一段时期的请求数、token、
+美元成本、credits 消耗一目了然。
+
+**改价格 / 加新厂商**：写 `~/.config/local-router/prices.json`（不用重启）：
+
+```json
+{"hy3": {"input": 0.5, "output": 2.0, "credits_per_million": 200.0}}
+```
+
+价目是估算：订阅制厂商的 credit 折算率来自套餐额度与公开价的比例，可能与
+厂商实际扣减有偏差；`prices.json` 可随时校准。
+
 ### 环境变量
 
 | 变量 | 作用 |
@@ -135,6 +176,7 @@ usage.jsonl    # 每请求一行：模型、provider、token、时延、状态
 local-router provider add workbuddy      # 不需要 key
 local-router workbuddy status            # 登录状态、账号、token 有效期
 local-router workbuddy credits           # 积分（资源包 + 签到）
+local-router workbuddy login             # 浏览器登录（打印链接 + 自动接入）
 local-router workbuddy checkin           # 手动领当日签到（通常自动完成）
 local-router workbuddy models            # 账号可用的模型
 local-router claude workbuddy/hy3        # 让 Claude Code 走 WorkBuddy
@@ -153,14 +195,22 @@ local-router claude workbuddy/hy3        # 让 Claude Code 走 WorkBuddy
 - **自动签到**：网关会自己盯签到活动，到点未签就代签（默认开；
   `config.json` 里 `"workbuddy_auto_checkin": false` 关掉）。每日 +100 credits
   就不用手动领了。也可手动：`local-router workbuddy checkin`。
-- **需要先登录**：登录在 WorkBuddy 客户端里完成（打开 WorkBuddy → 右上角
-  登录 → 浏览器 OAuth 回调）。登录完成后运行检查脚本确认：
+- **登录**：不用装客户端，直接
+
+  ```sh
+  local-router workbuddy login
+  ```
+
+  它会打印一个登录链接（并自动打开浏览器），登录完成后 token 自动保存到
+  local-router 自己的会话文件（0600），provider 自动加上——WorkBuddy 客户端
+  与它的登录文件完全不受影响。链接五分钟内有效，也可以复制到别的机器的
+  浏览器里打开。
+  已有本机 WorkBuddy 登录态时无需此步，直接可用；登录完成后可用检查脚本
+  验证：
 
   ```sh
   bash scripts/workbuddy-login-check.sh   # 五步检查：客户端/登录态/服务端/接入/真实推理
   ```
-
-  没有登录态时 `local-router workbuddy status` 会直接告诉你原因。
 - 容器里看不到宿主机的登录态，除非你把会话文件挂进去
   （`LOCAL_ROUTER_WORKBUDDY_SESSION`）。
 

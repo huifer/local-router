@@ -4,6 +4,7 @@ pub mod agents;
 pub mod config;
 pub mod gateway;
 pub mod presets;
+pub mod pricing;
 pub mod protocol;
 pub mod web;
 pub mod workbuddy;

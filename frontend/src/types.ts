@@ -98,6 +98,9 @@ export interface UsageTotals {
   cache_read_tokens: number;
   cache_write_tokens: number;
   reasoning_tokens: number;
+  cost_usd: number;
+  credits: number;
+  unpriced: number;
 }
 
 export interface UsageRecord {
@@ -123,6 +126,7 @@ export interface UsageRecord {
 export interface UsageData {
   totals: UsageTotals;
   by_model: [string, UsageTotals][];
+  by_provider_costs: Record<string, UsageTotals>;
   by_provider: [string, UsageTotals][];
   by_day: [string, UsageTotals][];
   recent: UsageRecord[];

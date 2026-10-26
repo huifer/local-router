@@ -82,3 +82,57 @@ fn the_log_is_rolled_over_before_it_grows_without_end() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_money_sums_up_per_provider_and_per_day() {
+    let mut a = record("workbuddy/hy3");
+    a.provider = "workbuddy".into();
+    a.output_tokens = 1000;
+    a.cost_usd = Some(0.01);
+    a.credits = Some(1.5);
+    let mut b = record("openai/gpt-5.2");
+    b.provider = "openai".into();
+    b.output_tokens = 2000;
+    b.cost_usd = Some(0.02);
+    let failed = record("openai/broken");
+    let failed = UsageRecord {
+        ok: false,
+        ..failed
+    };
+
+    let records = vec![a, b, failed];
+    let totals = usage::totals(&records);
+    assert!((totals.cost_usd - 0.03).abs() < 1e-9);
+    assert!((totals.credits - 1.5).abs() < 1e-9);
+    // A failed request cost nothing and is not reported as unpriced:
+    // "unpriced" means "answered, but we cannot say what it cost".
+    assert_eq!(totals.unpriced, 0);
+
+    let by_provider = usage::group_by(&records, |r| r.provider.clone());
+    let workbuddy = by_provider.iter().find(|(p, _)| p == "workbuddy").unwrap();
+    assert!((workbuddy.1.credits - 1.5).abs() < 1e-9);
+    let openai = by_provider.iter().find(|(p, _)| p == "openai").unwrap();
+    assert!((openai.1.cost_usd - 0.02).abs() < 1e-9);
+
+    // A record without any price is counted as unpriced, not silently zero.
+    let mut unpriced = record("mystery/model");
+    unpriced.priced = false;
+    unpriced.output_tokens = 500;
+    let records = vec![unpriced];
+    let totals = usage::totals(&records);
+    assert_eq!(totals.unpriced, 1);
+    assert!(totals.cost_usd.abs() < 1e-9);
+}
+
+#[test]
+fn the_builtin_table_prices_a_workbuddy_request_in_both_units() {
+    let cost = local_router::pricing::cost_of("workbuddy", "hy3", 1_000_000, 2_000_000, 0, 0);
+    let usd = cost.usd.expect("hy3 has a dollar price");
+    assert!((usd - (0.28 + 2.0 * 1.12)).abs() < 1e-9);
+    let credits = cost.credits.expect("hy3 has a credit rate");
+    assert!((credits - 3.0 * 120.0).abs() < 1e-9);
+
+    // An unknown model is unpriced, which the usage page reports.
+    let cost = local_router::pricing::cost_of("workbuddy", "no-such-model", 1, 1, 0, 0);
+    assert!(cost.usd.is_none());
+}

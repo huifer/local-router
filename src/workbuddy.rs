@@ -48,6 +48,14 @@ pub const CHECKIN_PATH: &str = "/v2/billing/meter/checkin-activity-status";
 /// The path that serves the model catalogue.
 pub const CONFIG_PATH: &str = "/v3/config";
 
+/// Where a login session is opened, and where its outcome is polled.
+pub const AUTH_STATE_PATH: &str = "/v2/plugin/auth/state?platform=workbuddy";
+pub const AUTH_TOKEN_PATH: &str = "/v2/plugin/auth/token?state=";
+pub const AUTH_ACCOUNT_PATH: &str = "/v2/plugin/login/account?state=";
+
+/// The login code the vendor answers while the browser is still waiting.
+const LOGIN_PENDING: i64 = 11217;
+
 /// The product name WorkBuddy expects in `X-Product`.
 const PRODUCT: &str = "WorkBuddy";
 
@@ -528,6 +536,262 @@ pub async fn claim_checkin() -> anyhow::Result<CheckinOutcome> {
         credit: None,
         message,
     })
+}
+
+/// A login session: the link to open, and how to poll its outcome.
+#[derive(Debug, Clone, Serialize)]
+pub struct LoginSession {
+    /// The url to open in a browser.
+    pub auth_url: String,
+    /// The session's id, for polling.
+    pub state: String,
+}
+
+/// The result of a finished login.
+#[derive(Debug, Clone)]
+pub struct LoginResult {
+    pub session: Session,
+    pub account: Value,
+}
+
+/// The answer of one poll: the browser is still waiting, or the login is done.
+#[derive(Debug, Clone)]
+pub enum LoginPoll {
+    /// The browser side has not signed in yet.
+    Waiting,
+    /// The login finished and the session is usable.
+    Ready(Box<LoginResult>),
+}
+
+/// Open a login session: ask the vendor for a link, and hand it back.
+///
+/// The caller opens the link in a browser, signs in, and then polls
+/// [`poll_login`] until it answers with the fresh session.
+pub async fn start_login() -> anyhow::Result<LoginSession> {
+    let mut headers = BTreeMap::new();
+    headers.insert("content-type".to_string(), "application/json".to_string());
+    headers.insert("accept".to_string(), "application/json".to_string());
+    headers.insert("x-product".to_string(), PRODUCT.to_string());
+    headers.insert(
+        "user-agent".to_string(),
+        format!("{PRODUCT}/{CLIENT_VERSION}"),
+    );
+    // The state request is made without any login: the headers below say so.
+    headers.insert(
+        "x-codebuddy-no-authorization".to_string(),
+        "true".to_string(),
+    );
+    headers.insert("x-codebuddy-no-user-id".to_string(), "true".to_string());
+    headers.insert(
+        "x-codebuddy-no-enterprise-id".to_string(),
+        "true".to_string(),
+    );
+    headers.insert(
+        "x-codebuddy-no-department-info".to_string(),
+        "true".to_string(),
+    );
+
+    let response = client()?
+        .post(format!("{}{AUTH_STATE_PATH}", endpoint()))
+        .headers(to_header_map(&headers)?)
+        .body("{}")
+        .send()
+        .await
+        .context("the login could not reach the server")?;
+    let status = response.status().as_u16();
+    let body: Value = response
+        .json()
+        .await
+        .context("the login state returned no json")?;
+    if !(200..300).contains(&status) {
+        anyhow::bail!(
+            "the login could not be started (HTTP {status}): {}",
+            message_of(&body)
+        );
+    }
+    let data = body.get("data").cloned().unwrap_or_default();
+    let auth_url = data
+        .get("authUrl")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let state = data
+        .get("state")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if auth_url.is_empty() || state.is_empty() {
+        anyhow::bail!("the login state did not carry a link; try again");
+    }
+    Ok(LoginSession { auth_url, state })
+}
+
+/// Poll a login session once.
+///
+/// While the browser is still waiting the vendor answers with its
+/// "login ing" code, which is not an error: the caller should poll again.
+/// Once the browser side has signed in, the answer carries the tokens and
+/// the account, and the session is ready to use.
+pub async fn poll_login(state: &str) -> anyhow::Result<LoginPoll> {
+    let mut headers = BTreeMap::new();
+    headers.insert("accept".to_string(), "application/json".to_string());
+    headers.insert("x-product".to_string(), PRODUCT.to_string());
+    headers.insert(
+        "user-agent".to_string(),
+        format!("{PRODUCT}/{CLIENT_VERSION}"),
+    );
+    headers.insert(
+        "x-codebuddy-no-authorization".to_string(),
+        "true".to_string(),
+    );
+    headers.insert("x-codebuddy-no-user-id".to_string(), "true".to_string());
+    headers.insert(
+        "x-codebuddy-no-enterprise-id".to_string(),
+        "true".to_string(),
+    );
+    headers.insert(
+        "x-codebuddy-no-department-info".to_string(),
+        "true".to_string(),
+    );
+
+    let response = client()?
+        .get(format!("{}{AUTH_TOKEN_PATH}{state}", endpoint()))
+        .headers(to_header_map(&headers)?)
+        .send()
+        .await
+        .context("the login poll could not reach the server")?;
+    let status = response.status().as_u16();
+    let body: Value = response
+        .json()
+        .await
+        .context("the login poll returned no json")?;
+    let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
+    if code == LOGIN_PENDING {
+        return Ok(LoginPoll::Waiting);
+    }
+    if !(200..300).contains(&status) || code != 0 {
+        anyhow::bail!(
+            "the login poll was refused (HTTP {status}): {}",
+            message_of(&body)
+        );
+    }
+    let data = body.get("data").cloned().unwrap_or_default();
+    let access_token = data
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if access_token.trim().is_empty() {
+        anyhow::bail!("the login finished without an access token");
+    }
+    let expires_in = data.get("expiresIn").and_then(Value::as_i64);
+    let session = Session {
+        account: Account {
+            nickname: String::new(),
+            uid: String::new(),
+            account_type: String::new(),
+            last_login: true,
+        },
+        access_token,
+        refresh_token: data
+            .get("refreshToken")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        domain: data
+            .get("domain")
+            .and_then(Value::as_str)
+            .unwrap_or("www.codebuddy.cn")
+            .to_string(),
+        expires_at: expires_in.map(|seconds| now_ms() + seconds * 1000),
+    };
+    Ok(LoginPoll::Ready(Box::new(LoginResult {
+        session,
+        account: data,
+    })))
+}
+
+/// The account that belongs to a finished login.
+pub async fn login_account(session: &Session, state: &str) -> anyhow::Result<Value> {
+    let mut headers = session.auth_headers();
+    headers.insert("x-codebuddy-no-user-id".to_string(), "true".to_string());
+    headers.insert(
+        "x-codebuddy-no-enterprise-id".to_string(),
+        "true".to_string(),
+    );
+    headers.insert(
+        "x-codebuddy-no-department-info".to_string(),
+        "true".to_string(),
+    );
+    let response = client()?
+        .get(format!("{}{AUTH_ACCOUNT_PATH}{state}", endpoint()))
+        .headers(to_header_map(&headers)?)
+        .send()
+        .await
+        .context("the login account could not reach the server")?;
+    let status = response.status().as_u16();
+    let body: Value = response
+        .json()
+        .await
+        .context("the login account returned no json")?;
+    if !(200..300).contains(&status) {
+        anyhow::bail!(
+            "the login account was refused (HTTP {status}): {}",
+            message_of(&body)
+        );
+    }
+    Ok(body.get("data").cloned().unwrap_or(Value::Null))
+}
+
+/// Store a finished login in local-router's own session file, next to the
+/// config, so it survives restarts without touching WorkBuddy's own files.
+///
+/// The file is 0600: it carries tokens.
+pub async fn store_session(session: &Session, account: &Value) -> anyhow::Result<PathBuf> {
+    let path = crate::config::config_dir().join("workbuddy-session.json");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = SessionFile {
+        account: Account {
+            uid: account
+                .get("uid")
+                .or_else(|| account.pointer("/account/uid"))
+                .and_then(Value::as_str)
+                .unwrap_or(&session.account.uid)
+                .to_string(),
+            nickname: account
+                .get("nickname")
+                .or_else(|| account.pointer("/account/nickname"))
+                .and_then(Value::as_str)
+                .unwrap_or(&session.account.nickname)
+                .to_string(),
+            account_type: account
+                .get("type")
+                .or_else(|| account.pointer("/account/type"))
+                .and_then(Value::as_str)
+                .unwrap_or(&session.account.account_type)
+                .to_string(),
+            last_login: true,
+        },
+        auth: Auth {
+            access_token: session.access_token.clone(),
+            refresh_token: session.refresh_token.clone(),
+            token_type: "Bearer".to_string(),
+            expires_at: session.expires_at,
+            refresh_expires_at: session.expires_at.map(|at| at + 2 * 24 * 3600 * 1000),
+            domain: session.domain.clone(),
+            scope: String::new(),
+        },
+    };
+    let body = serde_json::to_string_pretty(&file)?;
+    std::fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
 }
 
 /// The daily check-in state, for a caller that has no client yet.

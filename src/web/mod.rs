@@ -1092,17 +1092,22 @@ async fn api_usage(State(state): State<AppState>) -> Json<Value> {
     let by_model = usage::group_by(&records, |r| r.model.clone());
     let by_provider = usage::group_by(&records, |r| r.provider.clone());
     let by_day = usage::by_day(&records);
+    // The per-provider money view: what each platform cost this period.
+    let by_provider_costs: BTreeMap<String, usage::Totals> =
+        usage::group_by(&records, |r| r.provider.clone())
+            .into_iter()
+            .collect();
     let recent: Vec<Value> = records
         .iter()
         .rev()
         .take(200)
         .map(|r| serde_json::to_value(r).unwrap_or(json!({})))
         .collect();
-    let _ = &state;
     Json(json!({
         "totals": totals,
         "by_model": by_model,
         "by_provider": by_provider,
+        "by_provider_costs": by_provider_costs,
         "by_day": by_day,
         "recent": recent,
     }))

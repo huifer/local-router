@@ -74,6 +74,11 @@ fi
 rm -rf "$TEST_HOME"
 
 echo
+echo "== 提示：没有登录态？=="
+echo "  不装客户端也可以登录：local-router workbuddy login"
+echo "  （打印链接并打开浏览器，登录后自动接入）"
+
+echo
 echo "== 结论 =="
 if "$BIN" workbuddy status >/dev/null 2>&1 && "$BIN" workbuddy credits >/dev/null 2>&1; then
   echo "登录有效。可以正常使用：local-router provider add workbuddy"

@@ -50,6 +50,26 @@
   代签（每日 +100 credits 自动到账）。`workbuddy_auto_checkin` 默认开；
   `local-router workbuddy checkin` 可手动领。
 
+- **WorkBuddy 浏览器登录**：`local-router workbuddy login` 打印登录链接并
+  自动打开浏览器，登录完成后 token 存入 local-router 自己的会话文件（0600）、
+  provider 自动配置；无需安装 WorkBuddy 客户端，也不改动客户端的登录文件。
+  登录协议与客户端一致（`/v2/plugin/auth/state` → 浏览器 → 轮询
+  `auth/token` / `login/account`）。
+
+- **每平台额度/开销统计**：每条用量记录新增 `cost_usd`（按厂商公开价目折算
+  的美元成本）、`credits`（订阅制厂商如 WorkBuddy 的额度消耗估算）与
+  `priced`（该模型是否有价格记录）。
+  - CLI：`local-router usage` 新增按 provider / 按模型的 $ 与 credits 汇总，
+    `--csv` 增加两列；`local-router prices` 查看价目表。
+  - HTTP：`/v1/local-router/usage` 返回 `cost_usd` / `credits` / `unpriced`
+    汇总与 `per_provider[]` 每平台账单；`/usage/requests` 同步。
+  - 控制台 Usage 页新增「BY PLATFORM」面板。
+  - 内置 29+ 模型价目（OpenAI / Anthropic / DeepSeek / Moonshot / Zhipu /
+    MiniMax 公开价 + WorkBuddy credit 折算率）；`prices.json` 可覆盖或新增，
+    无需重启。
+  - 顺带修复：CLI 的 `usage` 读的是全局目录的 usage.jsonl（多实例时看不到
+    本实例的记录），现与网关写入路径一致。
+
 ### Fixed
 
 - 流式请求的用量记录此前 token 恒为 0（绝大多数 agent 走流式，用量页看不到
@@ -65,7 +85,7 @@
 
 ### Changed
 
-- 测试从 47 个增加到 72 个：新增 WorkBuddy 会话、续期、agent 配置写入、用量
+- 测试从 47 个增加到 77 个：新增 WorkBuddy 会话、续期、agent 配置写入、用量
   日志与「流式上游 → 整段回复」的端到端用例。
 
 ## [0.1.0] - 2026-10-26

@@ -4,7 +4,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use axum::routing::post;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use axum::Router;
 use serde_json::json;
 
@@ -289,4 +290,139 @@ async fn a_claim_without_a_session_says_so() {
         .expect_err("there is no session to claim with");
     assert!(err.to_string().contains("sign in"), "{err}");
     std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_SESSION");
+}
+
+/// A mock of the vendor's login endpoints: link, pending poll, done poll.
+fn login_mock_router(signed_in: std::sync::Arc<std::sync::atomic::AtomicBool>) -> Router {
+    use axum::response::IntoResponse;
+
+    async fn state() -> axum::response::Response {
+        axum::Json(json!({
+            "code": 0,
+            "data": {"authUrl": "https://www.workbuddy.cn/login?platform=workbuddy&state=st-1",
+                     "state": "st-1"}
+        }))
+        .into_response()
+    }
+
+    async fn token(
+        axum::extract::State(signed_in): axum::extract::State<
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        >,
+    ) -> axum::response::Response {
+        if signed_in.load(std::sync::atomic::Ordering::SeqCst) {
+            axum::Json(json!({
+                "code": 0,
+                "data": {"accessToken": "at-login", "refreshToken": "rt-login",
+                         "expiresIn": 2419200, "tokenType": "Bearer",
+                         "domain": "www.codebuddy.cn"}
+            }))
+            .into_response()
+        } else {
+            axum::Json(json!({"code": 11217, "msg": "login ing..."})).into_response()
+        }
+    }
+
+    async fn account(
+        axum::extract::State(signed_in): axum::extract::State<
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        >,
+    ) -> axum::response::Response {
+        if signed_in.load(std::sync::atomic::Ordering::SeqCst) {
+            axum::Json(json!({
+                "code": 0,
+                "data": {"uid": "u-9", "nickname": "Login Tester", "type": "personal"}
+            }))
+            .into_response()
+        } else {
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
+
+    Router::new()
+        .route("/v2/plugin/auth/state", post(|| async { state().await }))
+        .route(
+            "/v2/plugin/auth/token",
+            get(token).with_state(signed_in.clone()),
+        )
+        .route(
+            "/v2/plugin/login/account",
+            get(account).with_state(signed_in),
+        )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_login_session_is_opened_polled_and_stored() {
+    let _turn = env_guard().await;
+
+    let signed_in = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let router_signed_in = signed_in.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, login_mock_router(router_signed_in))
+            .await
+            .unwrap();
+    });
+    std::env::set_var(
+        "LOCAL_ROUTER_WORKBUDDY_ENDPOINT",
+        format!("http://127.0.0.1:{port}"),
+    );
+
+    // The link comes back with its state.
+    let session = workbuddy::start_login().await.expect("the login opens");
+    assert_eq!(session.state, "st-1");
+    assert!(session.auth_url.contains("workbuddy.cn/login"));
+
+    // While nobody has signed in, the poll says "waiting".
+    match workbuddy::poll_login(&session.state)
+        .await
+        .expect("the poll")
+    {
+        workbuddy::LoginPoll::Waiting => {}
+        workbuddy::LoginPoll::Ready(_) => panic!("the login finished without a browser"),
+    }
+
+    // The browser side signs in; the next poll carries the tokens.
+    signed_in.store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = match workbuddy::poll_login(&session.state)
+        .await
+        .expect("the poll")
+    {
+        workbuddy::LoginPoll::Ready(result) => *result,
+        workbuddy::LoginPoll::Waiting => panic!("the login should be ready"),
+    };
+    assert_eq!(result.session.access_token, "at-login");
+    assert_eq!(result.session.refresh_token, "rt-login");
+    assert!(result.session.expires_at.is_some());
+
+    // The account comes with it.
+    let account = workbuddy::login_account(&result.session, &session.state)
+        .await
+        .expect("the account answers");
+    assert_eq!(account["nickname"], "Login Tester");
+
+    // The session is stored in local-router's own file, 0600.
+    let dir = std::env::temp_dir().join(format!("lr-store-{}", workbuddy::now_ms()));
+    std::env::set_var("LOCAL_ROUTER_HOME", &dir);
+    let path = workbuddy::store_session(&result.session, &account)
+        .await
+        .expect("the session is stored");
+    assert!(path.exists());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the session file must not be world-readable");
+    }
+    // And reading it back gives the same login.
+    std::env::set_var("LOCAL_ROUTER_WORKBUDDY_SESSION", &path);
+    let stored = workbuddy::read_session_file().expect("the stored session reads");
+    assert_eq!(stored.account.nickname, "Login Tester");
+    assert_eq!(stored.access_token, "at-login");
+    std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_SESSION");
+    std::env::remove_var("LOCAL_ROUTER_HOME");
+
+    std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_ENDPOINT");
+    let _ = std::fs::remove_dir_all(&dir);
 }

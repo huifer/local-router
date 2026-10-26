@@ -50,6 +50,17 @@ pub struct UsageRecord {
     /// The agent that made the request, when it said.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// What the request cost in US dollars, when the model's price is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// What it cost in the vendor's own credits, when the vendor reports
+    /// one (WorkBuddy answers credits per request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits: Option<f64>,
+    /// Whether the cost could be worked out at all. An unpriced request is
+    /// one whose model has no price on file.
+    #[serde(default = "yes")]
+    pub priced: bool,
 }
 
 fn yes() -> bool {
@@ -95,6 +106,9 @@ impl UsageRecord {
             ok: true,
             error: None,
             agent: None,
+            cost_usd: None,
+            credits: None,
+            priced: true,
         }
     }
 }
@@ -158,6 +172,13 @@ pub struct Totals {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
+    /// What the successful requests cost in US dollars, over the models
+    /// whose price is known.
+    pub cost_usd: f64,
+    /// What they cost in the vendors' own credits, where a rate is known.
+    pub credits: f64,
+    /// How many requests could not be priced at all.
+    pub unpriced: u64,
 }
 
 /// Sum a set of records.
@@ -174,6 +195,15 @@ pub fn totals(records: &[UsageRecord]) -> Totals {
         t.cache_read_tokens += r.cache_read_tokens;
         t.cache_write_tokens += r.cache_write_tokens;
         t.reasoning_tokens += r.reasoning_tokens;
+        if let Some(usd) = r.cost_usd {
+            t.cost_usd += usd;
+        }
+        if let Some(credits) = r.credits {
+            t.credits += credits;
+        }
+        if !r.priced {
+            t.unpriced += 1;
+        }
     }
     t
 }
@@ -193,6 +223,15 @@ pub fn group_by(records: &[UsageRecord], key: fn(&UsageRecord) -> String) -> Vec
         entry.cache_read_tokens += r.cache_read_tokens;
         entry.cache_write_tokens += r.cache_write_tokens;
         entry.reasoning_tokens += r.reasoning_tokens;
+        if let Some(usd) = r.cost_usd {
+            entry.cost_usd += usd;
+        }
+        if let Some(credits) = r.credits {
+            entry.credits += credits;
+        }
+        if !r.priced {
+            entry.unpriced += 1;
+        }
     }
     map.into_iter().collect()
 }
@@ -210,6 +249,12 @@ pub fn by_day(records: &[UsageRecord]) -> Vec<(String, Totals)> {
         }
         entry.input_tokens += r.input_tokens;
         entry.output_tokens += r.output_tokens;
+        if let Some(usd) = r.cost_usd {
+            entry.cost_usd += usd;
+        }
+        if let Some(credits) = r.credits {
+            entry.credits += credits;
+        }
     }
     map.into_iter().collect()
 }

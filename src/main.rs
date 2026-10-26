@@ -3,12 +3,13 @@
 //! The web page and the gateway are the same process. `local-router` starts both;
 //! `local-router serve` starts the gateway alone.
 
-use local_router::{config, gateway, presets, protocol, web, workbuddy};
+use local_router::{config, gateway, presets, pricing, protocol, web, workbuddy};
 
 use std::sync::Arc;
 
 use anyhow::Context;
 use clap::{Args, Parser, Subcommand};
+use serde_json::Value;
 
 use crate::config::{AppState, Config, ProviderKey, Routing, Stays, Store};
 
@@ -55,6 +56,8 @@ enum Command {
     /// WorkBuddy: the local login session, its credits and its models.
     #[command(name = "workbuddy", subcommand)]
     WorkBuddy(WorkBuddyCmd),
+    /// Show the price table the gateway bills with.
+    Prices,
 }
 
 #[derive(Subcommand, Debug)]
@@ -67,6 +70,8 @@ enum WorkBuddyCmd {
     Models,
     /// Claim the day's check-in now.
     Checkin,
+    /// Sign in to WorkBuddy: print a link, wait for the browser, wire it up.
+    Login,
 }
 
 impl Default for ServeArgs {
@@ -208,6 +213,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Opencode(args)) => set_agent("opencode", args).await,
         Some(Command::Doctor) => doctor().await,
         Some(Command::WorkBuddy(cmd)) => workbuddy_cmd(cmd).await,
+        Some(Command::Prices) => prices().await,
         None => serve(ServeArgs::default()).await,
     }
 }
@@ -710,6 +716,7 @@ async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
                 println!("  {m}");
             }
         }
+        WorkBuddyCmd::Login => login().await?,
         WorkBuddyCmd::Checkin => match workbuddy::claim_checkin().await {
             Ok(outcome) if outcome.granted => {
                 println!(
@@ -729,6 +736,121 @@ async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
                 println!("sign in to WorkBuddy first, then try again");
             }
         },
+    }
+    Ok(())
+}
+
+/// Sign in to WorkBuddy from the terminal.
+///
+/// The vendor hands out a login link for a fresh state; the browser signs
+/// in; the gateway polls until the tokens arrive. The tokens are stored in
+/// local-router's own session file — WorkBuddy's desktop app and its login
+/// file are left untouched.
+async fn login() -> anyhow::Result<()> {
+    let session = workbuddy::start_login().await?;
+    println!("local-router {}", gateway::client::VERSION);
+    println!("  open this link in a browser and sign in:");
+    println!();
+    println!("  {}", session.auth_url);
+    println!();
+
+    // Open the default browser for the person at the keyboard; on a
+    // machine without one the link above still works.
+    let _ = std::process::Command::new("open")
+        .arg(&session.auth_url)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+
+    println!("  waiting for the sign-in (up to 5 minutes)…");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
+    let result = loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("the sign-in timed out; run `local-router workbuddy login` again");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        match workbuddy::poll_login(&session.state).await {
+            Ok(workbuddy::LoginPoll::Waiting) => continue,
+            Ok(workbuddy::LoginPoll::Ready(result)) => break *result,
+            Err(err) => return Err(err),
+        }
+    };
+
+    // Who signed in, from the vendor's account endpoint.
+    let account = workbuddy::login_account(&result.session, &session.state)
+        .await
+        .unwrap_or(Value::Null);
+    let nickname = account
+        .get("nickname")
+        .or_else(|| account.pointer("/account/nickname"))
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+
+    // Store the session in local-router's own file, next to the config.
+    let path = workbuddy::store_session(&result.session, &account).await?;
+    println!("  signed in   {nickname}");
+    println!("  session     {}", path.display());
+    println!(
+        "  token until {}",
+        result
+            .session
+            .expires_at
+            .map(format_time)
+            .unwrap_or_else(|| "unknown".to_string())
+    );
+
+    // Wire up the provider if it is not there yet.
+    let mut config = load_config()?;
+    if config.provider("workbuddy").is_none() {
+        if let Some(preset) = presets::get("workbuddy") {
+            config.providers.push(presets::to_provider(preset, None));
+            save_config(&config)?;
+            println!("  provider    workbuddy added (no key needed)");
+        }
+    }
+
+    println!();
+    println!("  done — try it: local-router workbuddy credits");
+    Ok(())
+}
+
+/// The price table in effect, and how to teach the gateway a new one.
+async fn prices() -> anyhow::Result<()> {
+    let table = pricing::effective_prices();
+    println!(
+        "local-router {} — {} models priced (per million tokens)",
+        gateway::client::VERSION,
+        table.len()
+    );
+    println!();
+    println!(
+        "{:<30} {:>10} {:>10} {:>12}",
+        "MODEL", "IN $", "OUT $", "CREDITS/M"
+    );
+    for (id, price) in &table {
+        println!(
+            "{:<30} {:>10.4} {:>10.4} {:>12}",
+            id,
+            price.input,
+            price.output,
+            price
+                .credits_per_million
+                .map(|c| format!("{c:.1}"))
+                .unwrap_or_else(|| "-".to_string())
+        );
+    }
+    println!();
+    if pricing::price_file_exists() {
+        println!(
+            "override file: {} (applied)",
+            pricing::price_file().display()
+        );
+    } else {
+        println!(
+            "override file: {} (not present — write one to add or reprice models)",
+            pricing::price_file().display()
+        );
+        println!("format: {{\"<model id>\": {{\"input\": 0.28, \"output\": 1.12, \"credits_per_million\": 120.0}}}}");
     }
     Ok(())
 }
@@ -877,7 +999,7 @@ async fn ls() -> anyhow::Result<()> {
 }
 
 async fn usage(args: UsageArgs) -> anyhow::Result<()> {
-    let records = gateway::usage::read_all(&config::usage_file());
+    let records = gateway::usage::read_all(&Store::new().usage_path());
     let days: i64 = match args.period.as_str() {
         "today" => 1,
         "7d" => 7,
@@ -896,11 +1018,11 @@ async fn usage(args: UsageArgs) -> anyhow::Result<()> {
 
     if args.csv {
         println!(
-            "time,model,provider,input_tokens,output_tokens,cache_read,cache_write,latency_ms,ok"
+            "time,model,provider,input_tokens,output_tokens,cache_read,cache_write,latency_ms,ok,cost_usd,credits"
         );
         for r in &recent {
             println!(
-                "{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{}",
                 r.time,
                 r.model,
                 r.provider,
@@ -909,7 +1031,9 @@ async fn usage(args: UsageArgs) -> anyhow::Result<()> {
                 r.cache_read_tokens,
                 r.cache_write_tokens,
                 r.latency_ms,
-                r.ok
+                r.ok,
+                r.cost_usd.map(|c| format!("{c:.6}")).unwrap_or_default(),
+                r.credits.map(|c| format!("{c:.4}")).unwrap_or_default(),
             );
         }
         return Ok(());
@@ -920,11 +1044,27 @@ async fn usage(args: UsageArgs) -> anyhow::Result<()> {
         "{} requests, {} failed, {} in, {} out",
         totals.requests, totals.failed, totals.input_tokens, totals.output_tokens
     );
+    println!(
+        "  cost      ${:.4}  ({unpriced} unpriced)",
+        totals.cost_usd,
+        unpriced = totals.unpriced
+    );
+    println!("  credits   {:.1}", totals.credits);
     println!();
+
+    println!("by provider (every platform's own tab):");
+    for (provider, t) in gateway::usage::group_by(&recent, |r| r.provider.clone()) {
+        println!(
+            "  {:<16} {:>5} req  {:>9} in  {:>8} out  ${:<8.4} {:>9.1} credits",
+            provider, t.requests, t.input_tokens, t.output_tokens, t.cost_usd, t.credits
+        );
+    }
+    println!();
+    println!("by model:");
     for (model, t) in gateway::usage::group_by(&recent, |r| r.model.clone()) {
         println!(
-            "  {:<32} {:>5} requests  {:>9} in  {:>8} out",
-            model, t.requests, t.input_tokens, t.output_tokens
+            "  {:<32} {:>5} requests  {:>9} in  {:>8} out  ${:.4}",
+            model, t.requests, t.input_tokens, t.output_tokens, t.cost_usd
         );
     }
     Ok(())

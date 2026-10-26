@@ -327,6 +327,22 @@ async fn usage_summary(
     let by_model = usage::group_by(&recent, |r| r.model.clone());
     let by_provider = usage::group_by(&recent, |r| r.provider.clone());
     let by_day = usage::by_day(&recent);
+    // The per-platform money view: what each provider cost, this period.
+    let per_provider: Vec<Value> = by_provider
+        .iter()
+        .map(|(provider, totals)| {
+            json!({
+                "provider": provider,
+                "calls": totals.requests,
+                "failed": totals.failed,
+                "input": totals.input_tokens,
+                "output": totals.output_tokens,
+                "cost_usd": totals.cost_usd,
+                "credits": totals.credits,
+                "unpriced": totals.unpriced,
+            })
+        })
+        .collect();
     Json(json!({
         "period": period,
         "since": cutoff.to_rfc3339(),
@@ -337,6 +353,10 @@ async fn usage_summary(
         "cache_read": totals.cache_read_tokens,
         "cache_write": totals.cache_write_tokens,
         "reasoning": totals.reasoning_tokens,
+        "cost_usd": totals.cost_usd,
+        "credits": totals.credits,
+        "unpriced": totals.unpriced,
+        "per_provider": per_provider,
         "by_model": by_model,
         "by_provider": by_provider,
         "by_day": by_day,
@@ -379,6 +399,9 @@ async fn usage_requests(
         "errors": totals.failed,
         "input": totals.input_tokens,
         "output": totals.output_tokens,
+        "cost_usd": totals.cost_usd,
+        "credits": totals.credits,
+        "unpriced": totals.unpriced,
     }))
     .into_response()
 }
@@ -1216,6 +1239,7 @@ async fn handle(
                 rec.latency_ms = started.elapsed().as_millis() as u64;
                 let record = g.state.config.read().await.settings.record_usage;
                 if record {
+                    crate::pricing::price_record(&mut rec);
                     usage::record(&g.state.usage_path(), &rec);
                 }
                 last_error = err;
@@ -1378,6 +1402,7 @@ async fn whole_attempt(
             rec.reasoning_tokens = parsed.usage.reasoning_tokens;
             rec.latency_ms = started.elapsed().as_millis() as u64;
             rec.status = status;
+            crate::pricing::price_record(&mut rec);
             let outbound = downstream_response(caller_protocol, &parsed, &request.model);
             let record = g.state.config.read().await.settings.record_usage;
             if record {
@@ -1472,6 +1497,7 @@ async fn stream_attempt(
                 ));
             }
             rec.status = status;
+            crate::pricing::price_record(&mut rec);
             let usage_path = g.state.usage_path();
             let record_usage = g.state.config.read().await.settings.record_usage;
             Ok(build_stream(
@@ -1509,6 +1535,7 @@ async fn stream_attempt(
             rec.reasoning_tokens = parsed.usage.reasoning_tokens;
             rec.latency_ms = started.elapsed().as_millis() as u64;
             rec.status = status;
+            crate::pricing::price_record(&mut rec);
 
             let mut events = vec![StreamEvent::MessageStart {
                 id: parsed.id.clone(),
@@ -1640,6 +1667,9 @@ impl UsageGuard {
         self.done = true;
         self.rec.latency_ms = self.started.elapsed().as_millis() as u64;
         if self.record {
+            // Pricing runs at write time: the tokens only arrived with the
+            // stream's last events.
+            crate::pricing::price_record(&mut self.rec);
             usage::record(&self.path, &self.rec);
         }
     }
