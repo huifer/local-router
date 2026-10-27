@@ -95,6 +95,8 @@ export interface Preset {
   default_models: string[];
   key_hint?: string;
   docs?: string;
+  /** The vendor supports a browser sign-in (OAuth), so no key is needed. */
+  oauth?: boolean;
 }
 
 export interface PresetGroup {

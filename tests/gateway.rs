@@ -158,6 +158,7 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         forward_headers: Vec::new(),
         remove_headers: Vec::new(),
         header_order: Vec::new(),
+        oauth: None,
         proxy: None,
         group_only: false,
         auth: None,

@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useRouteLoaderData } from "react-router";
-import { Plus } from "lucide-react";
+import { LogIn, Plus, Search } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
 import type { Preset } from "@/types";
@@ -16,7 +16,49 @@ export default function ProvidersPage() {
   const [showAdd, setShowAdd] = useState(false);
   const [presets, setPresets] = useState<{ group: string; presets: Preset[] }[]>([]);
   const [selected, setSelected] = useState<Preset | null>(null);
+  const [search, setSearch] = useState("");
+  const [signingIn, setSigningIn] = useState(false);
   const [form, setForm] = useState({ name: "", url: "", key: "", models: "" });
+
+  // Searching the preset list: match the name, the id and the protocol, so
+  // "qiniu", "七牛" and "openai_chat" all find their vendor.
+  const query = search.trim().toLowerCase();
+  const filteredPresets = presets
+    .map((group) => ({
+      ...group,
+      presets: group.presets.filter((preset) =>
+        !query ||
+        preset.name.toLowerCase().includes(query) ||
+        preset.id.toLowerCase().includes(query) ||
+        (preset.base_url ?? "").toLowerCase().includes(query) ||
+        preset.protocol.toLowerCase().includes(query),
+      ),
+    }))
+    .filter((group) => group.presets.length > 0);
+
+  /** Start the browser sign-in for a vendor that supports OAuth. */
+  const signIn = async (presetId: string) => {
+    setSigningIn(true);
+    try {
+      // The provider must exist first: the flow stores the credential on it.
+      const existing = data.providers.find((p) => p.id === presetId);
+      if (!existing) {
+        await api("/api/providers", {
+          method: "POST",
+          body: { preset: presetId, key: null, models: [] },
+        });
+      }
+      const flow = await api<{ url: string }>(`/api/providers/${encodeURIComponent(presetId)}/oauth`, { method: "POST" });
+      window.open(flow.url, "_blank", "noopener");
+      toast.success("A browser window opened — finish the sign-in there");
+      await reload();
+      setShowAdd(false);
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setSigningIn(false);
+    }
+  };
 
   const openAdd = async () => {
     const response = await getPresets();
@@ -141,28 +183,52 @@ export default function ProvidersPage() {
             <DialogTitle>Add provider</DialogTitle>
           </DialogHeader>
           <div className="grid min-h-80 grid-cols-[245px_1fr] max-[700px]:grid-cols-1">
-            <div className="overflow-auto border-r border-border p-4 max-[700px]:max-h-52 max-[700px]:border-r-0 max-[700px]:border-b">
-              {presets.map((group) => (
-                <div key={group.group}>
-                  <span className="eyebrow mb-2 block">{group.group}</span>
-                  {group.presets.map((preset) => (
-                    <button
-                      key={preset.id}
-                      onClick={() => choose(preset)}
-                      className={`mb-1 grid w-full cursor-pointer gap-1 border border-transparent p-2.5 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
-                        selected?.id === preset.id
-                          ? "border-input bg-accent text-foreground"
-                          : "border-transparent text-muted-foreground hover:border-border hover:bg-accent hover:text-foreground"
-                      }`}
-                    >
-                      <strong className="text-[11px] font-semibold">{preset.name}</strong>
-                      <small className="font-mono text-[9px] text-muted-foreground">
-                        {preset.protocol} · {preset.key_hint}
-                      </small>
-                    </button>
-                  ))}
+            <div className="flex flex-col border-r border-border max-[700px]:border-r-0 max-[700px]:border-b">
+              <div className="border-b border-border p-3">
+                <div className="flex items-center gap-2 border border-input bg-[#0c1110] px-2.5 text-muted-foreground focus-within:border-ring">
+                  <Search className="size-3.5 shrink-0" />
+                  <Input
+                    autoFocus
+                    className="h-8 border-0 bg-transparent px-0 focus-visible:ring-0"
+                    placeholder="Search vendors…"
+                    value={search}
+                    onChange={(event) => setSearch(event.target.value)}
+                  />
                 </div>
-              ))}
+              </div>
+              <div className="overflow-auto p-3 max-[700px]:max-h-52">
+                {filteredPresets.length ? (
+                  filteredPresets.map((group) => (
+                    <div key={group.group}>
+                      <span className="eyebrow mb-2 block">{group.group}</span>
+                      {group.presets.map((preset) => (
+                        <button
+                          key={preset.id}
+                          onClick={() => choose(preset)}
+                          className={`mb-1 grid w-full cursor-pointer gap-1 border p-2.5 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
+                            selected?.id === preset.id
+                              ? "border-input bg-accent text-foreground"
+                              : "border-transparent text-muted-foreground hover:border-border hover:bg-accent hover:text-foreground"
+                          }`}
+                        >
+                          <span className="flex items-center gap-1.5">
+                            <strong className="text-[11px] font-semibold">{preset.name}</strong>
+                            {preset.oauth && <Badge variant="primary">OAUTH</Badge>}
+                          </span>
+                          <small className="font-mono text-[9px] text-muted-foreground">
+                            {preset.protocol} · {preset.key_hint}
+                          </small>
+                        </button>
+                      ))}
+                    </div>
+                  ))
+                ) : (
+                  <p className="px-2 py-6 text-center font-mono text-[10px] text-muted-foreground/70">
+                    No vendor matches “{search}”.<br />
+                    Switch to the form on the right to add it by hand.
+                  </p>
+                )}
+              </div>
             </div>
             <div className="grid content-start gap-4 p-5">
               <Field label="Name">
@@ -171,10 +237,23 @@ export default function ProvidersPage() {
               <Field label="Base URL">
                 <Input value={form.url} onChange={(event) => setForm({ ...form, url: event.target.value })} />
               </Field>
-              <Field label="API key">
-                <Input type="password" value={form.key} onChange={(event) => setForm({ ...form, key: event.target.value })} />
-              </Field>
-              <Field label="Exposed models" help="Comma-separated model IDs. Refresh the catalog later from the CLI.">
+              {selected?.oauth ? (
+                <div className="grid gap-2 border border-primary/25 bg-primary/5 p-3">
+                  <strong className="text-[11px] text-primary">This vendor signs in with a browser</strong>
+                  <p className="text-[10px] text-muted-foreground">
+                    No API key needed: a browser window opens, you sign in with the vendor, and the
+                    credential is stored on this machine.
+                  </p>
+                  <Button variant="default" onClick={() => signIn(selected.id)} disabled={signingIn}>
+                    <LogIn /> {signingIn ? "Opening…" : "Sign in with " + selected.name}
+                  </Button>
+                </div>
+              ) : (
+                <Field label="API key">
+                  <Input type="password" value={form.key} onChange={(event) => setForm({ ...form, key: event.target.value })} />
+                </Field>
+              )}
+              <Field label="Exposed models" help="Comma-separated model IDs. Leave empty and refresh the catalog later — auto_include fills it in.">
                 <Input value={form.models} onChange={(event) => setForm({ ...form, models: event.target.value })} />
               </Field>
             </div>

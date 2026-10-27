@@ -8,6 +8,23 @@
 
 ### Added
 
+- **上游 OAuth 浏览器登录**：provider 新增 `oauth` 配置（授权端点 / 令牌端点 /
+  client_id / scopes / 交换风格），网关内置**通用 OAuth 2.0 + PKCE 引擎**：
+  - 控制台「Add provider」里，带 OAuth 的厂商（OpenRouter 已内置）显示
+    「Sign in with …」按钮——点一下，浏览器打开厂商登录页，签完凭证自动
+    落回 provider，不用粘贴 API key；
+  - 厂商回调落在网关自己的 `/oauth/callback`（与控制台同源），交换完成自动
+    存 0600 配置；API 形状的路径仍返回 JSON 404，不会被 SPA 兜底吞掉；
+  - 引擎配置驱动：同一引擎兼容 OAuth 2.0 标准表单交换与 OpenRouter 的
+    JSON/`key` 变体；新增一家 OAuth 上游只需在预设里写几个 URL 字段。
+  - 端点：`POST /api/providers/{id}/oauth`（发起）、`GET /oauth/callback`
+    （回调）。
+- **控制台 Add provider 搜索**：预设列表加搜索框，按名称 / id / 协议 / 地址
+  过滤；带 OAuth 的厂商标 `OAUTH` 徽标。
+- **路由组从已有模型里选成员**：Groups 新建面板不再要求手敲 `provider/model`，
+  改为按供应商分组的复选列表（可搜索、显示所选顺序= failover 顺序）；
+  没有模型时明确提示先加供应商。
+
 - **七牛云（Qiniu AI）内置预设**：`provider add qiniu --key sk-…` 直接可用
   （base_url https://api.qnaigc.com/v1，OpenAI 兼容）。预设带
   `auto_include: ["*"]`，`provider models qiniu` 拉到的模型会**全部自动

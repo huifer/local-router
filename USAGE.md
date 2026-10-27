@@ -155,6 +155,10 @@ local-router> workbuddy use personal     切换到另一个账号
 local-router> clear                     清屏（clean / cls 同义）
 ```
 
+面板里**可以搜索**厂商（按名称 / 协议 / 地址过滤）；带 **OAUTH** 徽标的厂商
+（如 OpenRouter）不用贴 key——选它再点「Sign in with …」，浏览器里完成登录，
+凭证自动存好。
+
 加自定义厂商时可以指定协议：
 
 ```sh
@@ -209,7 +213,18 @@ local-router daemon start|stop|status|logs
 local-router dashboard               # 终端仪表盘（q 退出）
 ```
 
-### 2.4 调用 API
+### 2.4 路由组：从已有模型里选
+
+控制台 **Groups → Add routing group** 的成员不再手敲——面板直接列出
+**你所有供应商已暴露的模型**（按供应商分组、可搜索、点选即加入），所选的
+**顺序就是 failover 顺序**。命令行同样可以：
+
+```sh
+local-router group add backup --models 七牛云/qwen3-max,deepseek/deepseek-chat --routing order
+local-router group weights balanced "a/m1=3,b/m2=1"   # weight 模式的权重
+```
+
+### 2.5 调用 API
 
 四种入口协议任意选，与上游协议自由组合（流式 / 非流式都支持）。
 
@@ -252,7 +267,7 @@ curl $BASE/v1/messages/count_tokens -H "x-api-key: $KEY" \
 `api-key`。key 取 `LOCAL_ROUTER_DEFAULT_KEY` → 设置里的默认 key → 任一
 caller key；一把都没有时**拒绝一切请求**。
 
-### 2.5 WorkBuddy：登录与多账号
+### 2.6 WorkBuddy：登录与多账号
 
 ```sh
 local-router workbuddy login                # 浏览器登录（默认账号名 default）
@@ -274,7 +289,7 @@ local-router workbuddy status|credits|models|checkin
 > token 加密存了，local-router 读不出来，所以请用上面的 `workbuddy login`
 > （浏览器登录一次即可，之后自动续期）。
 
-### 2.6 观察网关内部
+### 2.7 观察网关内部
 
 ```sh
 KEY=local-router
@@ -287,7 +302,7 @@ curl -H "Authorization: Bearer $KEY" "$BASE/v1/local-router/usage/requests?limit
 curl -H "Authorization: Bearer $KEY" -H "X-Session-ID: my-session" $BASE/v1/local-router/route  # 这次路由去了哪
 ```
 
-### 2.7 图片与视频
+### 2.8 图片与视频
 
 ```sh
 # 图片生成

@@ -4,6 +4,7 @@ pub mod agents;
 pub mod config;
 pub mod dashboard;
 pub mod gateway;
+pub mod oauth;
 pub mod presets;
 pub mod pricing;
 pub mod projects;

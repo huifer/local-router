@@ -172,6 +172,10 @@ pub struct Provider {
     /// most vendors ignore it.
     #[serde(default)]
     pub header_order: Vec<String>,
+    /// How to sign in with this upstream, when it wants a browser login
+    /// instead of a pasted API key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthConfig>,
     /// An HTTP proxy for this provider's requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
@@ -224,6 +228,7 @@ impl Default for Provider {
             forward_headers: Vec::new(),
             remove_headers: Vec::new(),
             header_order: Vec::new(),
+            oauth: None,
             proxy: None,
             group_only: false,
             auth: None,
@@ -355,6 +360,47 @@ pub struct Group {
     pub listed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+/// How to sign in to an upstream with a browser (OAuth 2.0, PKCE).
+///
+/// Every vendor spells OAuth a little differently, so the endpoints live
+/// here rather than in the code: the same engine serves them all.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    /// Where the browser is sent to sign in.
+    pub authorize_url: String,
+    /// Where the code is swapped for a credential.
+    pub token_url: String,
+    /// The app id the vendor knows.
+    pub client_id: String,
+    /// The scopes to ask for.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+    /// The path on this gateway the vendor redirects back to.
+    #[serde(default = "default_oauth_redirect")]
+    pub redirect_path: String,
+    /// Extra query parameters for the authorize URL.
+    #[serde(default)]
+    pub extra_params: BTreeMap<String, String>,
+    /// How the code is exchanged: `standard` (the OAuth 2.0 default) or
+    /// `openrouter` (a JSON body whose reply carries a `key`).
+    #[serde(default)]
+    pub style: Option<String>,
+}
+
+fn default_oauth_redirect() -> String {
+    "/oauth/callback".to_string()
+}
+
+impl OAuthConfig {
+    /// The exchange style, defaulting to the OAuth 2.0 standard.
+    pub fn style(&self) -> crate::oauth::ExchangeStyle {
+        match self.style.as_deref().map(|s| s.to_ascii_lowercase()) {
+            Some(ref s) if s == "openrouter" => crate::oauth::ExchangeStyle::OpenRouter,
+            _ => crate::oauth::ExchangeStyle::Standard,
+        }
+    }
 }
 
 /// A key other machines use to call the gateway.
@@ -936,6 +982,7 @@ mod config_surface_tests {
             forward_headers: vec!["x-session".into()],
             remove_headers: vec!["x-drop".into()],
             header_order: vec!["user-agent".into()],
+            oauth: None,
             proxy: None,
             group_only: true,
             auth: Some(AuthKind::QwenWork),

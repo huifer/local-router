@@ -54,6 +54,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/providers/{id}/models", post(api_set_models))
         .route("/api/providers/{id}/refresh", post(api_refresh_models))
         .route("/api/providers/{id}/test", post(api_test_provider))
+        .route("/api/providers/{id}/oauth", post(api_oauth_start))
+        .route("/api/providers/{id}/oauth", get(api_oauth_status))
+        // The vendor redirects the browser here after the user signed in.
+        .route("/oauth/callback", get(oauth_callback))
         .route("/api/models", get(api_models))
         .route("/api/groups", get(api_groups).post(api_add_group))
         .route(
@@ -257,6 +261,9 @@ async fn api_presets() -> Json<Value> {
                     "default_models": p.default_models,
                     "key_hint": p.key_hint,
                     "docs": p.docs,
+                    // A vendor that supports a browser login says so, and the
+                    // console offers that instead of a key field.
+                    "oauth": p.oauth.is_some(),
                 })).collect::<Vec<_>>(),
             })
         })
@@ -822,6 +829,130 @@ mod auto_include_tests {
 }
 
 /// Send a tiny request to a provider, to see whether it answers.
+/// Start a browser sign-in for a provider that wants one.
+///
+/// The console calls this, gets the authorize URL, and sends the browser
+/// there. The vendor redirects back to `/oauth/callback`, which finishes
+/// the flow; the console polls the status endpoint.
+async fn api_oauth_start(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let provider = {
+        let config = state.config.read().await;
+        config.provider(&id).cloned()
+    };
+    let Some(provider) = provider else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "there is no provider with that id"})),
+        ));
+    };
+    let Some(oauth) = provider.oauth.clone() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "this provider has no browser sign-in configured"})),
+        ));
+    };
+    let redirect = format!("{}/oauth/callback", console_base(&state).await);
+    match crate::oauth::start_flow(&id, &oauth, &redirect) {
+        Ok((url, state_token)) => Ok(Json(json!({"url": url, "state": state_token}))),
+        Err(err) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": err.to_string()})),
+        )),
+    }
+}
+
+/// Whether the sign-in finished, and what it produced.
+async fn api_oauth_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let provider = {
+        let config = state.config.read().await;
+        config.provider(&id).cloned()
+    };
+    let Some(provider) = provider else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "there is no provider with that id"})),
+        ));
+    };
+    // The stored credential means the sign-in went through.
+    let signed_in = provider
+        .keys
+        .iter()
+        .any(|k| k.key.starts_with("oauth:") || !k.key.trim().is_empty());
+    Ok(Json(json!({
+        "signed_in": signed_in,
+        "keys": provider.keys.len(),
+    })))
+}
+
+/// Where the vendor sends the browser back to.
+async fn console_base(state: &AppState) -> String {
+    let settings = state.config.read().await.settings.clone();
+    format!("http://{}:{}", settings.gateway_addr, settings.gateway_port)
+}
+
+/// The vendor redirects the browser here with the code. We swap it for a
+/// credential, store it on the provider, and send the user back to the
+/// console with a note.
+async fn oauth_callback(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<BTreeMap<String, String>>,
+) -> Response {
+    let code = params.get("code").or_else(|| params.get("auth_code"));
+    let state_token = params.get("state").cloned();
+    let error = params.get("error").cloned();
+
+    let title = "local-router";
+    let (heading, detail, ok) = match (error, code, state_token) {
+        (Some(err), _, _) => ("Sign-in failed", format!("the vendor said: {err}"), false),
+        (None, Some(code), Some(state_token)) => {
+            match crate::oauth::finish_flow(code, &state_token).await {
+                Ok((provider_id, token)) => {
+                    // Store the credential on the provider and save it.
+                    let key = token.api_key.clone();
+                    let stored = state
+                        .update(|config| {
+                            let Some(provider) = config.provider_mut(&provider_id) else {
+                                return Err(format!("there is no provider called {provider_id}"));
+                            };
+                            provider.keys.push(ProviderKey::new(key.clone()));
+                            Ok::<(), String>(())
+                        })
+                        .await;
+                    match stored {
+                        Ok(Ok(())) => (
+                            "Signed in",
+                            format!(
+                                "the credential for {provider_id} is stored — you can close this tab"
+                            ),
+                            true,
+                        ),
+                        Ok(Err(err)) => ("Sign-in failed", err, false),
+                        Err(err) => ("Sign-in failed", err.to_string(), false),
+                    }
+                }
+                Err(err) => ("Sign-in failed", err.to_string(), false),
+            }
+        }
+        _ => (
+            "Sign-in failed",
+            "the vendor sent back neither a code nor a state".to_string(),
+            false,
+        ),
+    };
+
+    let color = if ok { "#9ef0bf" } else { "#ff8d8d" };
+    let html = format!(
+        r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>{title}</title><style>body{{background:#0a0d0e;color:#edf2f0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;display:grid;place-content:center;min-height:100dvh;text-align:center;gap:8px}}h1{{font-size:20px;letter-spacing:-0.03em;margin:0}}p{{color:#7d8988;font-size:12px;max-width:34ch;margin:0}}a{{color:{color};font-size:12px}}</style></head><body><h1>{heading}</h1><p>{detail}</p><p><a href="/providers">← back to the console</a></p></body></html>"#
+    );
+    Html(html).into_response()
+}
+
 async fn api_test_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,

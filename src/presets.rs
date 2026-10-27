@@ -48,6 +48,9 @@ pub struct Preset {
     /// A relay that renames its models often uses `["*"]`.
     #[serde(default)]
     pub auto_include: Vec<String>,
+    /// How to sign in with a browser, when the vendor supports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::config::OAuthConfig>,
     /// The vendor's native media endpoints, when they are not the OpenAI
     /// `/v1` family.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -107,6 +110,7 @@ pub fn to_provider(preset: &Preset, key: Option<&str>) -> Provider {
         forward_headers: Vec::new(),
         remove_headers: Vec::new(),
         header_order: Vec::new(),
+        oauth: preset.oauth.clone(),
         proxy: None,
         group_only: false,
         auth: preset.auth,
@@ -150,6 +154,7 @@ pub fn custom_provider(
         forward_headers: Vec::new(),
         remove_headers: Vec::new(),
         header_order: Vec::new(),
+        oauth: None,
         proxy: None,
         group_only: false,
         auth: None,
