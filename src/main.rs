@@ -76,7 +76,7 @@ enum DaemonCmd {
     Start {
         /// The port the daemon listens on: the gateway and the console
         /// share it.
-        #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
+        #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3435)]
         port: u16,
         /// Deprecated: the console is on the daemon's port now.
         #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 0, hide = true)]
@@ -135,7 +135,7 @@ enum QwenCmd {
 impl Default for ServeArgs {
     fn default() -> Self {
         ServeArgs {
-            port: env_port("LOCAL_ROUTER_GATEWAY_PORT", 3425),
+            port: env_port("LOCAL_ROUTER_GATEWAY_PORT", 3435),
             web_port: 0,
             no_console: false,
             lan: false,
@@ -151,8 +151,9 @@ impl Default for ServeArgs {
 #[derive(Args, Debug, Clone)]
 struct ServeArgs {
     /// The port local-router listens on: the gateway and the console share
-    /// it. Defaults to LOCAL_ROUTER_GATEWAY_PORT, then the file, then 3425.
-    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
+    /// it. Zero lets the system pick a free one. Defaults to
+    /// LOCAL_ROUTER_GATEWAY_PORT, then the file, then 3435.
+    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3435)]
     port: u16,
     /// Deprecated: the console is on the gateway's port now. Zero still
     /// turns the console off.
@@ -326,10 +327,14 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         start_auto_checkin();
     }
 
+    // `--port 0` lets the system pick a free port: handy when another
+    // gateway (magpie, an older local-router) already holds 3435.
     let addr = format!("{}:{}", settings.gateway_addr, settings.gateway_port);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .with_context(|| format!("local-router could not listen on {addr}"))?;
+        .map_err(|err| port_taken_error(&addr, err))?;
+    let actual_port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let addr = format!("{}:{}", settings.gateway_addr, actual_port);
 
     println!("local-router {}", gateway::client::VERSION);
     println!("  gateway  http://{addr}");
@@ -365,7 +370,7 @@ async fn web_only(args: WebArgs) -> anyhow::Result<()> {
     let web_addr = format!("{}:{}", settings.gateway_addr, args.port);
     let listener = tokio::net::TcpListener::bind(&web_addr)
         .await
-        .with_context(|| format!("the console could not listen on {web_addr}"))?;
+        .map_err(|err| port_taken_error(&web_addr, err))?;
     println!("  console  http://{web_addr}");
     println!("  press ctrl-c to stop");
     axum::serve(listener, web::router(state))
@@ -373,6 +378,24 @@ async fn web_only(args: WebArgs) -> anyhow::Result<()> {
         .await
         .context("the console stopped")?;
     Ok(())
+}
+
+/// The error to show when the port is already taken.
+///
+/// A taken port is the most common way to fail to start, and the raw
+/// "Address already in use" says nothing about what to do next. Name the
+/// port, name the usual suspects, and hand over a command that works.
+fn port_taken_error(addr: &str, err: std::io::Error) -> anyhow::Error {
+    let taken = err.kind() == std::io::ErrorKind::AddrInUse;
+    if !taken {
+        return anyhow::Error::new(err).context(format!("local-router could not listen on {addr}"));
+    }
+    let port = addr.rsplit(':').next().unwrap_or(addr);
+    anyhow::anyhow!(
+        "the port {port} is already taken — another gateway (magpie? an older local-router?) is \
+         using it.\n\n  Start local-router on another port:\n    local-router serve --port {}\n\n           Or let the system pick a free one:\n    local-router serve --port 0\n\n           To see who holds it: lsof -nP -iTCP:{port} -sTCP:LISTEN",
+        port.parse::<u16>().unwrap_or(0) + 10
+    )
 }
 
 async fn shutdown() {

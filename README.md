@@ -28,16 +28,16 @@
 ```sh
 npm install && npm run build --prefix frontend   # 构建 React 控制台（cargo 也会自动调）
 cargo build --release
-./target/release/local-router                    # 网关 + 控制台，同一个端口 :3425
+./target/release/local-router                    # 网关 + 控制台，同一个端口 :3435
 local-router --version                           # 0.1.1
 ```
 
 ### Docker
 
 ```sh
-docker compose up -d          # http://localhost:3425（网关与控制台同一个端口）
+docker compose up -d          # http://localhost:3435（网关与控制台同一个端口）
 # 或
-docker build -t local-router . && docker run -p 3425:3425 -v lr-data:/data local-router
+docker build -t local-router . && docker run -p 3435:3435 -v lr-data:/data local-router
 ```
 
 ## 把 agent 指过来
@@ -51,9 +51,9 @@ local-router gemini glm/glm-4.6                # 写 ~/.gemini/.env
 local-router opencode deepseek/deepseek-chat   # 写 opencode.json
 
 # 方式二：环境变量（任何工具）
-export OPENAI_BASE_URL=http://127.0.0.1:3425/v1      OPENAI_API_KEY=local-router
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3425      ANTHROPIC_API_KEY=local-router
-export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3425  GEMINI_API_KEY=local-router
+export OPENAI_BASE_URL=http://127.0.0.1:3435/v1      OPENAI_API_KEY=local-router
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3435      ANTHROPIC_API_KEY=local-router
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3435  GEMINI_API_KEY=local-router
 ```
 
 ## CLI
@@ -154,7 +154,7 @@ HTTP API（`period=today|24h|7d|30d|all`）：
 
 ```sh
 curl -H "Authorization: Bearer <key>" \
-  'http://127.0.0.1:3425/v1/local-router/usage?period=7d'
+  'http://127.0.0.1:3435/v1/local-router/usage?period=7d'
 # → cost_usd / credits / unpriced 汇总 + per_provider[] 每个平台的账单
 ```
 
@@ -181,7 +181,7 @@ curl -H "Authorization: Bearer <key>" \
 两种常驻方式，**同一个进程**同时提供网关（API）和控制台（React 页面）：
 
 ```sh
-local-router daemon start              # 后台运行，默认 3425（网关 + 控制台）
+local-router daemon start              # 后台运行，默认 3435（网关 + 控制台）
 local-router daemon status             # 运行中？端口？日志在哪
 local-router daemon logs               # tail -f 日志
 local-router daemon stop               # 优雅停止（SIGTERM，卡死自动 SIGKILL）
@@ -191,7 +191,7 @@ local-router daemon stop               # 优雅停止（SIGTERM，卡死自动 S
 
 | 参数 | 作用 |
 | --- | --- |
-| `--port` / `LOCAL_ROUTER_GATEWAY_PORT` | 网关端口（默认 3425） |
+| `--port` / `LOCAL_ROUTER_GATEWAY_PORT` | 网关端口（默认 3435） |
 | `--no-console` | 只提供模型 API，不提供控制台页面（配置里是 `settings.console: false`） |
 | `--addr` / `LOCAL_ROUTER_GATEWAY_ADDR` | 网关绑定地址（默认 127.0.0.1） |
 | — | 控制台与网关共用端口与地址，没有单独的设置 |
@@ -291,13 +291,13 @@ local-router claude workbuddy/hy3        # 让 Claude Code 走 WorkBuddy
 
 ```sh
 # 用 WorkBuddy 的图像模型画一张图
-curl http://127.0.0.1:3425/v1/images/generations \
+curl http://127.0.0.1:3435/v1/images/generations \
   -H "Authorization: Bearer local-router" \
   -H "content-type: application/json" \
   -d '{"model":"workbuddy/hunyuan-image-v3.0-art","prompt":"一只戴帽子的猫"}'
 
 # 视频是异步任务：创建 → 查状态 → 取文件
-curl http://127.0.0.1:3425/v1/videos \
+curl http://127.0.0.1:3435/v1/videos \
   -H "Authorization: Bearer local-router" \
   -H "content-type: application/json" \
   -d '{"model":"workbuddy/kling-video-v3","prompt":"一只猫在跑"}'
@@ -398,7 +398,7 @@ cargo test                   # 228 个测试
 #   URL 与帧解析、仪表盘渲染、控制台守卫源校验
 #   tests/ 内是集成测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫与 API
 #   形状 / WorkBuddy 会话与续期 / QwenWork 信封 / agent 配置写入 / 用量存储
-cd frontend && npm run dev   # 控制台热更新（API 代理到 :3425）
+cd frontend && npm run dev   # 控制台热更新（API 代理到 :3435）
 ```
 
 只跑某一块：`cargo test --lib`（单元）/ `--test translate`（协议）/

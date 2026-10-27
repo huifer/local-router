@@ -395,7 +395,7 @@ mod tests {
     fn snapshot() -> Snapshot {
         Snapshot {
             version: "0.1.0".into(),
-            gateway_addr: "127.0.0.1:3425".into(),
+            gateway_addr: "127.0.0.1:3435".into(),
             web_addr: "127.0.0.1:3426".into(),
             providers: vec![ProviderRow {
                 id: "mock".into(),

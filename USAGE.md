@@ -30,33 +30,33 @@ cargo build --release               # Rust 1.80+；会自动构建前端
 ```sh
 git clone https://github.com/huifer/local-router.git
 cd local-router
-docker compose up -d                # 网关与控制台共用 3425
+docker compose up -d                # 网关与控制台共用 3435
 # 或自建镜像：
-# docker build -t local-router . && docker run -p 3425:3425 -v lr-data:/data local-router
+# docker build -t local-router . && docker run -p 3435:3435 -v lr-data:/data local-router
 ```
 
 ### 1.2 启动
 
 ```sh
-local-router                # 前台：网关 + 控制台，同一个端口 :3425
+local-router                # 前台：网关 + 控制台，同一个端口 :3435
 ```
 
 看到这样就成了：
 
 ```
 local-router 0.1.1
-  gateway  http://127.0.0.1:3425
-  console  http://127.0.0.1:3425
+  gateway  http://127.0.0.1:3435
+  console  http://127.0.0.1:3435
   press ctrl-c to stop
 ```
 
 **网关和控制台是同一个服务、同一个端口**——不用记两个地址：
 
-- 控制台（网页）：<http://127.0.0.1:3425>
-- 网关（API）：<http://127.0.0.1:3425>
+- 控制台（网页）：<http://127.0.0.1:3435>
+- 网关（API）：<http://127.0.0.1:3435>
 
-> 端口占用？3425 被别的 local-router 占着就换一个：
-> `local-router serve --port 13425`。
+> 端口占用？3435 被别的 local-router 占着就换一个：
+> `local-router serve --port 13435`。
 > 只想要 API、不要控制台页面：`local-router serve --no-console`。
 
 ### 1.3 配一个上游
@@ -93,11 +93,11 @@ local-router opencode deepseek/deepseek-chat   # 写 opencode.json
 或者不碰 agent 配置，直接给环境变量（任何吃 base URL 的工具都行）：
 
 ```sh
-export OPENAI_BASE_URL=http://127.0.0.1:3425/v1
+export OPENAI_BASE_URL=http://127.0.0.1:3435/v1
 export OPENAI_API_KEY=local-router            # 默认调用 key
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3425
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3435
 export ANTHROPIC_API_KEY=local-router
-export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3425
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3435
 export GEMINI_API_KEY=local-router
 ```
 
@@ -107,7 +107,7 @@ export GEMINI_API_KEY=local-router
 
 ```sh
 local-router doctor        # 一眼看出哪里没配好
-curl -H "Authorization: Bearer local-router" http://127.0.0.1:3425/v1/models
+curl -H "Authorization: Bearer local-router" http://127.0.0.1:3435/v1/models
 ```
 
 ---
@@ -116,7 +116,7 @@ curl -H "Authorization: Bearer local-router" http://127.0.0.1:3425/v1/models
 
 ### 2.1 控制台（网页）
 
-<http://127.0.0.1:3425>，左边六个页签：
+<http://127.0.0.1:3435>，左边六个页签：
 
 | 页签 | 干什么 |
 | --- | --- |
@@ -177,7 +177,7 @@ local-router dashboard               # 终端仪表盘（q 退出）
 
 ```sh
 KEY=local-router
-BASE=http://127.0.0.1:3425
+BASE=http://127.0.0.1:3435
 
 # OpenAI Chat
 curl $BASE/v1/chat/completions -H "Authorization: Bearer $KEY" \
@@ -218,7 +218,7 @@ caller key；一把都没有时**拒绝一切请求**。
 
 ```sh
 KEY=local-router
-BASE=http://127.0.0.1:3425
+BASE=http://127.0.0.1:3435
 
 curl -H "Authorization: Bearer $KEY" $BASE/v1/local-router/status        # 运行状态
 curl -H "Authorization: Bearer $KEY" $BASE/v1/local-router/quotas        # 各上游额度窗口
@@ -311,7 +311,7 @@ local-router group add weighted --models a/m1,b/m2 --routing weight
 ```sh
 local-router serve --lan                       # 绑 0.0.0.0
 # 另一台机器：
-export OPENAI_BASE_URL=http://网关IP:3425/v1
+export OPENAI_BASE_URL=http://网关IP:3435/v1
 export OPENAI_API_KEY=你的caller-key
 ```
 
@@ -449,7 +449,7 @@ A: 检查 `settings.record_usage` 是否为 true；数据在 `usage.jsonl` /
 `usage.db`，可 `local-router usage` 看。
 
 **Q: 端口被占**
-A: `local-router serve --port 13425`。注意 3425 常被另一个 local-router
+A: `local-router serve --port 13445`。注意 3435 常被另一个 local-router
 占着。
 
 **Q: 供应商报 401**

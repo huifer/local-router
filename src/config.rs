@@ -397,7 +397,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            gateway_port: 3425,
+            gateway_port: 3435,
             web_port: 0,
             console: true,
             lan: false,
@@ -678,7 +678,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let store = Store::at(dir.join("config.json"));
         let loaded = store.load().unwrap();
-        assert_eq!(loaded.settings.gateway_port, 3425);
+        assert_eq!(loaded.settings.gateway_port, 3435);
         // The console shares the gateway's port; the legacy field is unused.
         assert_eq!(loaded.settings.web_port, 0);
         assert!(loaded.providers.is_empty());
