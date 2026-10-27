@@ -1766,14 +1766,19 @@ async fn doctor() -> anyhow::Result<()> {
     let config = load_config()?;
     println!("local-router {}", gateway::client::VERSION);
     println!("  config      {}", config::config_file().display());
+    // The console is on the gateway's port now — one address, not two.
     println!(
         "  gateway     http://{}:{}",
         config.settings.gateway_addr, config.settings.gateway_port
     );
-    println!(
-        "  web         http://{}:{}",
-        config.settings.web_addr, config.settings.web_port
-    );
+    if config.settings.console {
+        println!(
+            "  console     http://{}:{}  (same port)",
+            config.settings.gateway_addr, config.settings.gateway_port
+        );
+    } else {
+        println!("  console     off (settings.console = false)");
+    }
     println!("  providers   {}", config.providers.len());
     println!("  groups      {}", config.groups.len());
     println!("  models      {}", config.model_ids().len());
