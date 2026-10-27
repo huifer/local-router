@@ -16,8 +16,10 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    // The gateway and the console share one port now, so everything the
+    // console talks to goes to the same place.
     proxy: {
-      "/api": "http://127.0.0.1:3426",
+      "/api": "http://127.0.0.1:3425",
       "/health": "http://127.0.0.1:3425",
       "/v1": "http://127.0.0.1:3425",
       "/v1beta": "http://127.0.0.1:3425",

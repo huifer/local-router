@@ -340,3 +340,125 @@ fn urlencode(text: &str) -> String {
     }
     out
 }
+
+// ------------------------------------------------- one port for both --
+//
+// The gateway and the console are one service on one port. These cases pin
+// that: the page and the model endpoints answer on the same listener, and
+// each keeps its own authentication rules.
+
+use local_router::server;
+
+async fn combined_state() -> AppState {
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "local-router-one-port-test-{}-{n}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Arc::new(Store::at(dir.join(format!("config-{n}.json"))));
+    let config = Config {
+        settings: Settings {
+            gateway_addr: "127.0.0.1".into(),
+            ..Settings::default()
+        },
+        ..Config::default()
+    };
+    store.save(&config).expect("save test config");
+    let state = AppState::load(store).await.expect("load test state");
+    state.set_web_bind("127.0.0.1").await;
+    state
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_console_and_the_model_api_answer_on_the_same_router() {
+    let state = combined_state().await;
+    let app = server::router(state);
+
+    // The console's page, its assets and its API.
+    for path in ["/", "/assets/app.js", "/assets/style.css", "/api/status"] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{path} should answer");
+    }
+
+    // The model endpoints are on the same router, and they still want a key.
+    let health = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(health.status(), StatusCode::OK);
+
+    let models = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(models.status(), StatusCode::UNAUTHORIZED);
+
+    let with_key = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/models")
+                .header("authorization", "Bearer local-router")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(with_key.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_console_guard_does_not_leak_onto_the_model_api() {
+    let state = combined_state().await;
+    let app = server::router(state);
+
+    // A cross-origin write to the console is refused.
+    let console = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/groups")
+                .header("content-type", "application/json")
+                .header("host", "127.0.0.1:3425")
+                .header("origin", "http://evil.example")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(console.status(), StatusCode::FORBIDDEN);
+
+    // The same origin header on a model endpoint is none of the console's
+    // business: the request is judged by the gateway's own rules.
+    let gateway = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .header("host", "127.0.0.1:3425")
+                .header("origin", "http://evil.example")
+                .body(Body::from(r#"{"model":"a/m","messages":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(gateway.status(), StatusCode::FORBIDDEN);
+}

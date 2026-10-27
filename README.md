@@ -28,16 +28,16 @@
 ```sh
 npm install && npm run build --prefix frontend   # 构建 React 控制台（cargo 也会自动调）
 cargo build --release
-./target/release/local-router                    # 网关 :3425 + 控制台 :3426
+./target/release/local-router                    # 网关 + 控制台，同一个端口 :3425
 local-router --version                           # 0.1.1
 ```
 
 ### Docker
 
 ```sh
-docker compose up -d          # http://localhost:3426
+docker compose up -d          # http://localhost:3425（网关与控制台同一个端口）
 # 或
-docker build -t local-router . && docker run -p 3425:3425 -p 3426:3426 -v lr-data:/data local-router
+docker build -t local-router . && docker run -p 3425:3425 -v lr-data:/data local-router
 ```
 
 ## 把 agent 指过来
@@ -60,11 +60,11 @@ export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3425  GEMINI_API_KEY=local-router
 
 ```sh
 local-router                                   # 网关 + 控制台（前台，一个进程）
-local-router serve [--port N] [--web-port N] [--addr A] [--web-addr A] [--lan]
+local-router serve [--port N] [--addr A] [--lan] [--no-console]
 local-router web [--port N]
 
 # 后台守护进程：同一进程提供网关 + 控制台，断开终端也活着
-local-router daemon start  [--port N] [--web-port N] [--addr A] [--web-addr A] [--lan]
+local-router daemon start  [--port N] [--addr A] [--lan]
 local-router daemon status | stop | logs
 
 local-router provider add <preset|名字> --key sk-… [--url …] [--models a,b]
@@ -181,7 +181,7 @@ curl -H "Authorization: Bearer <key>" \
 两种常驻方式，**同一个进程**同时提供网关（API）和控制台（React 页面）：
 
 ```sh
-local-router daemon start              # 后台运行，默认 3425/3426
+local-router daemon start              # 后台运行，默认 3425（网关 + 控制台）
 local-router daemon status             # 运行中？端口？日志在哪
 local-router daemon logs               # tail -f 日志
 local-router daemon stop               # 优雅停止（SIGTERM，卡死自动 SIGKILL）
@@ -192,9 +192,9 @@ local-router daemon stop               # 优雅停止（SIGTERM，卡死自动 S
 | 参数 | 作用 |
 | --- | --- |
 | `--port` / `LOCAL_ROUTER_GATEWAY_PORT` | 网关端口（默认 3425） |
-| `--web-port` / `LOCAL_ROUTER_WEB_PORT` | 控制台端口（默认 3426；**0 = 关闭页面，只跑网关**） |
+| `--no-console` | 只提供模型 API，不提供控制台页面（配置里是 `settings.console: false`） |
 | `--addr` / `LOCAL_ROUTER_GATEWAY_ADDR` | 网关绑定地址（默认 127.0.0.1） |
-| `--web-addr` / `LOCAL_ROUTER_WEB_ADDR` | 控制台绑定地址（默认同网关地址） |
+| — | 控制台与网关共用端口与地址，没有单独的设置 |
 | `--lan` / `LOCAL_ROUTER_LAN=1` | 两个地址都改绑 `0.0.0.0`（局域网可访问） |
 
 `daemon start` 会等两个端口就绪才返回；stop 会在 5 秒内退不干净时自动
@@ -206,7 +206,7 @@ SIGKILL。日志在 `~/.config/local-router/daemon/daemon.log`。
 | --- | --- |
 | `LOCAL_ROUTER_HOME` | 配置目录（Docker 里设为 `/data`） |
 | `LOCAL_ROUTER_GATEWAY_PORT` / `LOCAL_ROUTER_WEB_PORT` | 端口（CLI 参数可再覆盖） |
-| `LOCAL_ROUTER_GATEWAY_ADDR` / `LOCAL_ROUTER_WEB_ADDR` | 绑定地址 |
+| `LOCAL_ROUTER_GATEWAY_ADDR` | 绑定地址 |
 | `LOCAL_ROUTER_DEFAULT_KEY` | 运行时调用密钥（**不落盘**，优先于文件里的 key） |
 | `LOCAL_ROUTER_LAN` | `1` 等价于 `--lan` |
 | `LOCAL_ROUTER_LOG` | 日志过滤（如 `debug`） |
@@ -398,7 +398,7 @@ cargo test                   # 228 个测试
 #   URL 与帧解析、仪表盘渲染、控制台守卫源校验
 #   tests/ 内是集成测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫与 API
 #   形状 / WorkBuddy 会话与续期 / QwenWork 信封 / agent 配置写入 / 用量存储
-cd frontend && npm run dev   # 控制台热更新（API 代理到 :3426）
+cd frontend && npm run dev   # 控制台热更新（API 代理到 :3425）
 ```
 
 只跑某一块：`cargo test --lib`（单元）/ `--test translate`（协议）/

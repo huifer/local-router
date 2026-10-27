@@ -227,7 +227,8 @@ fn collect(sqlite: &Option<store::Store>) -> Snapshot {
     Snapshot {
         version: gateway::client::VERSION.to_string(),
         gateway_addr: format!("{}:{}", settings.gateway_addr, settings.gateway_port),
-        web_addr: format!("{}:{}", settings.web_addr, settings.web_port),
+        // The console is on the gateway's port now.
+        web_addr: format!("{}:{}", settings.gateway_addr, settings.gateway_port),
         providers,
         totals,
         by_day,

@@ -357,14 +357,21 @@ pub struct CallerKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
-    /// The port the gateway listens on; `LOCAL_ROUTER_GATEWAY_PORT` wins.
+    /// The port local-router listens on: the gateway and the console share
+    /// it. `LOCAL_ROUTER_GATEWAY_PORT` wins.
     pub gateway_port: u16,
-    /// The port the web UI listens on.
+    /// Deprecated: the console is on the gateway's port now. The value is
+    /// ignored; it stays in the file so old configs still parse.
     pub web_port: u16,
+    /// Whether the console is served at all. Off means API only — handy on
+    /// a shared machine where only the model endpoints should be reachable.
+    #[serde(default = "yes")]
+    pub console: bool,
     /// Bind on the local network as well.
     pub lan: bool,
-    /// The address the gateway binds to.
+    /// The address to bind.
     pub gateway_addr: String,
+    /// Deprecated: the console binds with the gateway.
     pub web_addr: String,
     /// The key callers use when they send none.
     pub default_caller_key: String,
@@ -391,7 +398,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             gateway_port: 3425,
-            web_port: 3426,
+            web_port: 0,
+            console: true,
             lan: false,
             gateway_addr: "127.0.0.1".to_string(),
             web_addr: "127.0.0.1".to_string(),
@@ -416,12 +424,6 @@ impl Settings {
         if let Ok(port) = std::env::var("LOCAL_ROUTER_GATEWAY_PORT") {
             if let Ok(port) = port.trim().parse() {
                 self.gateway_port = port;
-                applied = true;
-            }
-        }
-        if let Ok(port) = std::env::var("LOCAL_ROUTER_WEB_PORT") {
-            if let Ok(port) = port.trim().parse() {
-                self.web_port = port;
                 applied = true;
             }
         }
@@ -677,7 +679,8 @@ mod tests {
         let store = Store::at(dir.join("config.json"));
         let loaded = store.load().unwrap();
         assert_eq!(loaded.settings.gateway_port, 3425);
-        assert_eq!(loaded.settings.web_port, 3426);
+        // The console shares the gateway's port; the legacy field is unused.
+        assert_eq!(loaded.settings.web_port, 0);
         assert!(loaded.providers.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }

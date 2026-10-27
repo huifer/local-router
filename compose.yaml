@@ -5,15 +5,12 @@ services:
     container_name: local-router
     restart: unless-stopped
     ports:
-      # 按需改成宿主机端口；容器内固定 3425/3426
+      # 按需改成宿主机端口；容器内固定 3425（网关与控制台共用一个端口）
       - "3425:3425"
-      - "3426:3426"
     environment:
       LOCAL_ROUTER_HOME: /data
       LOCAL_ROUTER_GATEWAY_ADDR: 0.0.0.0
-      LOCAL_ROUTER_WEB_ADDR: 0.0.0.0
       LOCAL_ROUTER_GATEWAY_PORT: "3425"
-      LOCAL_ROUTER_WEB_PORT: "3426"
       # 默认调用密钥（建议改成自己的）
       LOCAL_ROUTER_DEFAULT_KEY: ${LOCAL_ROUTER_DEFAULT_KEY:-local-router}
       LOCAL_ROUTER_LOG: ${LOCAL_ROUTER_LOG:-info}

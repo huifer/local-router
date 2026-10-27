@@ -30,29 +30,34 @@ cargo build --release               # Rust 1.80+；会自动构建前端
 ```sh
 git clone https://github.com/huifer/local-router.git
 cd local-router
-docker compose up -d                # 网关 3425 + 控制台 3426
+docker compose up -d                # 网关与控制台共用 3425
 # 或自建镜像：
-# docker build -t local-router . && docker run -p 3425:3425 -p 3426:3426 -v lr-data:/data local-router
+# docker build -t local-router . && docker run -p 3425:3425 -v lr-data:/data local-router
 ```
 
 ### 1.2 启动
 
 ```sh
-local-router                # 前台：网关 :3425 + 控制台 :3426
+local-router                # 前台：网关 + 控制台，同一个端口 :3425
 ```
 
-看到这两行就成了：
+看到这样就成了：
 
 ```
+local-router 0.1.1
   gateway  http://127.0.0.1:3425
-  web      http://127.0.0.1:3426
+  console  http://127.0.0.1:3425
+  press ctrl-c to stop
 ```
 
-- 控制台（网页）：<http://127.0.0.1:3426>
+**网关和控制台是同一个服务、同一个端口**——不用记两个地址：
+
+- 控制台（网页）：<http://127.0.0.1:3425>
 - 网关（API）：<http://127.0.0.1:3425>
 
-> 端口占用？本机 3425/3426 已被别的 local-router 占了就换端口：
-> `local-router serve --port 13425 --web-port 13426`。
+> 端口占用？3425 被别的 local-router 占着就换一个：
+> `local-router serve --port 13425`。
+> 只想要 API、不要控制台页面：`local-router serve --no-console`。
 
 ### 1.3 配一个上游
 
@@ -111,7 +116,7 @@ curl -H "Authorization: Bearer local-router" http://127.0.0.1:3425/v1/models
 
 ### 2.1 控制台（网页）
 
-<http://127.0.0.1:3426>，左边六个页签：
+<http://127.0.0.1:3425>，左边六个页签：
 
 | 页签 | 干什么 |
 | --- | --- |
@@ -392,7 +397,8 @@ CLI 或控制台改了 `config.json`，网关在**下一个请求**自动重载�
 
 | 字段 | 作用 |
 | --- | --- |
-| `gateway_port` / `web_port` | 网关 / 控制台端口 |
+| `gateway_port` | 端口（网关与控制台共用） |
+| `console` | 是否提供控制台页面（默认 true） |
 | `gateway_addr` / `web_addr` | 绑定地址 |
 | `lan` | 是否绑 0.0.0.0（局域网可用） |
 | `default_caller_key` | 调用方默认用的 key |
@@ -407,7 +413,7 @@ CLI 或控制台改了 `config.json`，网关在**下一个请求**自动重载�
 | 变量 | 作用 |
 | --- | --- |
 | `LOCAL_ROUTER_HOME` | 配置目录（Docker 里是 `/data`） |
-| `LOCAL_ROUTER_GATEWAY_PORT` / `LOCAL_ROUTER_WEB_PORT` | 端口（CLI 参数可再覆盖） |
+| `LOCAL_ROUTER_GATEWAY_PORT` | 端口（CLI 参数可再覆盖） |
 | `LOCAL_ROUTER_GATEWAY_ADDR` / `LOCAL_ROUTER_WEB_ADDR` | 绑定地址 |
 | `LOCAL_ROUTER_DEFAULT_KEY` | 运行时调用密钥（**不落盘**，优先于文件里的 key） |
 | `LOCAL_ROUTER_LAN` | `1` 等价于 `--lan` |
@@ -443,8 +449,8 @@ A: 检查 `settings.record_usage` 是否为 true；数据在 `usage.jsonl` /
 `usage.db`，可 `local-router usage` 看。
 
 **Q: 端口被占**
-A: `local-router serve --port 13425 --web-port 13426`。注意 3425/3426 常被
-另一个 local-router 占着。
+A: `local-router serve --port 13425`。注意 3425 常被另一个 local-router
+占着。
 
 **Q: 供应商报 401**
 A: `local-router provider test <id>` 单测一把 key；再 `local-router doctor`

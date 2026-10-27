@@ -33,11 +33,10 @@ COPY --from=build /build/target/release/local-router /usr/local/bin/local-router
 USER router
 ENV LOCAL_ROUTER_HOME=/data \
     LOCAL_ROUTER_GATEWAY_PORT=3425 \
-    LOCAL_ROUTER_WEB_PORT=3426 \
-    LOCAL_ROUTER_GATEWAY_ADDR=0.0.0.0 \
-    LOCAL_ROUTER_WEB_ADDR=0.0.0.0
+    LOCAL_ROUTER_GATEWAY_ADDR=0.0.0.0
 VOLUME /data
-EXPOSE 3425 3426
+# One port for the model API and the console.
+EXPOSE 3425
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:3425/health || exit 1
 ENTRYPOINT ["local-router"]

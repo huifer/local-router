@@ -3,7 +3,9 @@
 //! The web page and the gateway are the same process. `local-router` starts both;
 //! `local-router serve` starts the gateway alone.
 
-use local_router::{config, gateway, presets, pricing, protocol, qwen, store, web, workbuddy};
+use local_router::{
+    config, gateway, presets, pricing, protocol, qwen, server, store, web, workbuddy,
+};
 
 use std::sync::Arc;
 
@@ -72,19 +74,20 @@ enum Command {
 enum DaemonCmd {
     /// Start the daemon in the background (gateway + console, one process).
     Start {
-        /// The gateway port.
+        /// The port the daemon listens on: the gateway and the console
+        /// share it.
         #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
         port: u16,
-        /// The console port (0 turns it off).
-        #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 3426)]
+        /// Deprecated: the console is on the daemon's port now.
+        #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 0, hide = true)]
         web_port: u16,
-        /// The address the gateway binds to.
+        /// The address to bind.
         #[arg(long, env = "LOCAL_ROUTER_GATEWAY_ADDR", default_value = "127.0.0.1")]
         addr: String,
-        /// The address the console binds to.
-        #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR", default_value = "127.0.0.1")]
+        /// Deprecated: the console binds with the gateway.
+        #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR", hide = true)]
         web_addr: Option<String>,
-        /// Bind on the local network (both addresses become 0.0.0.0).
+        /// Bind on the local network (the address becomes 0.0.0.0).
         #[arg(long)]
         lan: bool,
         /// Wait until the ports answer, then return.
@@ -133,47 +136,47 @@ impl Default for ServeArgs {
     fn default() -> Self {
         ServeArgs {
             port: env_port("LOCAL_ROUTER_GATEWAY_PORT", 3425),
-            web_port: env_port("LOCAL_ROUTER_WEB_PORT", 3426),
+            web_port: 0,
+            no_console: false,
             lan: false,
             addr: std::env::var("LOCAL_ROUTER_GATEWAY_ADDR")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
                 .unwrap_or_else(|| "127.0.0.1".to_string()),
-            web_addr: std::env::var("LOCAL_ROUTER_WEB_ADDR")
-                .ok()
-                .filter(|v| !v.trim().is_empty()),
+            web_addr: None,
         }
     }
 }
 
 #[derive(Args, Debug, Clone)]
 struct ServeArgs {
-    /// The port the gateway listens on.
-    /// Defaults to LOCAL_ROUTER_GATEWAY_PORT, then the file, then 3425.
+    /// The port local-router listens on: the gateway and the console share
+    /// it. Defaults to LOCAL_ROUTER_GATEWAY_PORT, then the file, then 3425.
     #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
     port: u16,
-    /// The port the web page listens on. Zero turns the page off.
-    #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 3426)]
+    /// Deprecated: the console is on the gateway's port now. Zero still
+    /// turns the console off.
+    #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 0, hide = true)]
     web_port: u16,
+    /// Serve the model API only, without the console.
+    #[arg(long)]
+    no_console: bool,
     /// Bind on the local network, so other computers can use the gateway.
     #[arg(long)]
     lan: bool,
-    /// The address the gateway binds to.
+    /// The address to bind.
     #[arg(long, env = "LOCAL_ROUTER_GATEWAY_ADDR", default_value = "127.0.0.1")]
     addr: String,
-    /// The address the console binds to. Defaults to the gateway address.
-    #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR")]
+    /// Deprecated: the console binds with the gateway.
+    #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR", hide = true)]
     web_addr: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
 struct WebArgs {
-    /// The port the web page listens on.
+    /// The port the console listens on.
     #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 3426)]
     port: u16,
-    /// The port the gateway listens on.
-    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3425)]
-    gateway_port: u16,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -299,99 +302,76 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // Environment first (containers), then the command line (people).
     let mut settings = config.settings.clone().from_env();
     settings.gateway_port = args.port;
-    settings.web_port = args.web_port;
     settings.gateway_addr = args.addr.clone();
-    if let Some(web_addr) = &args.web_addr {
-        settings.web_addr = web_addr.clone();
-    }
     if args.lan {
         settings.gateway_addr = "0.0.0.0".to_string();
-        settings.web_addr = "0.0.0.0".to_string();
+    }
+    // The console lives on the gateway's port now. The switch that decides
+    // whether it is served at all is `--no-console` (or `console: false` in
+    // the file); a legacy `web_port` is only a leftover.
+    let console = !args.no_console && settings.console;
+    if args.web_port != 0 && args.web_port != args.port {
+        eprintln!(
+            "note: the console now shares the gateway's port; --web-port {} is ignored",
+            args.web_port
+        );
     }
     drop(config);
     // Handlers that care — the console's remote guard — must see the real
-    // bind address, not the file's.
-    state.set_web_bind(&settings.web_addr).await;
+    // bind address, not the file's. The console is on the same port now, so
+    // it is exposed exactly when the gateway is.
+    state.set_web_bind(&settings.gateway_addr).await;
 
     if settings.workbuddy_auto_checkin {
         start_auto_checkin();
     }
 
-    let gateway = gateway::Gateway::new(state.clone());
-    let gateway_addr = format!("{}:{}", settings.gateway_addr, settings.gateway_port);
-    let gateway_router = gateway::router(gateway);
-    let listener = tokio::net::TcpListener::bind(&gateway_addr)
+    let addr = format!("{}:{}", settings.gateway_addr, settings.gateway_port);
+    let listener = tokio::net::TcpListener::bind(&addr)
         .await
-        .with_context(|| format!("the gateway could not listen on {gateway_addr}"))?;
-
-    let web_addr = format!("{}:{}", settings.web_addr, settings.web_port);
-    let web_listener = if settings.web_port == 0 {
-        None
-    } else {
-        Some(
-            tokio::net::TcpListener::bind(&web_addr)
-                .await
-                .with_context(|| format!("the web page could not listen on {web_addr}"))?,
-        )
-    };
+        .with_context(|| format!("local-router could not listen on {addr}"))?;
 
     println!("local-router {}", gateway::client::VERSION);
-    println!("  gateway  http://{gateway_addr}");
-    if web_listener.is_some() {
-        println!("  web      http://{web_addr}");
+    println!("  gateway  http://{addr}");
+    if console {
+        println!("  console  http://{addr}");
     }
     println!("  press ctrl-c to stop");
 
-    if let Some(listener) = web_listener {
-        let web_router = web::router(state.clone());
-        tokio::spawn(async move {
-            if let Err(err) = axum::serve(listener, web_router).await {
-                eprintln!("the web page stopped: {err}");
-            }
-        });
-    }
+    let router = if console {
+        server::router(state.clone())
+    } else {
+        gateway::router(gateway::Gateway::new(state.clone()))
+    };
 
-    axum::serve(listener, gateway_router)
+    axum::serve(listener, router)
         .with_graceful_shutdown(shutdown())
         .await
-        .context("the gateway stopped")?;
+        .context("local-router stopped")?;
     Ok(())
 }
 
+/// Serve the console alone — for the case where the gateway runs
+/// somewhere else and this machine only wants the page.
 async fn web_only(args: WebArgs) -> anyhow::Result<()> {
     let store = Arc::new(Store::new());
     let state = AppState::load(store).await?;
     let settings = state.config.read().await.settings.clone().from_env();
-    state.set_web_bind(&settings.web_addr).await;
+    state.set_web_bind(&settings.gateway_addr).await;
     if settings.workbuddy_auto_checkin {
         start_auto_checkin();
     }
 
-    let gateway = gateway::Gateway::new(state.clone());
-    let gateway_addr = format!("{}:{}", settings.gateway_addr, args.gateway_port);
-    let gateway_router = gateway::router(gateway);
-    match tokio::net::TcpListener::bind(&gateway_addr).await {
-        Ok(listener) => {
-            println!("  gateway  http://{gateway_addr}");
-            tokio::spawn(async move {
-                let _ = axum::serve(listener, gateway_router).await;
-            });
-        }
-        Err(err) => {
-            eprintln!("  gateway  not started on {gateway_addr}: {err}");
-        }
-    }
-
-    let web_addr = format!("{}:{}", settings.web_addr, args.port);
+    let web_addr = format!("{}:{}", settings.gateway_addr, args.port);
     let listener = tokio::net::TcpListener::bind(&web_addr)
         .await
-        .with_context(|| format!("the web page could not listen on {web_addr}"))?;
-    println!("  web      http://{web_addr}");
+        .with_context(|| format!("the console could not listen on {web_addr}"))?;
+    println!("  console  http://{web_addr}");
     println!("  press ctrl-c to stop");
     axum::serve(listener, web::router(state))
         .with_graceful_shutdown(shutdown())
         .await
-        .context("the web page stopped")?;
+        .context("the console stopped")?;
     Ok(())
 }
 
@@ -1097,31 +1077,15 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
             }
             start_daemon(&args)?;
             if wait {
-                // Wait until both ports answer, or say what went wrong.
+                // Wait until the port answers, or say what went wrong.
                 let gateway = format!("http://{}:{port}/health", args.addr);
-                let web = if args.web_port == 0 {
-                    None
-                } else {
-                    Some(format!(
-                        "http://{}:{}/",
-                        args.web_addr.clone().unwrap_or_else(|| args.addr.clone()),
-                        args.web_port
-                    ))
-                };
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                 loop {
                     let gateway_up = reqwest::get(&gateway)
                         .await
                         .map(|r| r.status().is_success())
                         .unwrap_or(false);
-                    let web_up = match &web {
-                        Some(url) => reqwest::get(url)
-                            .await
-                            .map(|r| r.status().is_success())
-                            .unwrap_or(false),
-                        None => true,
-                    };
-                    if gateway_up && web_up {
+                    if gateway_up {
                         break;
                     }
                     if std::time::Instant::now() > deadline {
@@ -1134,11 +1098,8 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
                 }
             }
             println!(
-                "daemon started  gateway http://{}:{}  console http://{}:{}",
-                args.addr,
-                args.port,
-                args.web_addr.as_deref().unwrap_or(&args.addr),
-                args.web_port
+                "daemon started  gateway + console http://{}:{}",
+                args.addr, args.port
             );
             println!("logs: {}", log_file().display());
             Ok(())
@@ -1174,13 +1135,7 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
                     let args = read_start_args().unwrap_or_default();
                     println!("running    yes (pid {pid})");
                     println!("gateway    http://{}:{}", args.addr, args.port);
-                    if args.web_port > 0 {
-                        println!(
-                            "console    http://{}:{}",
-                            args.web_addr.as_deref().unwrap_or(&args.addr),
-                            args.web_port
-                        );
-                    }
+                    println!("console    http://{}:{}  (same port)", args.addr, args.port);
                     println!("logs       {}", log_file().display());
                 }
                 None => println!("running    no"),
@@ -1236,16 +1191,11 @@ fn start_daemon(args: &DaemonStart) -> anyhow::Result<()> {
         .arg("serve")
         .arg("--port")
         .arg(args.port.to_string())
-        .arg("--web-port")
-        .arg(args.web_port.to_string())
         .arg("--addr")
         .arg(&args.addr)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
-    if let Some(web_addr) = &args.web_addr {
-        command.arg("--web-addr").arg(web_addr);
-    }
     if args.lan {
         command.arg("--lan");
     }
