@@ -272,7 +272,17 @@ curl $BASE/v1/messages/count_tokens -H "x-api-key: $KEY" \
 `api-key`。key 取 `LOCAL_ROUTER_DEFAULT_KEY` → 设置里的默认 key → 任一
 caller key；一把都没有时**拒绝一切请求**。
 
-### 2.6 WorkBuddy：登录与多账号
+### 2.6 开机自启（以后不用再手动启动）
+
+```sh
+local-router daemon install     # 装上开机自启（macOS 用 launchd，Linux 用 systemd）
+local-router daemon uninstall   # 卸掉
+```
+
+装上之后：登录系统网关自动起来；进程崩了也会被自动拉起（实测杀掉进程 8 秒内
+自动恢复，页面照常可用）。想看它跑在哪：`local-router daemon status`。
+
+### 2.7 WorkBuddy：登录与多账号
 
 ```sh
 local-router workbuddy login                # 浏览器登录（默认账号名 default）
@@ -294,7 +304,7 @@ local-router workbuddy status|credits|models|checkin
 > token 加密存了，local-router 读不出来，所以请用上面的 `workbuddy login`
 > （浏览器登录一次即可，之后自动续期）。
 
-### 2.7 观察网关内部
+### 2.8 观察网关内部
 
 ```sh
 KEY=local-router
@@ -307,7 +317,7 @@ curl -H "Authorization: Bearer $KEY" "$BASE/v1/local-router/usage/requests?limit
 curl -H "Authorization: Bearer $KEY" -H "X-Session-ID: my-session" $BASE/v1/local-router/route  # 这次路由去了哪
 ```
 
-### 2.8 图片与视频
+### 2.9 图片与视频
 
 ```sh
 # 图片生成

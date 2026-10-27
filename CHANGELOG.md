@@ -57,6 +57,11 @@
   - 支持 **WorkBuddy AI（www.workbuddy.ai）**：与国内 CodeBuddy 同协议、
     不同站点，登录时按站点选（`platform=workbuddy` / `workbuddy-ai`）；
   - 原有的 `LOCAL_ROUTER_WORKBUDDY_ENDPOINT` 覆盖仍生效。
+- **开机自启**：`local-router daemon install`（macOS 用 launchd、Linux 用
+  systemd）把网关装成登录自启且崩溃自愈——实测杀掉进程 8 秒内自动拉起，页面
+  照常可用；`daemon uninstall` 卸掉。新增 `daemon run`（前台运行并写 pid
+  文件）供 launchd / systemd 调用。
+
 - **WorkBuddy 多账号**：登录态文件改成账号池（`workbuddy-session.json`），
   可登录多个账号（`workbuddy login --account <名字>`）、列出
   （`workbuddy accounts`）、切换（`workbuddy use <名字>`）；网关的请求在

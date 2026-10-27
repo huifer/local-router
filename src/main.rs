@@ -105,6 +105,12 @@ enum DaemonCmd {
     },
     /// Stop the running daemon.
     Stop,
+    /// Run the daemon in the foreground (what launchd / systemd run).
+    Run,
+    /// Start the daemon at login (macOS: launchd, Linux: systemd).
+    Install,
+    /// Remove the login item.
+    Uninstall,
     /// Whether the daemon is running, and where.
     Status,
     /// Follow the daemon's log.
@@ -1344,6 +1350,98 @@ async fn qwen_login(no_open: bool) -> anyhow::Result<()> {
 // ---------------------------------------------------------------- daemon --
 
 /// Where the daemon's bookkeeping lives.
+/// The login item that starts the daemon with the machine.
+#[cfg(target_os = "macos")]
+fn install_login_item() -> anyhow::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let plist_dir = dirs::home_dir()
+        .context("no home directory")?
+        .join("Library/LaunchAgents");
+    std::fs::create_dir_all(&plist_dir)?;
+    let path = plist_dir.join("com.local-router.daemon.plist");
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.local-router.daemon</string>
+  <key>ProgramArguments</key>
+  <array><string>{}</string><string>daemon</string><string>run</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+        exe.display(),
+        log_file().display(),
+        log_file().display(),
+    );
+    std::fs::write(&path, plist)?;
+    // Ask launchd to load it now, so the daemon is up without a logout.
+    let _ = std::process::Command::new("launchctl")
+        .args(["load", "-w", &path.to_string_lossy()])
+        .status();
+    Ok(path)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_login_item() -> anyhow::Result<std::path::PathBuf> {
+    let path = dirs::home_dir()
+        .context("no home directory")?
+        .join("Library/LaunchAgents/com.local-router.daemon.plist");
+    if path.exists() {
+        let _ = std::process::Command::new("launchctl")
+            .args(["unload", "-w", &path.to_string_lossy()])
+            .status();
+        std::fs::remove_file(&path)?;
+    }
+    Ok(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn install_login_item() -> anyhow::Result<std::path::PathBuf> {
+    let exe = std::env::current_exe()?;
+    let dir = dirs::home_dir()
+        .context("no home directory")?
+        .join(".config/systemd/user");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("local-router.service");
+    let unit = format!(
+        "[Unit]
+Description=local-router gateway
+
+[Service]
+ExecStart={} daemon start
+Restart=always
+
+[Install]
+WantedBy=default.target
+",
+        exe.display()
+    );
+    std::fs::write(&path, unit)?;
+    let _ = std::process::Command::new("systemctl")
+        .args(["--user", "enable", "--now", "local-router.service"])
+        .status();
+    Ok(path)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_login_item() -> anyhow::Result<std::path::PathBuf> {
+    let path = dirs::home_dir()
+        .context("no home directory")?
+        .join(".config/systemd/user/local-router.service");
+    if path.exists() {
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "disable", "--now", "local-router.service"])
+            .status();
+        std::fs::remove_file(&path)?;
+    }
+    Ok(path)
+}
+
 fn daemon_dir() -> std::path::PathBuf {
     config::config_dir().join("daemon")
 }
@@ -1468,6 +1566,26 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
             }
             let _ = std::fs::remove_file(pid_file());
             println!("daemon stopped (was pid {pid})");
+            Ok(())
+        }
+        DaemonCmd::Run => {
+            // Foreground, with the pid file written so `daemon status` still
+            // works: launchd and systemd want a process that stays.
+            let _ = std::fs::create_dir_all(daemon_dir());
+            let _ = std::fs::write(pid_file(), std::process::id().to_string());
+            let result = serve(ServeArgs::default()).await;
+            let _ = std::fs::remove_file(pid_file());
+            result
+        }
+        DaemonCmd::Install => {
+            let path = install_login_item()?;
+            println!("installed: {}", path.display());
+            println!("the gateway now starts with your machine");
+            Ok(())
+        }
+        DaemonCmd::Uninstall => {
+            let path = remove_login_item()?;
+            println!("removed: {}", path.display());
             Ok(())
         }
         DaemonCmd::Status => {
