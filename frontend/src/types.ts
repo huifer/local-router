@@ -97,6 +97,11 @@ export interface Preset {
   docs?: string;
   /** The vendor supports a browser sign-in (OAuth), so no key is needed. */
   oauth?: boolean;
+  /**
+   * The vendor keeps its own browser session instead of a key:
+   * `workbuddy` | `qwenwork`.
+   */
+  session_login?: "workbuddy" | "qwenwork";
 }
 
 export interface PresetGroup {

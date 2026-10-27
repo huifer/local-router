@@ -32,6 +32,15 @@
 - **CLI 的 `provider models` 也会应用 auto_include**（此前只有控制台的
   「刷新模型」会），并把新模型落盘。
 
+- **WorkBuddy 登录修正（对照 magpie-community/plugins 的实现）**：
+  - 登录链接补上两个必需参数——`version`（登录页读它决定走哪套流程）与
+    `loginSessionId`（把这次浏览器标签与轮询绑定）；没有这两项，登录页
+    能打开但流程不会完成；
+  - `/v2/plugin/login/account` 现在会**重试 pending 码 12151**（token 与
+    账号两个接口不同步，签完立刻查账号常收到「还没好」）；
+  - 支持 **WorkBuddy AI（www.workbuddy.ai）**：与国内 CodeBuddy 同协议、
+    不同站点，登录时按站点选（`platform=workbuddy` / `workbuddy-ai`）；
+  - 原有的 `LOCAL_ROUTER_WORKBUDDY_ENDPOINT` 覆盖仍生效。
 - **WorkBuddy 多账号**：登录态文件改成账号池（`workbuddy-session.json`），
   可登录多个账号（`workbuddy login --account <名字>`）、列出
   （`workbuddy accounts`）、切换（`workbuddy use <名字>`）；网关的请求在

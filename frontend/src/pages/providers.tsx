@@ -36,6 +36,45 @@ export default function ProvidersPage() {
     }))
     .filter((group) => group.presets.length > 0);
 
+  /**
+   * Sign in with a vendor that keeps its own browser session (WorkBuddy,
+   * QwenWork): open the vendor's page, then poll until the sign-in lands.
+   * The provider is wired up automatically.
+   */
+  const sessionSignIn = async (presetId: string) => {
+    setSigningIn(true);
+    try {
+      const flow = await api<{ url: string }>(`/api/providers/${encodeURIComponent(presetId)}/login`, {
+        method: "POST",
+      });
+      window.open(flow.url, "_blank", "noopener");
+      toast.success("A browser window opened — finish the sign-in there");
+      // Poll the vendor until it says the session is good.
+      const deadline = Date.now() + 5 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        try {
+          const status = await api<{ done: boolean; waiting: boolean; account?: string }>(
+            `/api/providers/${encodeURIComponent(presetId)}/login/status`,
+          );
+          if (status.done) {
+            toast.success(`Signed in${status.account ? ` as ${status.account}` : ""}`);
+            setShowAdd(false);
+            await reload();
+            return;
+          }
+        } catch {
+          // keep waiting; the vendor may still be signing in
+        }
+      }
+      toast.error("the sign-in timed out — try again");
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setSigningIn(false);
+    }
+  };
+
   /** Start the browser sign-in for a vendor that supports OAuth. */
   const signIn = async (presetId: string) => {
     setSigningIn(true);
@@ -214,6 +253,7 @@ export default function ProvidersPage() {
                           <span className="flex items-center gap-1.5">
                             <strong className="text-[11px] font-semibold">{preset.name}</strong>
                             {preset.oauth && <Badge variant="primary">OAUTH</Badge>}
+                            {preset.session_login && <Badge variant="primary">LOGIN</Badge>}
                           </span>
                           <small className="font-mono text-[9px] text-muted-foreground">
                             {preset.protocol} · {preset.key_hint}
@@ -237,7 +277,24 @@ export default function ProvidersPage() {
               <Field label="Base URL">
                 <Input value={form.url} onChange={(event) => setForm({ ...form, url: event.target.value })} />
               </Field>
-              {selected?.oauth ? (
+              {selected?.session_login ? (
+                <div className="grid gap-2 border border-primary/25 bg-primary/5 p-3">
+                  <strong className="text-[11px] text-primary">
+                    Sign in with {selected.name}
+                  </strong>
+                  <p className="text-[10px] text-muted-foreground">
+                    No API key needed: a browser window opens, you sign in with the vendor, and
+                    the session is kept on this machine (auto-renewed).
+                  </p>
+                  <Button
+                    variant="default"
+                    onClick={() => sessionSignIn(selected.id)}
+                    disabled={signingIn}
+                  >
+                    <LogIn /> {signingIn ? "Waiting for the sign-in…" : `Sign in with ${selected.name}`}
+                  </Button>
+                </div>
+              ) : selected?.oauth ? (
                 <div className="grid gap-2 border border-primary/25 bg-primary/5 p-3">
                   <strong className="text-[11px] text-primary">This vendor signs in with a browser</strong>
                   <p className="text-[10px] text-muted-foreground">

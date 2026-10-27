@@ -55,6 +55,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/providers/{id}/refresh", post(api_refresh_models))
         .route("/api/providers/{id}/test", post(api_test_provider))
         .route("/api/providers/{id}/oauth", post(api_oauth_start))
+        .route("/api/providers/{id}/login", post(api_session_login_start))
+        .route(
+            "/api/providers/{id}/login/status",
+            get(api_session_login_status),
+        )
         .route("/api/providers/{id}/oauth", get(api_oauth_status))
         // The vendor redirects the browser here after the user signed in.
         .route("/oauth/callback", get(oauth_callback))
@@ -262,8 +267,16 @@ async fn api_presets() -> Json<Value> {
                     "key_hint": p.key_hint,
                     "docs": p.docs,
                     // A vendor that supports a browser login says so, and the
-                    // console offers that instead of a key field.
+                    // console offers that instead of a key field:
+                    //   oauth    — a standard OAuth 2.0 sign-in;
+                    //   session  — the vendor's own login (WorkBuddy,
+                    //              QwenWork), no key involved.
                     "oauth": p.oauth.is_some(),
+                    "session_login": match p.auth {
+                        Some(crate::config::AuthKind::WorkBuddy) => Some("workbuddy"),
+                        Some(crate::config::AuthKind::QwenWork) => Some("qwenwork"),
+                        _ => None,
+                    },
                 })).collect::<Vec<_>>(),
             })
         })
@@ -862,6 +875,159 @@ async fn api_oauth_start(
             Json(json!({"error": err.to_string()})),
         )),
     }
+}
+
+/// Start a browser sign-in for a vendor that keeps its own session
+/// (WorkBuddy, QwenWork): no key, no OAuth — the vendor's own login page.
+///
+/// The console opens the returned URL and polls the status endpoint; the
+/// session lands in local-router's own 0600 file when the sign-in lands.
+async fn api_session_login_start(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let kind = {
+        let config = state.config.read().await;
+        config.provider(&id).and_then(|p| p.auth)
+    };
+    match kind {
+        Some(crate::config::AuthKind::WorkBuddy) => {
+            let session = crate::workbuddy::start_login().await.map_err(oauth_err)?;
+            crate::session_logins::remember(
+                &id,
+                crate::session_logins::Pending::WorkBuddy {
+                    state: session.state.clone(),
+                },
+            );
+            Ok(Json(
+                json!({"url": session.auth_url, "state": session.state}),
+            ))
+        }
+        Some(crate::config::AuthKind::QwenWork) => {
+            let session = crate::qwen::login::start_login().await.map_err(oauth_err)?;
+            crate::session_logins::remember(
+                &id,
+                crate::session_logins::Pending::QwenWork {
+                    state: session.state.clone(),
+                },
+            );
+            Ok(Json(json!({"url": session.auth_url})))
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "this vendor does not sign in with a browser session"})),
+        )),
+    }
+}
+
+/// Whether the browser sign-in finished, and what it produced.
+async fn api_session_login_status(
+    State(app_state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let pending = crate::session_logins::take_or_peek(&id);
+    let Some(pending) = pending else {
+        // Nothing in flight: the session file tells us whether it worked.
+        let signed_in = match crate::config::AuthKind::WorkBuddy {
+            crate::config::AuthKind::WorkBuddy => crate::workbuddy::read_session_file().is_ok(),
+            crate::config::AuthKind::QwenWork => crate::qwen::login::read_session_file().is_ok(),
+            crate::config::AuthKind::Stored => false,
+        };
+        return Ok(Json(json!({"done": signed_in, "waiting": false})));
+    };
+    match pending {
+        crate::session_logins::Pending::WorkBuddy { state } => {
+            match crate::workbuddy::poll_login(&state).await {
+                Ok(crate::workbuddy::LoginPoll::Waiting) => {
+                    Ok(Json(json!({"done": false, "waiting": true})))
+                }
+                Ok(crate::workbuddy::LoginPoll::Ready(result)) => {
+                    let nickname = result
+                        .account
+                        .get("nickname")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let _ = crate::workbuddy::store_session(
+                        &result.session,
+                        &result.account,
+                        "default",
+                    )
+                    .await;
+                    crate::session_logins::forget(&id);
+                    // Make sure the provider exists and is wired.
+                    wire_session_provider(&app_state, "workbuddy").await;
+                    Ok(Json(
+                        json!({"done": true, "waiting": false, "account": nickname}),
+                    ))
+                }
+                Err(err) => Err(oauth_err(err)),
+            }
+        }
+        crate::session_logins::Pending::QwenWork { state: login_state } => {
+            match crate::qwen::login::poll_login(&login_state).await {
+                Ok(crate::qwen::login::LoginPoll::Waiting) => {
+                    Ok(Json(json!({"done": false, "waiting": true})))
+                }
+                Ok(crate::qwen::login::LoginPoll::Ready(token)) => {
+                    let account = crate::qwen::login::login_account(&login_state, &token)
+                        .await
+                        .unwrap_or(serde_json::Value::Null);
+                    let nickname = account
+                        .get("nickname")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let _ = crate::qwen::login::store_session(
+                        &token,
+                        &account,
+                        &login_state.machine_id,
+                    )
+                    .await;
+                    crate::session_logins::forget(&id);
+                    wire_session_provider(&app_state, "qwenwork").await;
+                    Ok(Json(
+                        json!({"done": true, "waiting": false, "account": nickname}),
+                    ))
+                }
+                Err(err) => Err(oauth_err(err)),
+            }
+        }
+    }
+}
+
+/// Add the provider a session-backed vendor needs, if it is not there yet.
+async fn wire_session_provider(state: &AppState, kind: &str) {
+    let preset_id = match kind {
+        "workbuddy" => "workbuddy",
+        "qwenwork" => "qwenwork",
+        _ => return,
+    };
+    let has = {
+        let config = state.config.read().await;
+        config.provider(preset_id).is_some()
+    };
+    if has {
+        return;
+    }
+    let Some(preset) = crate::presets::get(preset_id) else {
+        return;
+    };
+    let provider = crate::presets::to_provider(preset, None);
+    let _ = state
+        .update(|config| {
+            config.providers.push(provider.clone());
+            Ok::<(), String>(())
+        })
+        .await;
+}
+
+/// Turn a login error into a JSON answer the console can show.
+fn oauth_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::BAD_GATEWAY,
+        Json(json!({"error": err.to_string()})),
+    )
 }
 
 /// Whether the sign-in finished, and what it produced.

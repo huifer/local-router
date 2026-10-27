@@ -17,10 +17,64 @@ use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Where WorkBuddy's API lives.
+/// The WorkBuddy builds local-router knows. They speak the same protocol
+/// but are separate accounts on separate hosts, so the site is picked at
+/// sign-in time (and remembered by the provider's endpoint).
+pub const SITES: &[WbSite] = &[
+    WbSite {
+        id: "workbuddy",
+        name: "WorkBuddy（腾讯 CodeBuddy）",
+        endpoint: "https://copilot.tencent.com",
+        platform: "workbuddy",
+        auth_id: "workbuddy-desktop",
+        default_domain: "www.codebuddy.cn",
+    },
+    WbSite {
+        id: "workbuddy-ai",
+        name: "WorkBuddy AI",
+        endpoint: "https://www.workbuddy.ai",
+        platform: "workbuddy-ai",
+        auth_id: "workbuddy-desktop-ai",
+        default_domain: "www.workbuddy.ai",
+    },
+];
+
+/// One WorkBuddy build.
+#[derive(Debug, Clone, Copy)]
+pub struct WbSite {
+    /// The provider suffix: `workbuddy` or `workbuddy-ai`.
+    pub id: &'static str,
+    pub name: &'static str,
+    /// Where its API and sign-in live.
+    pub endpoint: &'static str,
+    /// The `platform` the device flow asks for.
+    pub platform: &'static str,
+    /// The desktop app's session file name (without `.info`).
+    pub auth_id: &'static str,
+    /// The `X-Domain` to send when the account does not name one.
+    pub default_domain: &'static str,
+}
+
+/// The endpoint of one build, honouring the environment override (tests, a
+/// private deployment).
+pub fn endpoint_for(site: &WbSite) -> String {
+    std::env::var("LOCAL_ROUTER_WORKBUDDY_ENDPOINT")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| site.endpoint.to_string())
+}
+
+/// The site named `id`, or the China build when it is unknown.
+pub fn site_of(id: &str) -> &'static WbSite {
+    SITES.iter().find(|s| s.id == id).unwrap_or(&SITES[0])
+}
+
+/// Where WorkBuddy's API lives (the China build's host).
 pub const ENDPOINT: &str = "https://copilot.tencent.com";
 
 /// The API to talk to. A private deployment or a test can point it
@@ -49,12 +103,23 @@ pub const CHECKIN_PATH: &str = "/v2/billing/meter/checkin-activity-status";
 pub const CONFIG_PATH: &str = "/v3/config";
 
 /// Where a login session is opened, and where its outcome is polled.
-pub const AUTH_STATE_PATH: &str = "/v2/plugin/auth/state?platform=workbuddy";
+/// The sign-in state path, for one build's `platform`.
+pub fn auth_state_path(platform: &str) -> String {
+    format!("/v2/plugin/auth/state?platform={platform}")
+}
 pub const AUTH_TOKEN_PATH: &str = "/v2/plugin/auth/token?state=";
 pub const AUTH_ACCOUNT_PATH: &str = "/v2/plugin/login/account?state=";
 
 /// The login code the vendor answers while the browser is still waiting.
 const LOGIN_PENDING: i64 = 11217;
+
+/// The code the account endpoint answers while the token is not usable yet
+/// (the two calls are not always in step; magpie retries on this one too).
+const ACCOUNT_PENDING: i64 = 12151;
+
+/// The version the sign-in page is opened with. The page reads it to decide
+/// how to render and which flow to run, so it is not decoration.
+const APP_VERSION: &str = "2.0.0";
 
 /// The product name WorkBuddy expects in `X-Product`.
 const PRODUCT: &str = "WorkBuddy";
@@ -64,6 +129,13 @@ const CLIENT_VERSION: &str = "5.3.14";
 
 /// Refresh this long before the access token actually expires.
 const REFRESH_MARGIN: Duration = Duration::from_secs(300);
+
+/// A random hex id, for the sign-in page's per-tab session id.
+fn random_hex() -> String {
+    let mut bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// The shape of the session file WorkBuddy writes.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -793,6 +865,11 @@ pub enum LoginPoll {
 /// The caller opens the link in a browser, signs in, and then polls
 /// [`poll_login`] until it answers with the fresh session.
 pub async fn start_login() -> anyhow::Result<LoginSession> {
+    start_login_at(site_of("workbuddy")).await
+}
+
+/// Open a sign-in for one specific build (the China one or WorkBuddy AI).
+pub async fn start_login_at(site: &'static WbSite) -> anyhow::Result<LoginSession> {
     let mut headers = BTreeMap::new();
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
@@ -817,7 +894,11 @@ pub async fn start_login() -> anyhow::Result<LoginSession> {
     );
 
     let response = client()?
-        .post(format!("{}{AUTH_STATE_PATH}", endpoint()))
+        .post(format!(
+            "{}{}",
+            endpoint_for(site),
+            auth_state_path(site.platform)
+        ))
         .headers(to_header_map(&headers)?)
         .body("{}")
         .send()
@@ -848,7 +929,22 @@ pub async fn start_login() -> anyhow::Result<LoginSession> {
     if auth_url.is_empty() || state.is_empty() {
         anyhow::bail!("the login state did not carry a link; try again");
     }
-    Ok(LoginSession { auth_url, state })
+    // The sign-in page wants to know which build opened it, and a session id
+    // to tie this browser tab to the poll. Without both, the page can come
+    // up and never finish the flow.
+    let mut url = auth_url;
+    if !url.contains("version=") {
+        url.push(if url.contains('?') { '&' } else { '?' });
+        url.push_str(&format!("version={APP_VERSION}"));
+    }
+    if !url.contains("loginSessionId=") {
+        url.push('&');
+        url.push_str(&format!("loginSessionId={}", random_hex()));
+    }
+    Ok(LoginSession {
+        auth_url: url,
+        state,
+    })
 }
 
 /// Poll a login session once.
@@ -858,6 +954,11 @@ pub async fn start_login() -> anyhow::Result<LoginSession> {
 /// Once the browser side has signed in, the answer carries the tokens and
 /// the account, and the session is ready to use.
 pub async fn poll_login(state: &str) -> anyhow::Result<LoginPoll> {
+    poll_login_at(state, site_of("workbuddy")).await
+}
+
+/// Poll one build's sign-in.
+pub async fn poll_login_at(state: &str, site: &'static WbSite) -> anyhow::Result<LoginPoll> {
     let mut headers = BTreeMap::new();
     headers.insert("accept".to_string(), "application/json".to_string());
     headers.insert("x-product".to_string(), PRODUCT.to_string());
@@ -926,7 +1027,7 @@ pub async fn poll_login(state: &str) -> anyhow::Result<LoginPoll> {
         domain: data
             .get("domain")
             .and_then(Value::as_str)
-            .unwrap_or("www.codebuddy.cn")
+            .unwrap_or(site.default_domain)
             .to_string(),
         expires_at: expires_in.map(|seconds| now_ms() + seconds * 1000),
     };
@@ -948,24 +1049,42 @@ pub async fn login_account(session: &Session, state: &str) -> anyhow::Result<Val
         "x-codebuddy-no-department-info".to_string(),
         "true".to_string(),
     );
-    let response = client()?
-        .get(format!("{}{AUTH_ACCOUNT_PATH}{state}", endpoint()))
-        .headers(to_header_map(&headers)?)
-        .send()
-        .await
-        .context("the login account could not reach the server")?;
-    let status = response.status().as_u16();
-    let body: Value = response
-        .json()
-        .await
-        .context("the login account returned no json")?;
-    if !(200..300).contains(&status) {
-        anyhow::bail!(
-            "the login account was refused (HTTP {status}): {}",
-            message_of(&body)
-        );
+    // The token and the account are two calls that are not always in step:
+    // right after the token lands, the account endpoint may still answer
+    // "not yet" (code 12151). Retry it for a while before giving up.
+    let header_map = to_header_map(&headers)?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let response = client()?
+            .get(format!("{}{AUTH_ACCOUNT_PATH}{state}", endpoint()))
+            .headers(header_map.clone())
+            .send()
+            .await
+            .context("the login account could not reach the server")?;
+        let status = response.status().as_u16();
+        let body: Value = response
+            .json()
+            .await
+            .context("the login account returned no json")?;
+        let code = body.get("code").and_then(Value::as_i64).unwrap_or(0);
+        if code == ACCOUNT_PENDING || status == 408 || status == 429 {
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!(
+                    "the account never became ready after sign-in: {}",
+                    message_of(&body)
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            continue;
+        }
+        if !(200..300).contains(&status) || (code != 0 && code != ACCOUNT_PENDING) {
+            anyhow::bail!(
+                "the login account was refused (HTTP {status}): {}",
+                message_of(&body)
+            );
+        }
+        return Ok(body.get("data").cloned().unwrap_or(Value::Null));
     }
-    Ok(body.get("data").cloned().unwrap_or(Value::Null))
 }
 
 /// Store a finished login in local-router's own session file, next to the

@@ -11,6 +11,7 @@ pub mod projects;
 pub mod protocol;
 pub mod qwen;
 pub mod server;
+pub mod session_logins;
 pub mod sessions;
 pub mod store;
 pub mod web;
