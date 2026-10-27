@@ -16,6 +16,9 @@
 
 本项目为独立实现，只做网页模式 + CLI，不做桌面客户端。
 
+> **第一次用请看 [USAGE.md](USAGE.md)** —— 五分钟跑起来、日常命令速查、
+> 11 个常见场景的做法、排障问答。本 README 是项目全貌与设计说明。
+
 ## 快速开始
 
 ### 本地运行
@@ -389,7 +392,7 @@ local-router claude group/backup
 ```sh
 cargo fmt --all -- --check   # 格式
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                   # 220 个测试
+cargo test                   # 228 个测试
 #   src/ 内是 Rust 原生单元测试（#[cfg(test)]）：协议 IR 与四协议往返、
 #   COSY 信封、配置/价目/预设/会话/项目、用量聚合、上下文估算、
 #   URL 与帧解析、仪表盘渲染、控制台守卫源校验
@@ -407,6 +410,7 @@ cd frontend && npm run dev   # 控制台热更新（API 代理到 :3426）
 
 ## 参与贡献
 
+- [USAGE.md](USAGE.md)：使用说明（安装、命令速查、场景做法、排障）
 - [CONTRIBUTING.md](CONTRIBUTING.md)：环境搭建、提交前检查、怎么改
 - [SECURITY.md](SECURITY.md)：漏洞私下报告渠道与安全模型
 - [CHANGELOG.md](CHANGELOG.md)：每个版本的变更

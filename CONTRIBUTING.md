@@ -12,7 +12,7 @@ CLI。提交改动前请先读 README 的「范围与取舍」，明确不做的
 ```sh
 git clone <仓库地址> && cd local-router
 npm ci --prefix frontend          # 控制台依赖（锁定文件已提交）
-cargo test                        # 220 个测试（含 src/ 内的原生单元测试）
+cargo test                        # 228 个测试（含 src/ 内的原生单元测试）
 ```
 
 测试分两层：`src/` 内的 `#[cfg(test)]` 原生单元测试（纯逻辑，快）与
