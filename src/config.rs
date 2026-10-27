@@ -903,6 +903,10 @@ impl AppState {
 mod config_surface_tests {
     use super::*;
 
+    /// Environment variables are process-global, so the tests that touch
+    /// them must not run at the same time. One lock for all of them.
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Every field of the main config must survive a round trip through the
     /// file: a field that silently drops is a setting the user cannot set.
     #[test]
@@ -1008,6 +1012,7 @@ mod config_surface_tests {
     /// The env overlay only bends what it names; everything else is kept.
     #[test]
     fn the_env_overlay_keeps_the_file_values_it_does_not_name() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let settings = Settings {
             gateway_port: 4000,
             masking: true,
@@ -1023,6 +1028,7 @@ mod config_surface_tests {
 
 #[cfg(test)]
 mod precedence_tests {
+    use super::config_surface_tests::ENV_LOCK;
     use super::*;
 
     /// The port must come out of the file when the command line and the
@@ -1045,6 +1051,7 @@ mod precedence_tests {
     /// The environment still beats the file.
     #[test]
     fn the_env_beats_the_file_for_the_port() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut settings = Settings {
             gateway_port: 13555,
             ..Settings::default()
