@@ -4,6 +4,7 @@ import { getStatus, getGroups, getModels, getProviders } from "./api";
 import type { Group, ModelItem, Provider, Status } from "./types";
 import { AppShell } from "@/layout/app-shell";
 import { Toaster } from "@/components/ui";
+import { I18nProvider, useT } from "@/i18n";
 import OverviewPage from "@/pages/overview";
 import ProvidersPage from "@/pages/providers";
 import ModelsPage from "@/pages/models";
@@ -20,6 +21,15 @@ export interface AppData {
 }
 
 export default function App() {
+  return (
+    <I18nProvider>
+      <AppInner />
+    </I18nProvider>
+  );
+}
+
+function AppInner() {
+  const { t, setLocale } = useT();
   const [data, setData] = useState<AppData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const reload = useCallback(async () => {
@@ -42,15 +52,25 @@ export default function App() {
     reload().catch((e: Error) => setError(e.message));
   }, [reload]);
 
+  // The gateway's own setting decides the language, unless the browser
+  // already made a choice of its own.
+  useEffect(() => {
+    if (!data) return;
+    const stored = localStorage.getItem("local-router.locale");
+    if (!stored && data.status.settings.locale) {
+      setLocale(data.status.settings.locale === "zh-CN" ? "zh-CN" : "en");
+    }
+  }, [data, setLocale]);
+
   if (error) {
     return (
       <div className="grid min-h-dvh place-content-center justify-items-center gap-3 text-center">
         <div className="eyebrow">local-router</div>
         <p className="max-w-sm text-sm text-muted-foreground">
-          The control plane could not reach the gateway: {error}
+          {t("app.unreachable")}: {error}
         </p>
         <a href="/" className="text-xs text-primary hover:underline">
-          Retry
+          {t("app.retry")}
         </a>
       </div>
     );
@@ -60,7 +80,7 @@ export default function App() {
     return (
       <div className="grid min-h-dvh place-items-center gap-4">
         <div className="size-10 animate-spin rounded-full border border-input border-t-primary" />
-        <span className="eyebrow">initializing local-router control plane</span>
+        <span className="eyebrow">{t("app.loading")}</span>
       </div>
     );
   }

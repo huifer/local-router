@@ -7,12 +7,14 @@ import type { Provider } from "@/types";
 import type { Preset } from "@/types";
 import { api, getPresets } from "@/api";
 import {
-  Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
-  EmptyState, Field, Input,
+  Badge, Button, Card, Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+  EmptyState, Field, Input, Sheet, SheetBody, SheetContent, SheetDescription, SheetHeader, SheetTitle,
 } from "@/components/ui";
+import { useT } from "@/i18n";
 import { SectionToolbar, StatusDot } from "@/components/shared/bits";
 
 export default function ProvidersPage() {
+  const { t } = useT();
   const { data, reload } = useRouteLoaderData("shell") as { data: AppData; reload: () => Promise<void> };
   const [showAdd, setShowAdd] = useState(false);
   const [presets, setPresets] = useState<{ group: string; presets: Preset[] }[]>([]);
@@ -52,7 +54,7 @@ export default function ProvidersPage() {
         method: "POST",
       });
       window.open(flow.url, "_blank", "noopener");
-      toast.success("A browser window opened — finish the sign-in there");
+      toast.success(t("providers.browserOpened"));
       // Poll the vendor until it says the session is good.
       const deadline = Date.now() + 5 * 60 * 1000;
       while (Date.now() < deadline) {
@@ -62,7 +64,7 @@ export default function ProvidersPage() {
             `/api/providers/${encodeURIComponent(presetId)}/login/status`,
           );
           if (status.done) {
-            toast.success(`Signed in${status.account ? ` as ${status.account}` : ""}`);
+            toast.success(status.account ? t("providers.signedInAs", { name: status.account }) : t("providers.signedIn"));
             setShowAdd(false);
             await reload();
             return;
@@ -71,7 +73,7 @@ export default function ProvidersPage() {
           // keep waiting; the vendor may still be signing in
         }
       }
-      toast.error("the sign-in timed out — try again");
+      toast.error(t("providers.signInTimeout"));
     } catch (error) {
       toast.error((error as Error).message);
     } finally {
@@ -93,7 +95,7 @@ export default function ProvidersPage() {
       }
       const flow = await api<{ url: string }>(`/api/providers/${encodeURIComponent(presetId)}/oauth`, { method: "POST" });
       window.open(flow.url, "_blank", "noopener");
-      toast.success("A browser window opened — finish the sign-in there");
+      toast.success(t("providers.browserOpened"));
       await reload();
       setShowAdd(false);
     } catch (error) {
@@ -124,7 +126,7 @@ export default function ProvidersPage() {
           models: form.models.split(",").map((item) => item.trim()).filter(Boolean),
         },
       });
-      toast.success("Provider added");
+      toast.success(t("providers.added"));
       setShowAdd(false);
       setSelected(null);
       await reload();
@@ -145,10 +147,10 @@ export default function ProvidersPage() {
     }
   };
   const remove = async (provider: AppData["providers"][number]) => {
-    if (!window.confirm(`Remove ${provider.name}?`)) return;
+    if (!window.confirm(t("providers.removeConfirm", { name: provider.name }))) return;
     try {
       await api(`/api/providers/${encodeURIComponent(provider.id)}`, { method: "DELETE" });
-      toast.success("Provider removed");
+      toast.success(t("providers.removed"));
       await reload();
     } catch (error) {
       toast.error((error as Error).message);
@@ -158,11 +160,11 @@ export default function ProvidersPage() {
   return (
     <div className="grid gap-5 pt-7">
       <SectionToolbar
-        title="Registry / upstreams"
-        detail="Each provider is an isolated route into your model network."
+        title={t("providers.eyebrow")}
+        detail={t("providers.detail")}
         action={
           <Button variant="default" onClick={openAdd}>
-            <Plus /> Add provider
+            <Plus /> {t("providers.add")}
           </Button>
         }
       />
@@ -186,14 +188,14 @@ export default function ProvidersPage() {
                 <StatusDot active={provider.enabled} />
               </div>
               <div className="my-3.5 min-h-8 font-mono text-[10px] leading-relaxed text-muted-foreground break-all">
-                {provider.base_url ?? provider.anthropic_base_url ?? "No endpoint"}
+                {provider.base_url ?? provider.anthropic_base_url ?? t("providers.noEndpoint")}
               </div>
               <div className="flex gap-3 border-y border-border py-2.5 font-mono text-[10px] text-muted-foreground">
-                <span>{provider.auth ? "登录态" : `${provider.keys.length} key${provider.keys.length === 1 ? "" : "s"}`}</span>
-                <span>{provider.models.length} models</span>
-                {provider.media_models?.length ? <span>{provider.media_models.length} media</span> : null}
+                <span>{provider.auth ? t("providers.session") : t(provider.keys.length === 1 ? "providers.keys" : "providers.keysPlural", { n: provider.keys.length })}</span>
+                <span>{t("providers.models", { n: provider.models.length })}</span>
+                {provider.media_models?.length ? <span>{t("providers.media", { n: provider.media_models.length })}</span> : null}
                 <span className={provider.enabled ? "state-on" : "state-off"}>
-                  {provider.enabled ? "ACTIVE" : "PAUSED"}
+                  {provider.enabled ? t("providers.active") : t("providers.paused")}
                 </span>
               </div>
               <div className="flex min-h-14 flex-wrap content-start gap-1 py-3">
@@ -208,10 +210,10 @@ export default function ProvidersPage() {
               </button>
               <div className="flex items-center justify-between gap-2 border-t border-border pt-3">
                 <Button variant="ghost" size="sm" onClick={() => toggle(provider)}>
-                  {provider.enabled ? "Pause" : "Enable"}
+                  {provider.enabled ? t("providers.pause") : t("providers.enable")}
                 </Button>
                 <Button variant="destructive" size="sm" onClick={() => remove(provider)}>
-                  Remove
+                  {t("providers.remove")}
                 </Button>
               </div>
             </Card>
@@ -220,8 +222,8 @@ export default function ProvidersPage() {
       ) : (
         <Card>
           <EmptyState
-            title="No providers yet"
-            detail="Add an upstream so agents have somewhere to send requests."
+            title={t("providers.empty")}
+            detail={t("providers.emptyDetail")}
           />
         </Card>
       )}
@@ -231,7 +233,7 @@ export default function ProvidersPage() {
       <Dialog open={showAdd} onOpenChange={setShowAdd}>
         <DialogContent className="max-w-3xl">
           <DialogHeader>
-            <DialogTitle>Add provider</DialogTitle>
+            <DialogTitle>{t("providers.add")}</DialogTitle>
           </DialogHeader>
           <div className="grid min-h-80 grid-cols-[245px_1fr] max-[700px]:grid-cols-1">
             <div className="flex flex-col border-r border-border max-[700px]:border-r-0 max-[700px]:border-b">
@@ -241,7 +243,7 @@ export default function ProvidersPage() {
                   <Input
                     autoFocus
                     className="h-8 border-0 bg-transparent px-0 focus-visible:ring-0"
-                    placeholder="Search vendors…"
+                    placeholder={t("providers.searchPlaceholder")}
                     value={search}
                     onChange={(event) => setSearch(event.target.value)}
                   />
@@ -276,60 +278,54 @@ export default function ProvidersPage() {
                   ))
                 ) : (
                   <p className="px-2 py-6 text-center font-mono text-[10px] text-muted-foreground/70">
-                    No vendor matches “{search}”.<br />
-                    Switch to the form on the right to add it by hand.
+                    {t("providers.noVendorMatch", { q: search })}<br />
+                    {t("providers.noVendorMatchDetail")}
                   </p>
                 )}
               </div>
             </div>
             <div className="grid content-start gap-4 p-5">
-              <Field label="Name">
+              <Field label={t("providers.name")}>
                 <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
               </Field>
-              <Field label="Base URL">
+              <Field label={t("providers.baseUrl")}>
                 <Input value={form.url} onChange={(event) => setForm({ ...form, url: event.target.value })} />
               </Field>
               {selected?.session_login ? (
                 <div className="grid gap-2 border border-primary/25 bg-primary/5 p-3">
                   <strong className="text-[11px] text-primary">
-                    Sign in with {selected.name}
+                    {t("providers.sessionTitle", { name: selected.name })}
                   </strong>
-                  <p className="text-[10px] text-muted-foreground">
-                    No API key needed: a browser window opens, you sign in with the vendor, and
-                    the session is kept on this machine (auto-renewed).
-                  </p>
+                  <p className="text-[10px] text-muted-foreground">{t("providers.sessionDetail")}</p>
                   <Button
                     variant="default"
                     onClick={() => sessionSignIn(selected.id)}
                     disabled={signingIn}
                   >
-                    <LogIn /> {signingIn ? "Waiting for the sign-in…" : `Sign in with ${selected.name}`}
+                    <LogIn /> {signingIn ? t("providers.sessionWaiting") : t("providers.oauthButton", { name: selected.name })}
                   </Button>
                 </div>
               ) : selected?.oauth ? (
                 <div className="grid gap-2 border border-primary/25 bg-primary/5 p-3">
-                  <strong className="text-[11px] text-primary">This vendor signs in with a browser</strong>
-                  <p className="text-[10px] text-muted-foreground">
-                    No API key needed: a browser window opens, you sign in with the vendor, and the
-                    credential is stored on this machine.
-                  </p>
+                  <strong className="text-[11px] text-primary">{t("providers.oauthTitle")}</strong>
+                  <p className="text-[10px] text-muted-foreground">{t("providers.oauthDetail")}</p>
                   <Button variant="default" onClick={() => signIn(selected.id)} disabled={signingIn}>
-                    <LogIn /> {signingIn ? "Opening…" : "Sign in with " + selected.name}
+                    <LogIn /> {signingIn ? t("providers.oauthOpening") : t("providers.oauthButton", { name: selected.name })}
                   </Button>
                 </div>
               ) : (
-                <Field label="API key">
+                <Field label={t("providers.apiKey")}>
                   <Input type="password" value={form.key} onChange={(event) => setForm({ ...form, key: event.target.value })} />
                 </Field>
               )}
-              <Field label="Exposed models" help="Comma-separated model IDs. Leave empty and refresh the catalog later — auto_include fills it in.">
+              <Field label={t("providers.exposedModelsLabel")} help={t("providers.exposedModelsHelp")}>
                 <Input value={form.models} onChange={(event) => setForm({ ...form, models: event.target.value })} />
               </Field>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="secondary" onClick={() => setShowAdd(false)}>Cancel</Button>
-            <Button variant="default" onClick={create}>Add provider</Button>
+            <Button variant="secondary" onClick={() => setShowAdd(false)}>{t("providers.cancel")}</Button>
+            <Button variant="default" onClick={create}>{t("providers.add")}</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -338,52 +334,67 @@ export default function ProvidersPage() {
 }
 
 function ProviderDetail({ provider, onClose }: { provider: Provider | null; onClose: () => void }) {
+  const { t } = useT();
+  const yesNo = (value: boolean | undefined) => (value ? t("providers.yes") : t("providers.no"));
   return (
-    <Dialog open={Boolean(provider)} onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-2xl">
+    <Sheet open={Boolean(provider)} onOpenChange={(open) => !open && onClose()}>
+      <SheetContent>
         {provider && (
           <>
-            <DialogHeader>
-              <DialogTitle>{provider.name}</DialogTitle>
-              <DialogDescription>{provider.id} · {provider.protocol}</DialogDescription>
-            </DialogHeader>
-            <div className="grid gap-5 p-5">
-              <div className="grid grid-cols-3 gap-3 max-[600px]:grid-cols-1">
-                <DetailStat label="Status" value={provider.enabled ? "ACTIVE" : "PAUSED"} accent={provider.enabled} />
-                <DetailStat label="Models" value={String(provider.models.length)} />
-                <DetailStat label="Keys" value={provider.auth ? "SESSION" : String(provider.keys.length)} />
+            <SheetHeader>
+              <SheetTitle>{provider.name}</SheetTitle>
+              <SheetDescription>{provider.id} · {provider.protocol}</SheetDescription>
+            </SheetHeader>
+            <SheetBody>
+              <div className="grid grid-cols-3 gap-2 border-b border-border p-4">
+                <DetailStat label={t("providers.status")} value={provider.enabled ? t("providers.active") : t("providers.paused")} accent={provider.enabled} />
+                <DetailStat label={t("nav.models")} value={String(provider.models.length)} />
+                <DetailStat label={t("providers.keysLabel")} value={provider.auth ? t("providers.session") : String(provider.keys.length)} />
               </div>
-              <div className="grid gap-3">
-                <DetailRow label="Base URL" value={provider.base_url ?? "—"} />
-                <DetailRow label="Anthropic URL" value={provider.anthropic_base_url ?? "—"} />
-                <DetailRow label="Responses URL" value={provider.responses_base_url ?? "—"} />
-                <DetailRow label="Gemini URL" value={provider.gemini_base_url ?? "—"} />
-                <DetailRow label="Catalog" value={provider.catalog ?? "—"} />
-                <DetailRow label="Group only" value={provider.group_only ? "yes" : "no"} />
-                <DetailRow label="Stream only" value={provider.stream_only ? "yes" : "no"} />
-                <DetailRow label="Auto include" value={provider.auto_include?.join(", ") || "—"} />
-                <DetailRow label="Forward headers" value={provider.forward_headers?.join(", ") || "—"} />
-                <DetailRow label="Remove headers" value={provider.remove_headers?.join(", ") || "—"} />
-                <DetailRow label="User-Agent" value={provider.user_agent || "default"} />
+              <div className="grid gap-0 px-4 py-2">
+                <DetailRow label={t("providers.baseUrl")} value={provider.base_url ?? "—"} />
+                <DetailRow label={t("providers.anthropicUrl")} value={provider.anthropic_base_url ?? "—"} />
+                <DetailRow label={t("providers.responsesUrl")} value={provider.responses_base_url ?? "—"} />
+                <DetailRow label={t("providers.geminiUrl")} value={provider.gemini_base_url ?? "—"} />
+                <DetailRow label={t("providers.chatPath")} value={provider.chat_path ?? t("providers.default")} />
+                <DetailRow label={t("providers.catalog")} value={provider.catalog ?? "—"} />
+                <DetailRow label={t("providers.authKind")} value={provider.auth ? t("providers.credentialSession") : t("providers.credentialKey")} />
+                <DetailRow label={t("providers.groupOnly")} value={yesNo(provider.group_only)} />
+                <DetailRow label={t("providers.streamOnly")} value={yesNo(provider.stream_only)} />
+                <DetailRow label={t("providers.holdWhenExhausted")} value={yesNo(provider.hold_when_exhausted)} />
+                <DetailRow label={t("providers.autoInclude")} value={provider.auto_include?.join(", ") || "—"} />
+                <DetailRow label={t("providers.forwardHeaders")} value={provider.forward_headers?.join(", ") || "—"} />
+                <DetailRow label={t("providers.removeHeaders")} value={provider.remove_headers?.join(", ") || "—"} />
+                <DetailRow label={t("providers.userAgent")} value={provider.user_agent || t("providers.default")} />
               </div>
-              <div>
-                <div className="eyebrow mb-2">Exposed models</div>
+              <div className="border-t border-border p-4">
+                <div className="eyebrow mb-2">{t("providers.exposedModels")}</div>
                 <div className="flex flex-wrap gap-1.5">
-                  {provider.models.length ? provider.models.map((model) => <Badge key={model}>{model}</Badge>) : <span className="font-mono text-[10px] text-muted-foreground">No models exposed</span>}
+                  {provider.models.length
+                    ? provider.models.map((model) => <Badge key={model}>{model}</Badge>)
+                    : <span className="font-mono text-[10px] text-muted-foreground">{t("providers.noModels")}</span>}
                 </div>
               </div>
-            </div>
+              {provider.media_models?.length ? (
+                <div className="border-t border-border p-4">
+                  <div className="eyebrow mb-2">{t("providers.mediaModels")}</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {provider.media_models.map((model) => <Badge key={model} variant="primary">{model}</Badge>)}
+                  </div>
+                </div>
+              ) : null}
+            </SheetBody>
           </>
         )}
-      </DialogContent>
-    </Dialog>
+      </SheetContent>
+    </Sheet>
   );
 }
 
 function DetailStat({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) {
-  return <div className="border border-border bg-secondary/50 p-3"><div className="eyebrow">{label}</div><strong className={`mt-2 block font-mono text-xl ${accent ? "text-primary" : ""}`}>{value}</strong></div>;
+  return <div className="border border-border bg-secondary/50 p-2.5"><div className="eyebrow">{label}</div><strong className={`mt-1.5 block font-mono text-base ${accent ? "text-primary" : ""}`}>{value}</strong></div>;
 }
 
 function DetailRow({ label, value }: { label: string; value: string }) {
-  return <div className="grid grid-cols-[130px_1fr] gap-4 border-b border-border/70 py-2.5 last:border-b-0 max-[500px]:grid-cols-1"><span className="eyebrow">{label}</span><span className="break-all font-mono text-[11px] text-muted-foreground">{value}</span></div>;
+  return <div className="grid grid-cols-[120px_1fr] gap-3 border-b border-border/60 py-2 last:border-b-0"><span className="eyebrow">{label}</span><span className="break-all font-mono text-[11px] text-muted-foreground">{value}</span></div>;
 }

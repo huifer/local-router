@@ -10,6 +10,7 @@ import {
   EmptyState, Field, Input, Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from "@/components/ui";
 import { SectionToolbar, StatusDot } from "@/components/shared/bits";
+import { useT } from "@/i18n";
 
 const routingOptions = [
   { value: "order", label: "order — primary then failover" },
@@ -37,13 +38,14 @@ function useMemberCatalog() {
 }
 
 export default function GroupsPage() {
+  const { t } = useT();
   const { data, reload } = useRouteLoaderData("shell") as { data: AppData; reload: () => Promise<void> };
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ name: "", members: [] as string[], routing: "order", stays: "auto" });
 
   const create = async () => {
     if (!form.members.length) {
-      toast.error("Pick at least one model for the group");
+      toast.error(t("groups.needMember"));
       return;
     }
     try {
@@ -57,7 +59,7 @@ export default function GroupsPage() {
           listed: true,
         },
       });
-      toast.success("Routing group added");
+      toast.success(t("groups.added"));
       setShowAdd(false);
       setForm({ name: "", members: [], routing: "order", stays: "auto" });
       await reload();
@@ -66,10 +68,10 @@ export default function GroupsPage() {
     }
   };
   const remove = async (group: Group) => {
-    if (!window.confirm(`Remove ${group.name}?`)) return;
+    if (!window.confirm(t("groups.removeConfirm", { name: group.name }))) return;
     try {
       await api(`/api/groups/${encodeURIComponent(group.id)}`, { method: "DELETE" });
-      toast.success("Routing group removed");
+      toast.success(t("groups.removed"));
       await reload();
     } catch (error) {
       toast.error((error as Error).message);
@@ -79,11 +81,11 @@ export default function GroupsPage() {
   return (
     <div className="grid gap-5 pt-7">
       <SectionToolbar
-        title="Router / policy sets"
-        detail="Turn several upstream models into one resilient endpoint."
+        title={t("groups.eyebrow")}
+        detail={t("groups.detail")}
         action={
           <Button variant="default" onClick={() => setShowAdd(true)} disabled={!data.models.length}>
-            <Plus /> Add routing group
+            <Plus /> {t("groups.add")}
           </Button>
         }
       />
@@ -91,8 +93,8 @@ export default function GroupsPage() {
       {!data.models.length ? (
         <Card>
           <EmptyState
-            title="No models to group yet"
-            detail="A routing group is built from the models your providers expose. Add a provider first, then come back."
+            title={t("groups.emptyNoModels")}
+            detail={t("groups.emptyNoModelsDetail")}
           />
         </Card>
       ) : data.groups.length ? (
@@ -107,9 +109,9 @@ export default function GroupsPage() {
                 <Badge variant="primary">{group.routing}</Badge>
               </div>
               <div className="my-5 mb-3 flex items-center gap-2">
-                <span className="eyebrow">stays</span>
+                <span className="eyebrow">{t("groups.stays")}</span>
                 <strong className="font-mono text-[11px]">{group.stays}</strong>
-                <span className="eyebrow ml-auto">members</span>
+                <span className="eyebrow ml-auto">{t("groups.members")}</span>
                 <strong className="font-mono text-[11px]">{group.models.length.toString().padStart(2, "0")}</strong>
               </div>
               <div className="border-t border-border">
@@ -121,7 +123,7 @@ export default function GroupsPage() {
                       <span className="truncate">{model}</span>
                       <Badge className="ml-auto shrink-0">{owner}</Badge>
                       {index === 0 && group.routing === "order" && (
-                        <em className="shrink-0 font-mono text-[9px] not-italic text-ring">PRIMARY</em>
+                        <em className="shrink-0 font-mono text-[9px] not-italic text-ring">{t("groups.primary")}</em>
                       )}
                     </div>
                   );
@@ -129,9 +131,9 @@ export default function GroupsPage() {
               </div>
               <div className="mt-3 flex items-center justify-between border-t border-border pt-3">
                 <span className="flex items-center gap-2 font-mono text-[10px] text-muted-foreground">
-                  <StatusDot /> route ready
+                  <StatusDot /> {t("groups.routeReady")}
                 </span>
-                <Button variant="destructive" size="sm" onClick={() => remove(group)}>Remove</Button>
+                <Button variant="destructive" size="sm" onClick={() => remove(group)}>{t("groups.remove")}</Button>
               </div>
             </Card>
           ))}
@@ -139,8 +141,8 @@ export default function GroupsPage() {
       ) : (
         <Card>
           <EmptyState
-            title="No routing groups"
-            detail="Pick a few of your exposed models and the gateway will fail over between them."
+            title={t("groups.empty")}
+            detail={t("groups.emptyDetail")}
           />
         </Card>
       )}
@@ -148,28 +150,25 @@ export default function GroupsPage() {
       <Dialog open={showAdd} onOpenChange={setShowAdd}>
         <DialogContent className="max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Create routing group</DialogTitle>
+            <DialogTitle>{t("groups.create")}</DialogTitle>
           </DialogHeader>
           <div className="grid gap-4 px-5 py-5">
-            <Field label="Group name">
+            <Field label={t("groups.groupName")}>
               <Input
                 autoFocus
                 value={form.name}
-                placeholder="Daily fallback"
+                placeholder={t("groups.groupNamePlaceholder")}
                 onChange={(event) => setForm({ ...form, name: event.target.value })}
               />
             </Field>
-            <Field
-              label="Members"
-              help="Pick from the models your providers already expose. The first one answers first under `order`."
-            >
+            <Field label={t("groups.membersLabel")} help={t("groups.membersHelp")}>
               <MemberPicker
                 selected={form.members}
                 onChange={(members) => setForm({ ...form, members })}
               />
             </Field>
             <div className="grid grid-cols-2 gap-3.5 max-[500px]:grid-cols-1">
-              <Field label="Routing">
+              <Field label={t("groups.routing")}>
                 <Select value={form.routing} onValueChange={(value) => setForm({ ...form, routing: value })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -179,7 +178,7 @@ export default function GroupsPage() {
                   </SelectContent>
                 </Select>
               </Field>
-              <Field label="Session affinity">
+              <Field label={t("groups.affinity")}>
                 <Select value={form.stays} onValueChange={(value) => setForm({ ...form, stays: value })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -193,11 +192,11 @@ export default function GroupsPage() {
           </div>
           <DialogFooter>
             <span className="mr-auto font-mono text-[10px] text-muted-foreground">
-              {form.members.length} member{form.members.length === 1 ? "" : "s"} selected
+              {t(form.members.length === 1 ? "groups.selectedCount" : "groups.selectedCountPlural", { n: form.members.length })}
             </span>
-            <Button variant="secondary" onClick={() => setShowAdd(false)}>Cancel</Button>
+            <Button variant="secondary" onClick={() => setShowAdd(false)}>{t("groups.cancel")}</Button>
             <Button variant="default" onClick={create} disabled={!form.members.length}>
-              Create group
+              {t("groups.createButton")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -213,6 +212,7 @@ export default function GroupsPage() {
  * clicking it off and on again.
  */
 function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (next: string[]) => void }) {
+  const { t } = useT();
   const catalog = useMemberCatalog();
   const [query, setQuery] = useState("");
 
@@ -241,7 +241,7 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
         <Search className="size-3.5 shrink-0" />
         <Input
           className="h-8 border-0 bg-transparent px-0 focus-visible:ring-0"
-          placeholder="Search models…"
+          placeholder={t("groups.searchModels")}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
@@ -254,7 +254,7 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
             <div key={provider} className="border-b border-border last:border-b-0">
               <div className="flex items-center gap-2 bg-secondary/60 px-3 py-2">
                 <span className="eyebrow">{provider}</span>
-                <span className="font-mono text-[9px] text-muted-foreground/60">{visible.length} models</span>
+                <span className="font-mono text-[9px] text-muted-foreground/60">{t("groups.modelsCount", { n: visible.length })}</span>
               </div>
               {visible.map((model) => {
                 const index = selected.indexOf(model.id);
@@ -284,7 +284,7 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
         })}
         {!catalog.length && (
           <p className="px-3 py-6 text-center font-mono text-[10px] text-muted-foreground/70">
-            No models exposed yet.
+            {t("groups.noModelsExposed")}
           </p>
         )}
       </div>
@@ -294,7 +294,7 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
             <button
               key={id}
               onClick={() => toggle(id)}
-              title="Click to remove"
+              title={t("groups.removeMemberHint")}
               className="flex cursor-pointer items-center gap-1.5 border border-primary/30 bg-primary/5 px-1.5 py-1 font-mono text-[10px] text-primary hover:border-destructive/40 hover:text-destructive"
             >
               <span className="opacity-70">{index + 1}</span>

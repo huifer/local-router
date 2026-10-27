@@ -10,35 +10,39 @@ import {
   RefreshCw,
   Router as RouterIcon,
   Settings2,
+  UserRound,
 } from "lucide-react";
 import type { AppData } from "@/App";
 import { Button } from "@/components/ui";
+import { useT } from "@/i18n";
+import { LOCALES } from "@/i18n/messages";
 import { cn } from "@/lib/utils";
 
 const nav = [
-  { to: "/overview", label: "Overview", icon: LayoutGrid },
-  { to: "/providers", label: "Providers", icon: Cpu },
-  { to: "/models", label: "Models", icon: Layers },
-  { to: "/groups", label: "Routing groups", icon: AudioLines },
-  { to: "/usage", label: "Usage", icon: KeyRound },
-  { to: "/accounts", label: "Accounts", icon: KeyRound },
-  { to: "/settings", label: "Settings", icon: Settings2 },
+  { to: "/overview", key: "nav.overview", icon: LayoutGrid },
+  { to: "/providers", key: "nav.providers", icon: Cpu },
+  { to: "/models", key: "nav.models", icon: Layers },
+  { to: "/groups", key: "nav.groups", icon: AudioLines },
+  { to: "/usage", key: "nav.usage", icon: KeyRound },
+  { to: "/accounts", key: "nav.accounts", icon: UserRound },
+  { to: "/settings", key: "nav.settings", icon: Settings2 },
 ] as const;
 
-const titles: Record<string, string> = {
-  "/overview": "Overview",
-  "/providers": "Providers",
-  "/models": "Models",
-  "/groups": "Routing groups",
-  "/usage": "Usage",
-  "/accounts": "Accounts",
-  "/settings": "Settings",
+const titleKeys: Record<string, string> = {
+  "/overview": "nav.overview",
+  "/providers": "nav.providers",
+  "/models": "nav.models",
+  "/groups": "nav.groups",
+  "/usage": "nav.usage",
+  "/accounts": "nav.accounts",
+  "/settings": "nav.settings",
 };
 
 export function AppShell({ data, reload, children }: { data: AppData; reload: () => Promise<void>; children?: ReactNode }) {
   const location = useLocation();
   const [busy, setBusy] = useState(false);
-  const title = titles[location.pathname] ?? "Overview";
+  const { t, locale, setLocale } = useT();
+  const title = t(titleKeys[location.pathname] ?? "nav.overview");
   const online = true; // The shell only renders once the first status fetch succeeded.
 
   useEffect(() => {
@@ -70,7 +74,7 @@ export function AppShell({ data, reload, children }: { data: AppData; reload: ()
             </div>
           </div>
         </div>
-        <div className="eyebrow px-3 pb-2.5">Workspace</div>
+        <div className="eyebrow px-3 pb-2.5">{t("app.workspace")}</div>
         <nav className="grid gap-0.5 max-[900px]:flex max-[900px]:overflow-x-auto" aria-label="Primary navigation">
           {nav.map((item) => (
             <NavLink
@@ -88,7 +92,7 @@ export function AppShell({ data, reload, children }: { data: AppData; reload: ()
               {({ isActive }) => (
                 <>
                   <item.icon className={cn("size-4", isActive && "text-primary")} />
-                  <span>{item.label}</span>
+                  <span>{t(item.key)}</span>
                   {isActive && <i className="absolute inset-y-2 right-[-1px] w-0.5 bg-primary max-[900px]:inset-x-2 max-[900px]:bottom-0.5 max-[900px]:top-auto max-[900px]:h-0.5 max-[900px]:w-auto" />}
                 </>
               )}
@@ -99,14 +103,34 @@ export function AppShell({ data, reload, children }: { data: AppData; reload: ()
           <div className="flex items-center gap-2.5">
             <StatusDot active={online} />
             <div>
-              <strong className="block text-[11px] font-semibold">Gateway online</strong>
+              <strong className="block text-[11px] font-semibold">{t("app.online")}</strong>
               <span className="mt-1 block font-mono text-[10px] text-muted-foreground/70">
                 {data.status.settings.gateway_addr}:{data.status.settings.gateway_port}
               </span>
             </div>
           </div>
           <div className="mt-6 font-mono text-[8px] uppercase leading-7 tracking-[0.13em] text-muted-foreground/60">
-            local only / api keys stay here
+            {t("app.localOnly")}
+          </div>
+          <div className="mt-3 flex items-center gap-1">
+            {LOCALES.map((item) => (
+              <button
+                key={item.id}
+                onClick={() => setLocale(item.id)}
+                title={item.label}
+                className={cn(
+                  "cursor-pointer rounded-sm border px-1.5 py-0.5 font-mono text-[9px] uppercase transition-colors",
+                  locale === item.id
+                    ? "border-primary/40 bg-primary/10 text-primary"
+                    : "border-border text-muted-foreground hover:text-foreground",
+                )}
+              >
+                {item.short}
+              </button>
+            ))}
+            <span className="ml-1 font-mono text-[8px] uppercase tracking-[0.1em] text-muted-foreground/50">
+              {t("app.language")}
+            </span>
           </div>
         </div>
       </aside>
@@ -121,20 +145,20 @@ export function AppShell({ data, reload, children }: { data: AppData; reload: ()
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-2 border border-border bg-secondary px-3 py-2 font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground max-[700px]:hidden">
               <StatusDot active={online} />
-              <span>runtime ready</span>
+              <span>{t("app.runtimeReady")}</span>
               <RouterIcon className="size-3.5 opacity-60" />
               <Cpu className="size-3.5 opacity-60" />
             </div>
-            <Button variant="secondary" onClick={refresh} disabled={busy} aria-label="Refresh workspace">
+            <Button variant="secondary" onClick={refresh} disabled={busy} aria-label={t("app.refreshAria")}>
               <RefreshCw className={cn(busy && "animate-spin")} />
-              Refresh
+              {t("app.refresh")}
             </Button>
             <a
               href="https://github.com/huifer/local-router/blob/master/USAGE.md"
               target="_blank"
               rel="noreferrer"
               className="hidden size-9 items-center justify-center rounded-md border border-input text-muted-foreground transition-colors hover:text-foreground max-[700px]:hidden sm:inline-flex"
-              aria-label="Usage documentation"
+              aria-label={t("app.docs")}
             >
               <ArrowUpRight className="size-4" />
             </a>

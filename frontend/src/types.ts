@@ -61,6 +61,8 @@ export interface Provider {
   chat_path?: string;
   /** The upstream only answers streaming requests. */
   stream_only?: boolean;
+  /** The upstream is held back while its quota window is empty. */
+  hold_when_exhausted?: boolean;
   /** The models this provider offers for image and video work. */
   media_models?: string[];
 }

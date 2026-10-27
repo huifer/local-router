@@ -8,6 +8,13 @@
 
 ### Added
 
+- **控制台国际化（English / 简体中文）**：所有界面文案抽到 `src/i18n/messages.ts`
+  的双语词典，组件通过 `useT()` 取文案（`{name}` 变量插值）；侧边栏底部
+  `EN` / `中` 一键切换，选择持久化到网关设置 `settings.locale`，未手动选择时
+  按系统语言自动判定。
+- **供应商详情改为右侧抽屉**（shadcn Sheet）：点击卡片从右侧滑出，展示状态、
+  端点、凭据来源、对话路径、暴露模型、媒体模型与全部请求头规则。
+
 - **上游 OAuth 浏览器登录**：provider 新增 `oauth` 配置（授权端点 / 令牌端点 /
   client_id / scopes / 交换风格），网关内置**通用 OAuth 2.0 + PKCE 引擎**：
   - 控制台「Add provider」里，带 OAuth 的厂商（OpenRouter 已内置）显示

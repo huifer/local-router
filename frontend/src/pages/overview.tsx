@@ -14,8 +14,10 @@ import { formatTime } from "@/components/shared/bits";
 import type { AppData } from "@/App";
 import type { UsageData, WorkBuddyStatus } from "@/types";
 import { getUsage, getWorkBuddy } from "@/api";
+import { useT } from "@/i18n";
 
 export default function OverviewPage() {
+  const { t } = useT();
   const { data } = useRouteLoaderData("shell") as { data: AppData };
   const navigate = useNavigate();
   const [usage, setUsage] = useState<UsageData | null>(null);
@@ -37,28 +39,28 @@ export default function OverviewPage() {
     <div className="grid gap-5 pt-7">
       <div className="grid grid-cols-[1.7fr_0.7fr_0.7fr] gap-3 max-[1100px]:grid-cols-1 max-[700px]:grid-cols-1">
         <div className="signal-card signal-wide">
-          <span className="eyebrow">System status</span>
+          <span className="eyebrow">{t("overview.systemStatus")}</span>
           <div className="flex items-center gap-2.5">
             <span className="inline-block size-2 rounded-full bg-primary shadow-[0_0_0_4px_rgba(158,240,191,0.08)]" />
-            <strong className="text-sm font-bold">Gateway operational</strong>
+            <strong className="text-sm font-bold">{t("overview.operational")}</strong>
           </div>
           <div>
-            <span className="text-[11px] text-muted-foreground">All request paths are accepting traffic</span>
+            <span className="text-[11px] text-muted-foreground">{t("overview.operationalDetail")}</span>
             <div className="mt-1.5 font-mono text-[11px] text-primary">{endpoint}</div>
           </div>
         </div>
         <div className="signal-card">
-          <span className="eyebrow">Providers</span>
+          <span className="eyebrow">{t("overview.providers")}</span>
           <div>
             <strong className="metric-value">{data.providers.length.toString().padStart(2, "0")}</strong>
-            <span className="metric-detail mt-2 block">configured upstreams</span>
+            <span className="metric-detail mt-2 block">{t("overview.providersDetail")}</span>
           </div>
         </div>
         <div className="signal-card">
-          <span className="eyebrow">Models</span>
+          <span className="eyebrow">{t("overview.models")}</span>
           <div>
             <strong className="metric-value">{data.models.length.toString().padStart(2, "0")}</strong>
-            <span className="metric-detail mt-2 block">available endpoints</span>
+            <span className="metric-detail mt-2 block">{t("overview.modelsDetail")}</span>
           </div>
         </div>
       </div>
@@ -66,16 +68,16 @@ export default function OverviewPage() {
       <div className="grid grid-cols-[1.2fr_0.8fr] gap-5 max-[1100px]:grid-cols-1">
         <Card>
           <CardHeader>
-            <CardDescription className="eyebrow">01 / quick access</CardDescription>
-            <CardTitle>Operator surface</CardTitle>
+            <CardDescription className="eyebrow">{t("overview.quickAccess")}</CardDescription>
+            <CardTitle>{t("overview.operatorSurface")}</CardTitle>
           </CardHeader>
           <CardContent className="p-0">
             <div className="grid grid-cols-2 gap-px bg-border max-[700px]:grid-cols-1">
               {[
-                { label: "Manage providers", detail: "Keys, endpoints, model catalog", to: "/providers", icon: "server" as const },
-                { label: "Configure routing", detail: "Failover, rotation, affinity", to: "/groups", icon: "activity" as const },
-                { label: "Browse model map", detail: "Every exposed model in one view", to: "/models", icon: "layers" as const },
-                { label: "Inspect usage", detail: "Tokens, latency, request history", to: "/usage", icon: "grid" as const },
+                { label: t("overview.manageProviders"), detail: t("overview.manageProvidersDetail"), to: "/providers", icon: "server" as const },
+                { label: t("overview.configureRouting"), detail: t("overview.configureRoutingDetail"), to: "/groups", icon: "activity" as const },
+                { label: t("overview.browseModels"), detail: t("overview.browseModelsDetail"), to: "/models", icon: "layers" as const },
+                { label: t("overview.inspectUsage"), detail: t("overview.inspectUsageDetail"), to: "/usage", icon: "grid" as const },
               ].map((item) => (
                 <button
                   key={item.to}
@@ -95,8 +97,8 @@ export default function OverviewPage() {
         </Card>
         <Card>
           <CardHeader>
-            <CardDescription className="eyebrow">02 / connection</CardDescription>
-            <CardTitle>Agent environment</CardTitle>
+            <CardDescription className="eyebrow">{t("overview.connection")}</CardDescription>
+            <CardTitle>{t("overview.agentEnv")}</CardTitle>
           </CardHeader>
           <div className="code-block">
             <div className="grid grid-cols-[180px_15px_1fr] max-[500px]:grid-cols-1">
@@ -116,7 +118,7 @@ export default function OverviewPage() {
             </div>
           </div>
           <div className="flex items-center gap-2 border-t border-border px-4 py-3 font-mono text-[10px] text-muted-foreground/80">
-            <Terminal className="size-3.5" /> Export these variables to connect any compatible agent.
+            <Terminal className="size-3.5" /> {t("overview.envFootnote")}
           </div>
         </Card>
       </div>
@@ -125,14 +127,14 @@ export default function OverviewPage() {
         <Card>
           <CardHeader className="flex-row items-center justify-between">
             <div>
-              <CardDescription className="eyebrow">03 / live feed</CardDescription>
-              <CardTitle>Recent requests</CardTitle>
+              <CardDescription className="eyebrow">{t("overview.liveFeed")}</CardDescription>
+              <CardTitle>{t("overview.recentRequests")}</CardTitle>
             </div>
             <button
               className="cursor-pointer border-0 bg-transparent font-mono text-[11px] text-primary hover:underline focus-visible:outline-none"
               onClick={() => navigate("/usage")}
             >
-              View all ↗
+              {t("overview.viewAll")} ↗
             </button>
           </CardHeader>
           {recent.length ? (
@@ -142,13 +144,13 @@ export default function OverviewPage() {
               ))}
             </div>
           ) : (
-            <EmptyState title="No requests yet" detail="Traffic will appear here when an agent connects." />
+            <EmptyState title={t("overview.noRequests")} detail={t("overview.noRequestsDetail")} />
           )}
         </Card>
         <Card>
           <CardHeader>
-            <CardDescription className="eyebrow">04 / routing posture</CardDescription>
-            <CardTitle>Groups at a glance</CardTitle>
+            <CardDescription className="eyebrow">{t("overview.routingPosture")}</CardDescription>
+            <CardTitle>{t("overview.groupsAtGlance")}</CardTitle>
           </CardHeader>
           <div className="px-5 py-2">
             {data.groups.length ? (
@@ -164,7 +166,7 @@ export default function OverviewPage() {
                 </div>
               ))
             ) : (
-              <EmptyState title="No routing groups" detail="Create a group to add failover or rotation." />
+              <EmptyState title={t("overview.noGroups")} detail={t("overview.noGroupsDetail")} />
             )}
           </div>
         </Card>
@@ -172,8 +174,8 @@ export default function OverviewPage() {
 
       <Card>
         <CardHeader>
-          <CardDescription className="eyebrow">05 / account</CardDescription>
-          <CardTitle>WorkBuddy session</CardTitle>
+          <CardDescription className="eyebrow">{t("overview.account")}</CardDescription>
+          <CardTitle>{t("overview.workbuddySession")}</CardTitle>
         </CardHeader>
         <WorkBuddySection status={workbuddy} />
       </Card>
@@ -211,13 +213,14 @@ function RequestRow({ record }: { record: UsageData["recent"][number] }) {
 }
 
 function WorkBuddySection({ status }: { status: WorkBuddyStatus | null }) {
+  const { t } = useT();
   if (!status) {
-    return <EmptyState title="Reading the session" detail="Looking for the local WorkBuddy login." />;
+    return <EmptyState title={t("overview.readingSession")} detail={t("overview.readingSessionDetail")} />;
   }
   if (!status.signed_in) {
     return (
       <EmptyState
-        title="Not signed in to WorkBuddy"
+        title={t("overview.notSignedIn")}
         detail={status.note ?? "Run local-router workbuddy login to sign in with a browser."}
       />
     );
@@ -228,38 +231,38 @@ function WorkBuddySection({ status }: { status: WorkBuddyStatus | null }) {
     <div className="grid gap-4 p-5">
       <div className="grid grid-cols-4 gap-3 max-[900px]:grid-cols-2">
         <div className="signal-card min-h-28">
-          <span className="eyebrow">Account</span>
+          <span className="eyebrow">{t("overview.accountLabel")}</span>
           <div>
             <strong className="metric-value text-2xl">{status.account?.nickname || "signed in"}</strong>
             <span className="metric-detail mt-1.5 block">{status.account?.type || "personal"}</span>
           </div>
         </div>
         <div className="signal-card min-h-28">
-          <span className="eyebrow">Credits left</span>
+          <span className="eyebrow">{t("overview.creditsLeft")}</span>
           <div>
             <strong className="metric-value text-2xl">{credits?.remaining ?? 0}</strong>
             <span className="metric-detail mt-1.5 block">of {credits?.capacity ?? 0} this cycle</span>
           </div>
         </div>
         <div className="signal-card min-h-28">
-          <span className="eyebrow">Check-in</span>
+          <span className="eyebrow">{t("overview.checkIn")}</span>
           <div>
             <strong className="metric-value text-2xl">{checkin ? (checkin.checked_in_today ? "DONE" : "TODO") : "--"}</strong>
             <span className="metric-detail mt-1.5 block">{checkin ? `streak ${checkin.streak_days} days` : "unknown"}</span>
           </div>
         </div>
         <div className="signal-card min-h-28">
-          <span className="eyebrow">Token</span>
+          <span className="eyebrow">{t("overview.token")}</span>
           <div>
             <strong className="metric-value text-2xl">{status.token_expires_at ? formatTime(new Date(status.token_expires_at).toISOString()).slice(0, 10) : "--"}</strong>
-            <span className="metric-detail mt-1.5 block">access token expiry</span>
+            <span className="metric-detail mt-1.5 block">{t("overview.accessTokenExpiry")}</span>
           </div>
         </div>
       </div>
       {credits?.packages.length ? (
         <div className="overflow-auto">
           <div className="grid grid-cols-[minmax(200px,2fr)_110px_130px_110px] gap-3 border-b border-border px-1 pb-2.5">
-            <span className="eyebrow">Package</span><span className="eyebrow">Remaining</span><span className="eyebrow">Capacity</span><span className="eyebrow">Used</span>
+            <span className="eyebrow">{t("overview.package")}</span><span className="eyebrow">{t("overview.remaining")}</span><span className="eyebrow">{t("overview.capacity")}</span><span className="eyebrow">{t("overview.used")}</span>
           </div>
           {credits.packages.map((item, index) => (
             <div key={`${item.package_name}-${index}`} className="grid grid-cols-[minmax(200px,2fr)_110px_130px_110px] items-center gap-3 border-b border-border/70 py-3 last:border-b-0">
