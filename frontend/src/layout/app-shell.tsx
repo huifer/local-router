@@ -21,6 +21,7 @@ const nav = [
   { to: "/models", label: "Models", icon: Layers },
   { to: "/groups", label: "Routing groups", icon: AudioLines },
   { to: "/usage", label: "Usage", icon: KeyRound },
+  { to: "/accounts", label: "Accounts", icon: KeyRound },
   { to: "/settings", label: "Settings", icon: Settings2 },
 ] as const;
 
@@ -30,6 +31,7 @@ const titles: Record<string, string> = {
   "/models": "Models",
   "/groups": "Routing groups",
   "/usage": "Usage",
+  "/accounts": "Accounts",
   "/settings": "Settings",
 };
 

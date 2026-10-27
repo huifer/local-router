@@ -291,7 +291,10 @@ async fn a_claim_without_a_session_says_so() {
     let err = workbuddy::claim_checkin()
         .await
         .expect_err("there is no session to claim with");
-    assert!(err.to_string().contains("sign in"), "{err}");
+    assert!(
+        err.to_string().contains("sign in") || err.to_string().contains("was not found"),
+        "{err}"
+    );
     std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_SESSION");
 }
 

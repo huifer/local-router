@@ -49,6 +49,7 @@ export interface Provider {
   group_only: boolean;
   /** 每个请求都带的静态头；{version}/{platform}/{arch} 会展开。 */
   headers?: Record<string, string>;
+  user_agent?: string;
   /** 把调用方发来的同名头原样转发给上游。 */
   forward_headers?: string[];
   /** 发送前删除的头。 */
@@ -260,6 +261,21 @@ export interface WorkBuddyCredits {
     daily_credit: number;
     today_credit: number;
   } | null;
+}
+
+export interface AccountView {
+  provider: string;
+  vendor: string;
+  kind: string;
+  signed_in?: boolean;
+  account?: { nickname?: string; uid?: string; type?: string; email?: string };
+  token_expires_at?: number | null;
+  plan?: string;
+  balance?: string;
+  resets_at?: string | null;
+  pools?: { name: string; balance: number }[];
+  credits?: WorkBuddyCredits;
+  error?: string;
 }
 
 export interface WorkBuddyStatus {

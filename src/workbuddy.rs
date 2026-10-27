@@ -293,7 +293,7 @@ pub fn read_session_file() -> anyhow::Result<Session> {
             let path = PathBuf::from(explicit);
             if !path.exists() {
                 anyhow::bail!(
-                    "the WorkBuddy login file at {} was not found",
+                    "the WorkBuddy login file at {} was not found; run `local-router workbuddy login` to sign in",
                     path.display()
                 );
             }
@@ -486,6 +486,28 @@ fn read_pool_at(path: &std::path::Path) -> anyhow::Result<SessionPool> {
 /// Read the pool: our own file when it exists, else the desktop app's file
 /// as a single account.
 pub fn read_pool() -> anyhow::Result<SessionPool> {
+    // An explicit path is authoritative, including when it does not exist:
+    // tests, containers and multi-account deployments use this to select one
+    // exact session instead of falling through to the desktop app.
+    if let Ok(explicit) = std::env::var("LOCAL_ROUTER_WORKBUDDY_SESSION") {
+        let path = PathBuf::from(explicit);
+        if !path.exists() {
+            anyhow::bail!(
+                "the WorkBuddy login file at {} was not found",
+                path.display()
+            );
+        }
+        return read_pool_at(&path);
+    }
+    // WORKBUDDY_HOME is also an explicit deployment choice. It wins over
+    // local-router's own pool so the desktop/test session selected there is
+    // the one the caller asked us to use.
+    if let Ok(dir) = std::env::var("WORKBUDDY_HOME") {
+        let path = PathBuf::from(dir).join("auth/workbuddy-desktop.info");
+        if path.exists() {
+            return read_pool_at(&path);
+        }
+    }
     let own = own_session_path();
     if own.exists() {
         return read_pool_at(&own);

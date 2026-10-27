@@ -3,10 +3,11 @@ import { useRouteLoaderData } from "react-router";
 import { LogIn, Plus, Search } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
+import type { Provider } from "@/types";
 import type { Preset } from "@/types";
 import { api, getPresets } from "@/api";
 import {
-  Badge, Button, Card, Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle,
+  Badge, Button, Card, Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle,
   EmptyState, Field, Input,
 } from "@/components/ui";
 import { SectionToolbar, StatusDot } from "@/components/shared/bits";
@@ -18,6 +19,7 @@ export default function ProvidersPage() {
   const [selected, setSelected] = useState<Preset | null>(null);
   const [search, setSearch] = useState("");
   const [signingIn, setSigningIn] = useState(false);
+  const [detail, setDetail] = useState<Provider | null>(null);
   const [form, setForm] = useState({ name: "", url: "", key: "", models: "" });
 
   // Searching the preset list: match the name, the id and the protocol, so
@@ -167,7 +169,12 @@ export default function ProvidersPage() {
       {data.providers.length ? (
         <div className="grid grid-cols-3 gap-3 max-[1100px]:grid-cols-2 max-[700px]:grid-cols-1">
           {data.providers.map((provider) => (
-            <Card key={provider.id} className="p-4">
+            <Card key={provider.id} className="p-4 transition-colors hover:border-input">
+              <button
+                onClick={() => setDetail(provider)}
+                className="block w-full cursor-pointer text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/60"
+                aria-label={`Details of ${provider.name}`}
+              >
               <div className="flex items-center gap-2.5">
                 <span className="grid size-8 shrink-0 place-items-center border border-input text-primary">▣</span>
                 <div className="min-w-0 flex-1">
@@ -198,6 +205,7 @@ export default function ProvidersPage() {
                   <Badge key={`media-${model}`} variant="primary">{model}</Badge>
                 ))}
               </div>
+              </button>
               <div className="flex items-center justify-between gap-2 border-t border-border pt-3">
                 <Button variant="ghost" size="sm" onClick={() => toggle(provider)}>
                   {provider.enabled ? "Pause" : "Enable"}
@@ -217,6 +225,8 @@ export default function ProvidersPage() {
           />
         </Card>
       )}
+
+      <ProviderDetail provider={detail} onClose={() => setDetail(null)} />
 
       <Dialog open={showAdd} onOpenChange={setShowAdd}>
         <DialogContent className="max-w-3xl">
@@ -325,4 +335,55 @@ export default function ProvidersPage() {
       </Dialog>
     </div>
   );
+}
+
+function ProviderDetail({ provider, onClose }: { provider: Provider | null; onClose: () => void }) {
+  return (
+    <Dialog open={Boolean(provider)} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="max-w-2xl">
+        {provider && (
+          <>
+            <DialogHeader>
+              <DialogTitle>{provider.name}</DialogTitle>
+              <DialogDescription>{provider.id} · {provider.protocol}</DialogDescription>
+            </DialogHeader>
+            <div className="grid gap-5 p-5">
+              <div className="grid grid-cols-3 gap-3 max-[600px]:grid-cols-1">
+                <DetailStat label="Status" value={provider.enabled ? "ACTIVE" : "PAUSED"} accent={provider.enabled} />
+                <DetailStat label="Models" value={String(provider.models.length)} />
+                <DetailStat label="Keys" value={provider.auth ? "SESSION" : String(provider.keys.length)} />
+              </div>
+              <div className="grid gap-3">
+                <DetailRow label="Base URL" value={provider.base_url ?? "—"} />
+                <DetailRow label="Anthropic URL" value={provider.anthropic_base_url ?? "—"} />
+                <DetailRow label="Responses URL" value={provider.responses_base_url ?? "—"} />
+                <DetailRow label="Gemini URL" value={provider.gemini_base_url ?? "—"} />
+                <DetailRow label="Catalog" value={provider.catalog ?? "—"} />
+                <DetailRow label="Group only" value={provider.group_only ? "yes" : "no"} />
+                <DetailRow label="Stream only" value={provider.stream_only ? "yes" : "no"} />
+                <DetailRow label="Auto include" value={provider.auto_include?.join(", ") || "—"} />
+                <DetailRow label="Forward headers" value={provider.forward_headers?.join(", ") || "—"} />
+                <DetailRow label="Remove headers" value={provider.remove_headers?.join(", ") || "—"} />
+                <DetailRow label="User-Agent" value={provider.user_agent || "default"} />
+              </div>
+              <div>
+                <div className="eyebrow mb-2">Exposed models</div>
+                <div className="flex flex-wrap gap-1.5">
+                  {provider.models.length ? provider.models.map((model) => <Badge key={model}>{model}</Badge>) : <span className="font-mono text-[10px] text-muted-foreground">No models exposed</span>}
+                </div>
+              </div>
+            </div>
+          </>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function DetailStat({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) {
+  return <div className="border border-border bg-secondary/50 p-3"><div className="eyebrow">{label}</div><strong className={`mt-2 block font-mono text-xl ${accent ? "text-primary" : ""}`}>{value}</strong></div>;
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return <div className="grid grid-cols-[130px_1fr] gap-4 border-b border-border/70 py-2.5 last:border-b-0 max-[500px]:grid-cols-1"><span className="eyebrow">{label}</span><span className="break-all font-mono text-[11px] text-muted-foreground">{value}</span></div>;
 }

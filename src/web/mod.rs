@@ -76,6 +76,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/caller-keys/{id}", delete(api_delete_caller_key))
         .route("/api/usage", get(api_usage))
+        .route("/api/accounts", get(api_accounts))
+        .route("/api/checkin", post(api_checkin))
         .route("/api/projects", get(api_projects).patch(api_update_project))
         .route("/api/projects/merge", post(api_merge_projects))
         // SPA deep links: everything that is not an API path or a known
@@ -1046,6 +1048,109 @@ fn oauth_err(err: anyhow::Error) -> (StatusCode, Json<Value>) {
         StatusCode::BAD_GATEWAY,
         Json(json!({"error": err.to_string()})),
     )
+}
+
+/// Claim a WorkBuddy account's daily check-in from the console.
+async fn api_checkin(
+    State(_state): State<AppState>,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let _ = body;
+    // The console asks for the workbuddy account by provider id; the
+    // default session is the one signed in through the UI.
+    let outcome = crate::workbuddy::claim_checkin().await.map_err(|err| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": err.to_string()})),
+        )
+    })?;
+    Ok(Json(serde_json::to_value(&outcome).unwrap_or(Value::Null)))
+}
+
+/// Every signed-in account, for the Accounts page: who is signed in, what
+/// the plan is, what is left of it, and which provider serves it.
+async fn api_accounts(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config.read().await;
+    let session_providers: Vec<_> = config
+        .providers
+        .iter()
+        .filter(|p| p.enabled && p.uses_session())
+        .cloned()
+        .collect();
+    drop(config);
+
+    let mut accounts: Vec<Value> = Vec::new();
+    for provider in &session_providers {
+        match provider.auth {
+            Some(crate::config::AuthKind::WorkBuddy) => {
+                let mut entry = json!({
+                    "provider": provider.id,
+                    "vendor": "workbuddy",
+                    "kind": "workbuddy",
+                });
+                match crate::workbuddy::read_session_file() {
+                    Ok(session) => {
+                        entry["signed_in"] = json!(true);
+                        entry["account"] = json!({
+                            "nickname": session.account.nickname,
+                            "uid": session.account.uid,
+                            "type": session.account.account_type,
+                        });
+                        entry["token_expires_at"] = json!(session.expires_at);
+                        match crate::workbuddy::credits().await {
+                            Ok(credits) => {
+                                entry["credits"] =
+                                    serde_json::to_value(&credits).unwrap_or(Value::Null);
+                            }
+                            Err(err) => entry["error"] = json!(err.to_string()),
+                        }
+                    }
+                    Err(err) => {
+                        entry["signed_in"] = json!(false);
+                        entry["error"] = json!(err.to_string());
+                    }
+                }
+                accounts.push(entry);
+            }
+            Some(crate::config::AuthKind::QwenWork) => {
+                let mut entry = json!({
+                    "provider": provider.id,
+                    "vendor": "qwenwork",
+                    "kind": "qwenwork",
+                });
+                match crate::qwen::login::read_session_file() {
+                    Ok(session) => {
+                        entry["signed_in"] = json!(true);
+                        entry["account"] = json!({
+                            "nickname": session.account.nickname,
+                            "uid": session.account.uid,
+                            "email": session.account.email,
+                        });
+                        entry["token_expires_at"] = json!(session.expires_at);
+                        match crate::qwen::login::session().await {
+                            Ok(live) => match crate::qwen::client::account_quota(&live).await {
+                                Ok(quota) => {
+                                    entry["plan"] = json!(quota.plan);
+                                    entry["balance"] = json!(quota.balance);
+                                    entry["pools"] = json!(quota.pools);
+                                    entry["resets_at"] = json!(quota.resets_at);
+                                }
+                                Err(err) => entry["error"] = json!(err.to_string()),
+                            },
+                            Err(err) => entry["error"] = json!(err.to_string()),
+                        }
+                    }
+                    Err(err) => {
+                        entry["signed_in"] = json!(false);
+                        entry["error"] = json!(err.to_string());
+                    }
+                }
+                accounts.push(entry);
+            }
+            _ => {}
+        }
+    }
+    Json(json!({ "accounts": accounts }))
 }
 
 /// Whether the sign-in finished, and what it produced.
