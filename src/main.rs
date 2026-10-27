@@ -1160,7 +1160,9 @@ async fn login(account_name: &str, no_open: bool) -> anyhow::Result<()> {
             .unwrap_or_else(|| "unknown".to_string())
     );
 
-    // Wire up the provider if it is not there yet.
+    // Signing in is only the first step. Wire the provider, pull the
+    // vendor's model list and claim the day's check-in here, so the user
+    // does not have to run four more commands.
     let mut config = load_config()?;
     if config.provider("workbuddy").is_none() {
         if let Some(preset) = presets::get("workbuddy") {
@@ -1170,8 +1172,39 @@ async fn login(account_name: &str, no_open: bool) -> anyhow::Result<()> {
         }
     }
 
+    match workbuddy::models().await {
+        Ok(list) => {
+            let mut ids: Vec<String> = list.into_iter().collect();
+            ids.sort();
+            ids.dedup();
+            let count = ids.len();
+            let mut config = load_config()?;
+            if let Some(provider) = config.provider_mut("workbuddy") {
+                for id in ids {
+                    if !provider.models.contains(&id) {
+                        provider.models.push(id);
+                    }
+                }
+                provider.models.sort();
+                provider.models.dedup();
+                save_config(&config)?;
+                println!("  models      {count} imported from the vendor");
+            }
+        }
+        Err(err) => println!("  models      could not be pulled: {err}"),
+    }
+
+    match workbuddy::claim_checkin().await {
+        Ok(outcome) if outcome.granted => println!(
+            "  check-in    claimed (+{} credits)",
+            outcome.credit.unwrap_or(0)
+        ),
+        Ok(outcome) => println!("  check-in    {}", outcome.message),
+        Err(err) => println!("  check-in    could not be claimed: {err}"),
+    }
+
     println!();
-    println!("  done — try it: local-router workbuddy credits");
+    println!("  done — try it: local-router claude workbuddy/hy3");
     Ok(())
 }
 

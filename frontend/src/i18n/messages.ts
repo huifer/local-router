@@ -151,6 +151,8 @@ const en: Dict = {
   "providers.signedInAs": "Signed in as {name}",
   "providers.signedIn": "Signed in",
   "providers.signInTimeout": "the sign-in timed out — try again",
+  "providers.setupModels": "{n} models imported from the vendor",
+  "providers.setupCheckin": "Daily check-in claimed: +{n} credits",
 
   // ---- models -------------------------------------------------------------
   "models.eyebrow": "Catalog / exposed models",
@@ -524,6 +526,8 @@ const zh: Dict = {
   "providers.signedInAs": "已登录：{name}",
   "providers.signedIn": "已登录",
   "providers.signInTimeout": "登录超时，请重试",
+  "providers.setupModels": "已从厂商导入 {n} 个模型",
+  "providers.setupCheckin": "已自动签到：+{n} 额度",
 
   "models.eyebrow": "目录 / 已暴露模型",
   "models.detail": "给所有 agent 与协议的扁平可寻址模型表。",

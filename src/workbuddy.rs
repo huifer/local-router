@@ -1053,9 +1053,34 @@ pub async fn poll_login_at(state: &str, site: &'static WbSite) -> anyhow::Result
             .to_string(),
         expires_at: expires_in.map(|seconds| now_ms() + seconds * 1000),
     };
+    // The token endpoint answers with tokens but no identity; the account
+    // endpoint names who signed in. Fill it in here so the stored session
+    // (and the console) can show the account, not an empty string.
+    let mut session = session;
+    let mut account_data = data;
+    if let Ok(profile) = login_account(&session, state).await {
+        if let Some(uid) = profile.get("uid").and_then(Value::as_str) {
+            session.account.uid = uid.to_string();
+        }
+        if let Some(nickname) = profile.get("nickname").and_then(Value::as_str) {
+            session.account.nickname = nickname.to_string();
+        }
+        if let Some(kind) = profile.get("type").and_then(Value::as_str) {
+            session.account.account_type = kind.to_string();
+        }
+        // Keep the profile on the result so callers that read it see the
+        // same fields.
+        if let Value::Object(ref mut map) = account_data {
+            for key in ["uid", "nickname", "type"] {
+                if let Some(value) = profile.get(key) {
+                    map.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
     Ok(LoginPoll::Ready(Box::new(LoginResult {
         session,
-        account: data,
+        account: account_data,
     })))
 }
 

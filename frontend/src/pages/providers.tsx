@@ -60,11 +60,24 @@ export default function ProvidersPage() {
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
         try {
-          const status = await api<{ done: boolean; waiting: boolean; account?: string }>(
-            `/api/providers/${encodeURIComponent(presetId)}/login/status`,
-          );
+          const status = await api<{
+            done: boolean;
+            waiting: boolean;
+            account?: string;
+            setup?: { models?: number; checkin?: { granted?: boolean; credit?: number | null } };
+          }>(`/api/providers/${encodeURIComponent(presetId)}/login/status`);
           if (status.done) {
-            toast.success(status.account ? t("providers.signedInAs", { name: status.account }) : t("providers.signedIn"));
+            toast.success(
+              status.account ? t("providers.signedInAs", { name: status.account }) : t("providers.signedIn"),
+            );
+            // The gateway already pulled the models and claimed the
+            // check-in; say so instead of making the user go look.
+            if (status.setup?.models) {
+              toast.success(t("providers.setupModels", { n: status.setup.models }));
+            }
+            if (status.setup?.checkin?.granted) {
+              toast.success(t("providers.setupCheckin", { n: status.setup.checkin.credit ?? 0 }));
+            }
             setShowAdd(false);
             await reload();
             return;

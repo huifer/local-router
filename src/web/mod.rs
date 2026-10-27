@@ -975,11 +975,16 @@ async fn api_session_login_status(
                     )
                     .await;
                     crate::session_logins::forget(&id);
-                    // Make sure the provider exists and is wired.
-                    wire_session_provider(&app_state, "workbuddy").await;
-                    Ok(Json(
-                        json!({"done": true, "waiting": false, "account": nickname}),
-                    ))
+                    // Signing in is only the first step: wire the provider,
+                    // pull the model list, claim the day's check-in. The user
+                    // asked to sign in, not to run four more commands.
+                    let setup = complete_workbuddy_signin(&app_state).await;
+                    Ok(Json(json!({
+                        "done": true,
+                        "waiting": false,
+                        "account": nickname,
+                        "setup": setup,
+                    })))
                 }
                 Err(err) => Err(oauth_err(err)),
             }
@@ -1005,15 +1010,107 @@ async fn api_session_login_status(
                     )
                     .await;
                     crate::session_logins::forget(&id);
-                    wire_session_provider(&app_state, "qwenwork").await;
-                    Ok(Json(
-                        json!({"done": true, "waiting": false, "account": nickname}),
-                    ))
+                    let setup = complete_qwenwork_signin(&app_state).await;
+                    Ok(Json(json!({
+                        "done": true,
+                        "waiting": false,
+                        "account": nickname,
+                        "setup": setup,
+                    })))
                 }
                 Err(err) => Err(oauth_err(err)),
             }
         }
     }
+}
+
+/// Everything that follows a WorkBuddy sign-in: the provider exists, the
+/// models are pulled, the day's check-in is claimed. Returns what each step
+/// did, so the console can report it truthfully.
+async fn complete_workbuddy_signin(state: &AppState) -> serde_json::Value {
+    let mut report = serde_json::Map::new();
+
+    // 1. The provider, with its preset models as a starting point.
+    wire_session_provider(state, "workbuddy").await;
+
+    // 2. The vendor's own model list, merged into the provider.
+    match crate::workbuddy::models().await {
+        Ok(list) => {
+            let mut ids: Vec<String> = list.into_iter().collect();
+            ids.sort();
+            ids.dedup();
+            let models_added = ids.len();
+            let _ = state
+                .update(|config| {
+                    if let Some(provider) = config.provider_mut("workbuddy") {
+                        for id in ids {
+                            if !provider.models.contains(&id) {
+                                provider.models.push(id);
+                            }
+                        }
+                        provider.models.sort();
+                        provider.models.dedup();
+                    }
+                    Ok::<(), String>(())
+                })
+                .await;
+            report.insert("models".into(), json!(models_added));
+        }
+        Err(err) => {
+            report.insert("modelsError".into(), json!(err.to_string()));
+        }
+    }
+
+    // 3. The daily check-in, so the credits land without opening the app.
+    match crate::workbuddy::claim_checkin().await {
+        Ok(outcome) => {
+            report.insert(
+                "checkin".into(),
+                serde_json::to_value(&outcome).unwrap_or(Value::Null),
+            );
+        }
+        Err(err) => {
+            report.insert("checkinError".into(), json!(err.to_string()));
+        }
+    }
+
+    serde_json::Value::Object(report)
+}
+
+/// The same for QwenWork: provider plus its account's model list.
+async fn complete_qwenwork_signin(state: &AppState) -> serde_json::Value {
+    let mut report = serde_json::Map::new();
+    wire_session_provider(state, "qwenwork").await;
+
+    if let Ok(session) = crate::qwen::login::session().await {
+        match crate::qwen::client::models(&session).await {
+            Ok(list) => {
+                let mut ids: Vec<String> = list.into_iter().collect();
+                ids.sort();
+                ids.dedup();
+                report.insert("models".into(), json!(ids.len()));
+                let _ = state
+                    .update(|config| {
+                        if let Some(provider) = config.provider_mut("qwenwork") {
+                            for id in ids {
+                                if !provider.models.contains(&id) {
+                                    provider.models.push(id);
+                                }
+                            }
+                            provider.models.sort();
+                            provider.models.dedup();
+                        }
+                        Ok::<(), String>(())
+                    })
+                    .await;
+            }
+            Err(err) => {
+                report.insert("modelsError".into(), json!(err.to_string()));
+            }
+        }
+    }
+
+    serde_json::Value::Object(report)
 }
 
 /// Add the provider a session-backed vendor needs, if it is not there yet.
@@ -1089,7 +1186,26 @@ async fn api_accounts(State(state): State<AppState>) -> Json<Value> {
                     "kind": "workbuddy",
                 });
                 match crate::workbuddy::read_session_file() {
-                    Ok(session) => {
+                    Ok(mut session) => {
+                        // An older session file may have been written before
+                        // the identity was filled in. Ask the vendor once and
+                        // remember it, so the console can name the account.
+                        if session.account.uid.is_empty() {
+                            if let Ok(profile) = crate::workbuddy::login_account(&session, "").await
+                            {
+                                if let Some(uid) = profile.get("uid").and_then(Value::as_str) {
+                                    session.account.uid = uid.to_string();
+                                }
+                                if let Some(nickname) =
+                                    profile.get("nickname").and_then(Value::as_str)
+                                {
+                                    session.account.nickname = nickname.to_string();
+                                }
+                                if let Some(kind) = profile.get("type").and_then(Value::as_str) {
+                                    session.account.account_type = kind.to_string();
+                                }
+                            }
+                        }
                         entry["signed_in"] = json!(true);
                         entry["account"] = json!({
                             "nickname": session.account.nickname,
@@ -2242,5 +2358,34 @@ mod tests {
     fn a_missing_host_header_refuses_everything() {
         let headers = HeaderMap::new();
         assert!(!same_origin("http://127.0.0.1:3426", &headers));
+    }
+}
+
+#[cfg(test)]
+mod setup_tests {
+    use super::*;
+
+    /// A completed sign-in must leave the provider wired with the vendor's
+    /// models — the user asked to sign in, not to configure anything else.
+    #[tokio::test]
+    async fn a_finished_signin_wires_the_provider_and_its_models() {
+        let dir = std::env::temp_dir().join(format!("local-router-setup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = std::sync::Arc::new(crate::config::Store::at(dir.join("config.json")));
+        store.save(&crate::config::Config::default()).unwrap();
+        let state = AppState::load(store).await.unwrap();
+
+        // The provider does not exist yet: signing in creates it.
+        assert!(state.config.read().await.provider("workbuddy").is_none());
+        wire_session_provider(&state, "workbuddy").await;
+        let provider = {
+            let config = state.config.read().await;
+            config.provider("workbuddy").cloned()
+        }
+        .expect("the provider is wired");
+        assert!(provider.uses_session(), "it authenticates with the session");
+        assert!(!provider.models.is_empty(), "the preset models came along");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

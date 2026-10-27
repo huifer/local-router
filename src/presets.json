@@ -373,7 +373,10 @@
         "deepseek-v4-flash"
       ],
       "key_hint": "(无需 key，使用本机 WorkBuddy 登录态)",
-      "docs": "https://www.codebuddy.cn"
+      "docs": "https://www.codebuddy.cn",
+      "auto_include": [
+        "*"
+      ]
     },
     {
       "id": "qwenwork",
@@ -388,7 +391,10 @@
         "qwen3-coder-plus"
       ],
       "key_hint": "(无需 key，使用本机 QwenWork 登录态)",
-      "docs": "https://qwenwork.cn"
+      "docs": "https://qwenwork.cn",
+      "auto_include": [
+        "*"
+      ]
     },
     {
       "id": "ollama",

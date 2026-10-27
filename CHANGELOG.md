@@ -39,6 +39,15 @@
 - **CLI 的 `provider models` 也会应用 auto_include**（此前只有控制台的
   「刷新模型」会），并把新模型落盘。
 
+- **登录后全自动装配（不再需要用户敲命令）**：WorkBuddy / QwenWork 的浏览器
+  登录一完成，网关自动依次完成——① 创建并配置 provider、② 拉取厂商模型目录
+  并并入 provider、③ 领取当日签到；控制台逐条提示（「已导入 N 个模型」
+  「已自动签到 +N 额度」），CLI 的 `workbuddy login` 同样一次跑完。
+  - 顺带修**账号身份没有保存**：`poll_login` 拿到 token 后没有查账号接口，
+    会话文件里 `uid` / `nickname` 一直是空字符串，界面上看不到是谁登录的。
+    现在登录当场补全身份并落盘；对已存在的空身份会话，`/api/accounts`
+    会在读取时补拉一次并回写。
+  - workbuddy / qwenwork 预设加 `auto_include: ["*"]`，厂商新增模型自动纳入。
 - **WorkBuddy 登录修正（对照 magpie-community/plugins 的实现）**：
   - 登录链接补上两个必需参数——`version`（登录页读它决定走哪套流程）与
     `loginSessionId`（把这次浏览器标签与轮询绑定）；没有这两项，登录页
