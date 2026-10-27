@@ -1529,9 +1529,18 @@ async fn target_headers(
     caller_headers: Option<&reqwest::header::HeaderMap>,
 ) -> Result<BTreeMap<String, String>, ApiError> {
     if provider.uses_session() {
-        let session = crate::workbuddy::session()
-            .await
-            .map_err(|e| ApiError::Unauthorized(e.to_string()))?;
+        // Several WorkBuddy accounts can live side by side; the requests
+        // take turns so the load is shared instead of one account taking
+        // all of it.
+        let session = match crate::workbuddy::session_rotating().await {
+            Ok((_, session)) => session,
+            Err(err) => {
+                // A pool of one (or none) falls back to the plain reader.
+                crate::workbuddy::session()
+                    .await
+                    .map_err(|_| ApiError::Unauthorized(err.to_string()))?
+            }
+        };
         return Ok(client::session_headers(target.protocol, provider, &session));
     }
     Ok(client::auth_headers(

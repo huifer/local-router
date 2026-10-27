@@ -134,7 +134,37 @@ curl -H "Authorization: Bearer local-router" http://127.0.0.1:3435/v1/models
 - **Context**：上下文窗口拆解（系统提示 / 工具定义 / 附件 / 对话各占多少 token）
 - **Quota**：WorkBuddy、QwenWork 的额度窗口与重置时间
 
-### 2.2 命令行速查
+### 2.2 交互模式（小白友好）
+
+```sh
+local-router console
+```
+
+进入后每行一个词，敲 `help` 看全部命令，`exit` 退出（Ctrl-D 也行）：
+
+```
+local-router> add 七牛云 --url https://api.qnaigc.com/v1 --key sk-xxx
+local-router> list                    列出已配的上游
+local-router> test 七牛云              测连通性
+local-router> fetch 七牛云             拉厂商的模型列表
+local-router> expose 七牛云 qwen-max,qwen-plus
+local-router> use claude 七牛云/qwen-max    把 Claude Code 指过去
+local-router> workbuddy login          浏览器登录 WorkBuddy
+local-router> workbuddy accounts        列出（可登录多个）WorkBuddy 账号
+local-router> workbuddy use personal     切换到另一个账号
+local-router> clear                     清屏（clean / cls 同义）
+```
+
+加自定义厂商时可以指定协议：
+
+```sh
+add 我的中转 --url https://api.example.com/v1 --key sk-xxx --protocol anthropic
+```
+
+协议取值：`openai_chat`（默认，OpenAI 兼容）/ `anthropic` / `gemini` /
+`openai_responses`。厂商名可以写中文。
+
+### 2.3 命令行速查
 
 ```sh
 # 看配置
@@ -179,7 +209,7 @@ local-router daemon start|stop|status|logs
 local-router dashboard               # 终端仪表盘（q 退出）
 ```
 
-### 2.3 调用 API
+### 2.4 调用 API
 
 四种入口协议任意选，与上游协议自由组合（流式 / 非流式都支持）。
 
@@ -222,7 +252,24 @@ curl $BASE/v1/messages/count_tokens -H "x-api-key: $KEY" \
 `api-key`。key 取 `LOCAL_ROUTER_DEFAULT_KEY` → 设置里的默认 key → 任一
 caller key；一把都没有时**拒绝一切请求**。
 
-### 2.4 观察网关内部
+### 2.5 WorkBuddy：登录与多账号
+
+```sh
+local-router workbuddy login                # 浏览器登录（默认账号名 default）
+local-router workbuddy login --account work # 登录第二个账号
+local-router workbuddy accounts              # 列出所有账号与当前使用的
+local-router workbuddy use work             # 切换到某个账号
+local-router workbuddy status|credits|models|checkin
+```
+
+多个账号可以并存（存在 `~/.config/local-router/workbuddy-session.json`），
+网关让请求在它们之间**轮流走**，分摊额度；`use` 指定优先用哪个。
+
+> 本机装了 WorkBuddy 桌面版时，它自己的登录文件也能直接用——但新版本把
+> token 加密存了，local-router 读不出来，所以请用上面的 `workbuddy login`
+> （浏览器登录一次即可，之后自动续期）。
+
+### 2.6 观察网关内部
 
 ```sh
 KEY=local-router
@@ -235,7 +282,7 @@ curl -H "Authorization: Bearer $KEY" "$BASE/v1/local-router/usage/requests?limit
 curl -H "Authorization: Bearer $KEY" -H "X-Session-ID: my-session" $BASE/v1/local-router/route  # 这次路由去了哪
 ```
 
-### 2.5 图片与视频
+### 2.7 图片与视频
 
 ```sh
 # 图片生成

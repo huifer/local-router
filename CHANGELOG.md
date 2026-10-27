@@ -8,6 +8,16 @@
 
 ### Added
 
+- **WorkBuddy 多账号**：登录态文件改成账号池（`workbuddy-session.json`），
+  可登录多个账号（`workbuddy login --account <名字>`）、列出
+  （`workbuddy accounts`）、切换（`workbuddy use <名字>`）；网关的请求在
+  多个账号之间**轮流走**，分摊额度，续期逻辑照旧。
+- **交互模式增强**：`local-router console` 新增 `clear`（`clean`/`cls` 同义）
+  清屏；`add` 支持 `--protocol`（openai_chat 默认 / anthropic / gemini /
+  openai_responses）自定义协议；密钥与 URL 会自动去掉粘贴时带的中英文引号；
+  `workbuddy` / `qwen` 支持子命令（login / status / credits / models /
+  checkin / accounts / use）。
+
 - **请求头重写**（对齐 [icebear0828/codex-proxy](https://github.com/icebear0828/codex-proxy)
   的同名能力）：provider 新增五组请求头规则——
   - `headers`：静态头注入，值支持 `{version}` / `{platform}` / `{arch}`
@@ -49,6 +59,15 @@
     （含 `qwenwork` 协议与 `auth` 枚举、settings 新字段）。
 
 ### Fixed
+
+- **WorkBuddy 桌面版的新版本把 token 加密存了**：客户端登录文件里的
+  `accessToken` / `nickname` 变成 `{"$wbEncrypted": …}` 对象，旧解析直接报
+  「not valid json」。现在能容错读取，并给出可行动的错误（提示改用
+  `local-router workbuddy login`）。
+- **中文厂商名会变成 id "custom"**：slug 只保留 ASCII 字母数字，中文名
+  （如「七牛云」）被清空后全部落到 "custom" 并撞名；现在保留 Unicode 字母。
+- **`local-router workbuddy login` 存了却读不到**：读取优先找桌面版客户端
+  的文件，浏览器登录写进自己文件的会话因此被忽略；现在自己的文件优先。
 
 - **`settings.masking` 一直是空配置**：README 声称「发往上游前遮蔽提示词里的
   密钥」，但网关从未读取该字段，实测 `sk-…` 明文直通上游。现已实现：开启后

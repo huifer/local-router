@@ -160,8 +160,11 @@ pub fn custom_provider(
 fn slugify(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch.to_ascii_lowercase());
+        // Unicode letters count too: a Chinese vendor name ("七牛云") must
+        // not collapse into an empty slug, or every such provider would
+        // be called "custom".
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
         } else if !out.ends_with('-') {
             out.push('-');
         }

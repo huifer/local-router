@@ -78,12 +78,30 @@ pub struct SessionFile {
 pub struct Account {
     #[serde(default)]
     pub uid: String,
-    #[serde(default)]
+    /// The display name. The desktop app encrypts it
+    /// (`{"$wbEncrypted": 1, "envelope": …}`), so a non-string is read as
+    /// "the name is encrypted" rather than failing the whole file.
+    #[serde(default, deserialize_with = "string_or_encrypted")]
     pub nickname: String,
     #[serde(default, rename = "type")]
     pub account_type: String,
     #[serde(default, rename = "lastLogin")]
     pub last_login: bool,
+}
+
+/// Read a field that is either a string or the desktop app's encrypted
+/// envelope. Anything else becomes a short placeholder.
+fn string_or_encrypted<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    Ok(match value {
+        Value::String(s) => s,
+        Value::Object(_) => "（客户端加密了昵称）".to_string(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    })
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -167,6 +185,13 @@ pub fn session_file() -> Option<PathBuf> {
         let path = PathBuf::from(explicit);
         return path.exists().then_some(path);
     }
+    // The session local-router stored itself (from `workbuddy login`) comes
+    // first: the user asked for that account on purpose, and it may be a
+    // second account besides the desktop app's.
+    let own = crate::config::config_dir().join("workbuddy-session.json");
+    if own.exists() {
+        return Some(own);
+    }
     let home = dirs::home_dir()?;
     let mut candidates = Vec::new();
     if let Ok(dir) = std::env::var("WORKBUDDY_HOME") {
@@ -190,32 +215,43 @@ pub fn session_file() -> Option<PathBuf> {
 
 /// Read the session file without touching the network.
 pub fn read_session_file() -> anyhow::Result<Session> {
-    let path = session_file().ok_or_else(|| {
-        anyhow::anyhow!("the WorkBuddy login file was not found; open WorkBuddy and sign in first")
-    })?;
-    let raw = std::fs::read_to_string(&path).with_context(|| {
-        format!(
-            "the WorkBuddy login file at {} is unreadable",
-            path.display()
-        )
-    })?;
-    let file: SessionFile = serde_json::from_str(&raw).with_context(|| {
-        format!(
-            "the WorkBuddy login file at {} is not valid json",
-            path.display()
-        )
-    })?;
+    // An explicit path wins; otherwise the pool (our file, else the app's).
+    let pool = match std::env::var("LOCAL_ROUTER_WORKBUDDY_SESSION") {
+        Ok(explicit) => {
+            let path = PathBuf::from(explicit);
+            if !path.exists() {
+                anyhow::bail!(
+                    "the WorkBuddy login file at {} was not found",
+                    path.display()
+                );
+            }
+            read_pool_at(&path)?
+        }
+        Err(_) => read_pool()?,
+    };
+    let name = if pool.active.is_empty() {
+        pool.accounts
+            .keys()
+            .next()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("the WorkBuddy session file holds no account"))?
+    } else {
+        pool.active.clone()
+    };
+    let file = pool
+        .accounts
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("there is no WorkBuddy account called {name}"))?;
     if file.auth.access_token.trim().is_empty() {
         anyhow::bail!(
-            "the WorkBuddy login file at {} holds no access token; sign in to WorkBuddy again",
-            path.display()
+            "the WorkBuddy session file holds no access token; sign in with `local-router workbuddy login`"
         );
     }
     Ok(Session {
-        account: file.account,
-        access_token: file.auth.access_token,
-        refresh_token: file.auth.refresh_token,
-        domain: file.auth.domain,
+        account: file.account.clone(),
+        access_token: file.auth.access_token.clone(),
+        refresh_token: file.auth.refresh_token.clone(),
+        domain: file.auth.domain.clone(),
         expires_at: file.auth.expires_at,
     })
 }
@@ -293,7 +329,25 @@ pub async fn refresh(session: &Session) -> anyhow::Result<Session> {
 /// The refreshed token is returned to the caller but never written back to
 /// disk: WorkBuddy owns that file, and its own refresh writes it.
 pub async fn session() -> anyhow::Result<Session> {
-    let current = read_session_file()?;
+    let pool = read_pool()?;
+    let name = if pool.active.is_empty() {
+        pool.accounts.keys().next().cloned().ok_or_else(|| {
+            anyhow::anyhow!("no WorkBuddy session yet; run `local-router workbuddy login`")
+        })?
+    } else {
+        pool.active.clone()
+    };
+    let file = pool
+        .accounts
+        .get(&name)
+        .ok_or_else(|| anyhow::anyhow!("there is no WorkBuddy account called {name}"))?;
+    let current = Session {
+        account: file.account.clone(),
+        access_token: file.auth.access_token.clone(),
+        refresh_token: file.auth.refresh_token.clone(),
+        domain: file.auth.domain.clone(),
+        expires_at: file.auth.expires_at,
+    };
     if !current.needs_refresh() {
         return Ok(current);
     }
@@ -306,6 +360,177 @@ pub async fn session() -> anyhow::Result<Session> {
             Ok(current)
         }
     }
+}
+
+/// The sessions local-router holds for WorkBuddy: one file, several
+/// accounts, and the one that is in use.
+///
+/// The file is `workbuddy-session.json` next to the config. An older file
+/// held a single session at the top level; that shape is still read (as one
+/// account named `default`) so nothing breaks.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionPool {
+    /// Which account the gateway uses when the caller does not pick one.
+    #[serde(default)]
+    pub active: String,
+    /// The accounts, by name.
+    #[serde(default)]
+    pub accounts: std::collections::BTreeMap<String, SessionFile>,
+}
+
+/// Where local-router keeps its own WorkBuddy sessions.
+pub fn own_session_path() -> std::path::PathBuf {
+    crate::config::config_dir().join("workbuddy-session.json")
+}
+
+/// Read a pool from one file: either the pool shape or the old
+/// single-session shape (which is one account named `default`).
+fn read_pool_at(path: &std::path::Path) -> anyhow::Result<SessionPool> {
+    let raw = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "the WorkBuddy session file at {} is unreadable",
+            path.display()
+        )
+    })?;
+    if let Ok(pool) = serde_json::from_str::<SessionPool>(&raw) {
+        if !pool.accounts.is_empty() {
+            return Ok(pool);
+        }
+    }
+    let file: SessionFile = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "the WorkBuddy login file at {} is not valid json — this version of the app encrypts its tokens, so sign in with `local-router workbuddy login` instead",
+            path.display()
+        )
+    })?;
+    let mut accounts = std::collections::BTreeMap::new();
+    accounts.insert("default".to_string(), file);
+    Ok(SessionPool {
+        active: "default".to_string(),
+        accounts,
+    })
+}
+
+/// Read the pool: our own file when it exists, else the desktop app's file
+/// as a single account.
+pub fn read_pool() -> anyhow::Result<SessionPool> {
+    let own = own_session_path();
+    if own.exists() {
+        return read_pool_at(&own);
+    }
+    // The desktop app's own file (older versions kept the token in clear).
+    let path = session_file().ok_or_else(|| {
+        anyhow::anyhow!(
+            "no WorkBuddy session yet; run `local-router workbuddy login` to sign in with a browser"
+        )
+    })?;
+    let pool = read_pool_at(&path)?;
+    let active_file = pool
+        .accounts
+        .get(&pool.active)
+        .or_else(|| pool.accounts.values().next())
+        .ok_or_else(|| {
+            anyhow::anyhow!("the WorkBuddy login file at {} is empty", path.display())
+        })?;
+    if active_file.auth.access_token.trim().is_empty() {
+        anyhow::bail!(
+            "the WorkBuddy login file at {} holds no access token; sign in with `local-router workbuddy login`",
+            path.display()
+        );
+    }
+    Ok(pool)
+}
+
+/// The accounts local-router knows, by name.
+pub fn accounts() -> anyhow::Result<Vec<(String, SessionFile)>> {
+    Ok(read_pool()?.accounts.into_iter().collect())
+}
+
+/// Use another account from now on.
+pub fn use_account(name: &str) -> anyhow::Result<()> {
+    let mut pool = read_pool()?;
+    if !pool.accounts.contains_key(name) {
+        anyhow::bail!("there is no WorkBuddy account called {name}");
+    }
+    pool.active = name.to_string();
+    write_pool(&pool)?;
+    Ok(())
+}
+
+/// Write the pool back to local-router's own file.
+fn write_pool(pool: &SessionPool) -> anyhow::Result<()> {
+    let path = own_session_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let body = serde_json::to_string_pretty(pool)?;
+    std::fs::write(&path, body)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// The session of one named account.
+pub fn session_of(name: &str) -> anyhow::Result<Session> {
+    let pool = read_pool()?;
+    let file = pool
+        .accounts
+        .get(name)
+        .ok_or_else(|| anyhow::anyhow!("there is no WorkBuddy account called {name}"))?;
+    Ok(Session {
+        account: file.account.clone(),
+        access_token: file.auth.access_token.clone(),
+        refresh_token: file.auth.refresh_token.clone(),
+        domain: file.auth.domain.clone(),
+        expires_at: file.auth.expires_at,
+    })
+}
+
+/// A session of one of the accounts, in turn — so several WorkBuddy
+/// accounts share the traffic instead of one taking all of it. The token is
+/// renewed first when it is about to expire, like the single-account path.
+pub async fn session_rotating() -> anyhow::Result<(String, Session)> {
+    let (name, session) = rotating_account()?;
+    if !session.needs_refresh() {
+        return Ok((name, session));
+    }
+    match refresh(&session).await {
+        Ok(fresh) => Ok((name, fresh)),
+        Err(err) => {
+            // A failed refresh is not fatal while the old token still works.
+            tracing::warn!("the WorkBuddy token could not be refreshed: {err}");
+            Ok((name, session))
+        }
+    }
+}
+
+/// The next account's session, without renewing it.
+pub fn rotating_account() -> anyhow::Result<(String, Session)> {
+    let pool = read_pool()?;
+    if pool.accounts.is_empty() {
+        anyhow::bail!("no WorkBuddy session yet; run `local-router workbuddy login`");
+    }
+    let names: Vec<String> = pool.accounts.keys().cloned().collect();
+    let index = {
+        static CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let i = CURSOR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        i % names.len()
+    };
+    let name = names[index].clone();
+    let file = &pool.accounts[&name];
+    Ok((
+        name,
+        Session {
+            account: file.account.clone(),
+            access_token: file.auth.access_token.clone(),
+            refresh_token: file.auth.refresh_token.clone(),
+            domain: file.auth.domain.clone(),
+            expires_at: file.auth.expires_at,
+        },
+    ))
 }
 
 /// One quota window on the account, in the shape the routing view reads:
@@ -747,8 +972,12 @@ pub async fn login_account(session: &Session, state: &str) -> anyhow::Result<Val
 /// config, so it survives restarts without touching WorkBuddy's own files.
 ///
 /// The file is 0600: it carries tokens.
-pub async fn store_session(session: &Session, account: &Value) -> anyhow::Result<PathBuf> {
-    let path = crate::config::config_dir().join("workbuddy-session.json");
+pub async fn store_session(
+    session: &Session,
+    account: &Value,
+    name: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = own_session_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -784,7 +1013,13 @@ pub async fn store_session(session: &Session, account: &Value) -> anyhow::Result
             scope: String::new(),
         },
     };
-    let body = serde_json::to_string_pretty(&file)?;
+    // The pool keeps every account; the one just signed in becomes active.
+    let mut pool = read_pool().unwrap_or_default();
+    if pool.accounts.is_empty() {
+        pool.active = name.to_string();
+    }
+    pool.accounts.insert(name.to_string(), file);
+    let body = serde_json::to_string_pretty(&pool)?;
     std::fs::write(&path, body)?;
     #[cfg(unix)]
     {
@@ -1194,5 +1429,85 @@ mod tests {
             expires_at: None,
         };
         assert!(session.refresh_token.trim().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    fn session_file_for(uid: &str, token: &str) -> SessionFile {
+        SessionFile {
+            account: Account {
+                uid: uid.into(),
+                nickname: format!("{uid}-name"),
+                account_type: "personal".into(),
+                last_login: true,
+            },
+            auth: Auth {
+                access_token: token.into(),
+                refresh_token: "rt".into(),
+                token_type: "Bearer".into(),
+                expires_at: Some(9_999_999_999_999),
+                refresh_expires_at: None,
+                domain: "www.codebuddy.cn".into(),
+                scope: String::new(),
+            },
+        }
+    }
+
+    /// The desktop app encrypts its nickname and token; the file must still
+    /// parse (with a placeholder) instead of failing the whole read.
+    #[test]
+    fn an_encrypted_nickname_is_read_as_a_placeholder() {
+        let raw = r#"{
+            "account": {"uid": "u1", "nickname": {"$wbEncrypted": 1, "envelope": "abc"}, "type": "personal"},
+            "auth": {"accessToken": "at", "expiresAt": 1795496955295}
+        }"#;
+        let file: SessionFile = serde_json::from_str(raw).unwrap();
+        assert_eq!(file.account.uid, "u1");
+        assert!(!file.account.nickname.is_empty());
+        assert_eq!(file.auth.access_token, "at");
+        assert_eq!(file.auth.expires_at, Some(1_795_496_955_295));
+    }
+
+    /// Several accounts live side by side; the active one is picked.
+    #[test]
+    fn a_pool_holds_several_accounts_and_names_the_active_one() {
+        let dir =
+            std::env::temp_dir().join(format!("local-router-wb-pool-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workbuddy-session.json");
+        let mut pool = SessionPool::default();
+        pool.accounts
+            .insert("work".into(), session_file_for("u-work", "at-work"));
+        pool.accounts.insert(
+            "personal".into(),
+            session_file_for("u-personal", "at-personal"),
+        );
+        pool.active = "work".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&pool).unwrap()).unwrap();
+
+        let read = read_pool_at(&path).unwrap();
+        assert_eq!(read.accounts.len(), 2);
+        assert_eq!(read.active, "work");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The old single-session file still reads (as one account).
+    #[test]
+    fn an_old_single_session_file_reads_as_one_account() {
+        let dir =
+            std::env::temp_dir().join(format!("local-router-wb-old-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workbuddy-session.json");
+        let file = session_file_for("u1", "at-1");
+        std::fs::write(&path, serde_json::to_string_pretty(&file).unwrap()).unwrap();
+        let pool = read_pool_at(&path).unwrap();
+        assert_eq!(pool.accounts.len(), 1);
+        assert_eq!(pool.active, "default");
+        assert_eq!(pool.accounts["default"].auth.access_token, "at-1");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

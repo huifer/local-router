@@ -14,7 +14,7 @@ use std::io::Write;
 use anyhow::Context;
 
 use crate::config::{Config, Store};
-use crate::gateway;
+use crate::{gateway, presets};
 
 /// Commands the console understands. One keyword, mostly one argument.
 pub const HELP: &str = "\
@@ -24,6 +24,9 @@ pub const HELP: &str = "\
   status               网关健康 + 有哪些 provider / group
   start | stop         启动 / 停止后台网关（daemon）
   add <厂商> [key]     加上游：add deepseek sk-xxx
+  add <名> --url …     自定义上游：add 七牛云 --url https://api.qnaigc.com/v1 --key …
+                       --protocol openai_chat（默认）/ anthropic / gemini / openai_responses
+                       --models m1,m2（可省，稍后 fetch 或 expose）
   rm <厂商>            删上游
   list                 列出已配的上游
   models               网关对外暴露的模型
@@ -36,9 +39,12 @@ pub const HELP: &str = "\
   usage                用量（近 7 天）
   doctor               自检
   prices               价目表
-  workbuddy            WorkBuddy 登录态与积分
-  qwen                 QwenWork（千问办公）登录态与余额
+  workbuddy [子命令]    WorkBuddy：login 登录（--account 名字，可多账号）/
+                       status 状态 / credits 积分 / models 模型 /
+                       checkin 签到 / accounts 列出账号 / use <名字> 切换
+  qwen [子命令]         QwenWork（千问办公）：login / status / credits / models
   open                 在浏览器打开控制台
+  clear | clean        清屏
   exit | quit          退出（Ctrl-D 也行）
 ";
 
@@ -148,9 +154,15 @@ async fn handle(line: &str) -> anyhow::Result<()> {
         }
         "doctor" => super::doctor().await?,
         "prices" => super::prices().await?,
-        "workbuddy" => super::workbuddy_cmd(crate::WorkBuddyCmd::Status).await?,
-        "qwen" => super::qwen_cmd(crate::QwenCmd::Status).await?,
+        "workbuddy" => workbuddy(rest).await?,
+        "qwen" => qwen(rest).await?,
         "open" => open_console().await?,
+        "clear" | "clean" | "cls" => {
+            // ANSI: clear the screen and move home; a fallback for the
+            // few terminals that ignore it.
+            print!("\x1b[2J\x1b[H");
+            let _ = std::io::stdout().flush();
+        }
         "dashboard" => {
             return Err(anyhow::anyhow!(
                 "dashboard 需要全屏终端；退出后运行 local-router dashboard"
@@ -191,20 +203,22 @@ async fn status() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 加上游：`add deepseek sk-xxx`，或自定义
-/// `add myrelay --url http://…/v1 --models m1,m2`，或免 key 的
-/// `add workbuddy` / `add qwenwork`。
+/// 加上游。内置厂商一行搞定：`add deepseek sk-xxx`；免 key 的
+/// `add workbuddy` / `add qwenwork`；自定义的
+/// `add 七牛云 --url https://api.qnaigc.com/v1 --key {{API_KEY_…}}`
+/// （协议默认 openai_chat，`--protocol` 可换）。
 async fn add(rest: &[&str]) -> anyhow::Result<()> {
     let mut preset: Option<String> = None;
     let mut key: Option<String> = None;
     let mut name: Option<String> = None;
     let mut url: Option<String> = None;
+    let mut protocol: Option<String> = None;
     let mut models: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i] {
             "--url" => {
-                url = rest.get(i + 1).map(|s| s.to_string());
+                url = rest.get(i + 1).map(|s| s.trim().to_string());
                 i += 2;
             }
             "--models" => {
@@ -221,16 +235,20 @@ async fn add(rest: &[&str]) -> anyhow::Result<()> {
                 i += 2;
             }
             "--key" => {
-                key = rest.get(i + 1).map(|s| s.to_string());
+                key = rest.get(i + 1).map(|s| clean_key(s));
+                i += 2;
+            }
+            "--protocol" | "--proto" => {
+                protocol = rest.get(i + 1).map(|s| s.to_string());
                 i += 2;
             }
             word => {
-                // The first bare word is the preset id; a second bare word
-                // that looks like a secret rides as the key.
+                // The first bare word is the preset id (or the custom
+                // name); a second bare word rides as the key.
                 if preset.is_none() {
                     preset = Some(word.to_string());
                 } else if key.is_none() {
-                    key = Some(word.to_string());
+                    key = Some(clean_key(word));
                 }
                 i += 1;
             }
@@ -238,9 +256,33 @@ async fn add(rest: &[&str]) -> anyhow::Result<()> {
     }
     let Some(preset) = preset else {
         anyhow::bail!(
-            "用法：\n  add deepseek sk-xxx              （内置厂商）\n  add workbuddy / add qwenwork    （免 key，用本机登录态）\n  add myrelay --url http://…/v1 --models m1,m2   （自定义）"
+            "用法：\n  add deepseek sk-xxx     （内置厂商）\n  add workbuddy / add qwenwork   （免 key，用本机登录态）\n  add 七牛云 --url https://api.qnaigc.com/v1 --key xxx\n                          （自定义，协议默认 openai_chat，\n                           --protocol anthropic / gemini / openai_responses 可换）"
         );
     };
+    // 自定义上游（名字不在内置预设里）需要 --url 或 --name；协议可选。
+    let protocol_value = protocol.as_deref().map(clean_protocol);
+    if presets::get(&preset).is_none() && (url.is_some() || name.is_some()) {
+        let name = name.clone().unwrap_or_else(|| preset.clone());
+        let id = slug(&name);
+        super::provider_cmd(crate::ProviderCmd::Add {
+            preset: "custom".into(),
+            key,
+            name: Some(name),
+            url,
+            models,
+        })
+        .await?;
+        // 协议不是默认值时补一条设置（Add 没有 protocol 参数，用 update）。
+        if let Some(p) = protocol_value {
+            set_protocol(&id, p).await?;
+        }
+        return Ok(());
+    }
+    if let Some(p) = protocol_value {
+        anyhow::bail!(
+            "内置厂商的协议是预设好的（{preset}）。--protocol 只用于自定义上游：\n  add <名字> --url <地址> --protocol {p}"
+        );
+    }
     super::provider_cmd(crate::ProviderCmd::Add {
         preset,
         key,
@@ -249,6 +291,108 @@ async fn add(rest: &[&str]) -> anyhow::Result<()> {
         models,
     })
     .await
+}
+
+/// `openai` / `anthropic` / `claude` / `gemini` / `responses` / `chat` …
+/// 都收，归一成网关认的协议名。
+fn clean_protocol(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "anthropic" | "claude" | "messages" => "anthropic".into(),
+        "gemini" | "google" => "gemini".into(),
+        "responses" | "openai_responses" | "openai-responses" => "openai_responses".into(),
+        _ => "openai_chat".into(), // openai / chat / openai_chat / 其它一律按 OpenAI 兼容
+    }
+}
+
+/// 清洗用户粘贴的密钥：去掉中文引号、直引号与空白。
+///
+/// 用户常从文档或聊天记录里复制，密钥外面可能带着 " " 「」 或全角空格。
+fn clean_key(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”' || c == '‘' || c == '’')
+        .trim()
+        .to_string()
+}
+
+fn slug(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.trim().chars() {
+        // Unicode letters count too: a Chinese vendor name ("七牛云") must
+        // not collapse into an empty slug.
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "custom".to_string()
+    } else {
+        out
+    }
+}
+
+/// 给刚建的自定义上游设置协议（Add 命令本身不带 protocol）。
+async fn set_protocol(id: &str, protocol: String) -> anyhow::Result<()> {
+    let parsed = match protocol.as_str() {
+        "anthropic" => crate::protocol::ir::Protocol::Anthropic,
+        "gemini" => crate::protocol::ir::Protocol::Gemini,
+        "openai_responses" => crate::protocol::ir::Protocol::OpenAiResponses,
+        _ => crate::protocol::ir::Protocol::OpenAiChat,
+    };
+    let config = load()?;
+    let mut config = config;
+    {
+        let Some(p) = config.provider_mut(id) else {
+            return Ok(()); // provider 刚建好，理论上不会缺
+        };
+        p.protocol = parsed;
+    }
+    Store::new().save(&config)?;
+    println!("  protocol    {protocol}");
+    Ok(())
+}
+
+/// WorkBuddy：login / status / credits / models / checkin / accounts / use。
+async fn workbuddy(rest: &[&str]) -> anyhow::Result<()> {
+    let sub = rest.first().copied().unwrap_or("status");
+    match sub {
+        "login" => {
+            // `workbuddy login [名字]`：不给名字就叫 default；给了就是账号名。
+            let name = rest.get(1).copied().unwrap_or("default").to_string();
+            super::workbuddy_cmd(crate::WorkBuddyCmd::Login { account: name }).await
+        }
+        "status" | "s" => super::workbuddy_cmd(crate::WorkBuddyCmd::Status).await,
+        "credits" | "credit" => super::workbuddy_cmd(crate::WorkBuddyCmd::Credits).await,
+        "models" | "m" => super::workbuddy_cmd(crate::WorkBuddyCmd::Models).await,
+        "checkin" => super::workbuddy_cmd(crate::WorkBuddyCmd::Checkin).await,
+        "accounts" | "acc" => super::workbuddy_cmd(crate::WorkBuddyCmd::Accounts).await,
+        "use" => {
+            let Some(name) = rest.get(1) else {
+                anyhow::bail!("切换到哪个账号？workbuddy use <名字>（workbuddy accounts 看有哪些）");
+            };
+            super::workbuddy_cmd(crate::WorkBuddyCmd::Use {
+                name: name.to_string(),
+            })
+            .await
+        }
+        other => anyhow::bail!(
+            "workbuddy 不认识「{other}」。可用：login / status / credits / models / checkin / accounts / use"
+        ),
+    }
+}
+
+/// QwenWork：login / status / credits / models。
+async fn qwen(rest: &[&str]) -> anyhow::Result<()> {
+    let sub = rest.first().copied().unwrap_or("status");
+    match sub {
+        "login" => super::qwen_cmd(crate::QwenCmd::Login).await,
+        "status" | "s" => super::qwen_cmd(crate::QwenCmd::Status).await,
+        "credits" | "credit" => super::qwen_cmd(crate::QwenCmd::Credits).await,
+        "models" | "m" => super::qwen_cmd(crate::QwenCmd::Models).await,
+        other => anyhow::bail!("qwen 不认识「{other}」。可用：login / status / credits / models"),
+    }
 }
 
 /// 建组：`group backup deepseek/deepseek-chat,glm/glm-4.6`（order 主备）。

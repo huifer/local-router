@@ -407,7 +407,7 @@ async fn a_login_session_is_opened_polled_and_stored() {
     // The session is stored in local-router's own file, 0600.
     let dir = std::env::temp_dir().join(format!("lr-store-{}", workbuddy::now_ms()));
     std::env::set_var("LOCAL_ROUTER_HOME", &dir);
-    let path = workbuddy::store_session(&result.session, &account)
+    let path = workbuddy::store_session(&result.session, &account, "default")
         .await
         .expect("the session is stored");
     assert!(path.exists());

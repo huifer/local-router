@@ -126,7 +126,16 @@ enum WorkBuddyCmd {
     /// Claim the day's check-in now.
     Checkin,
     /// Sign in to WorkBuddy: print a link, wait for the browser, wire it up.
-    Login,
+    Login {
+        /// The name to file this account under (several accounts can live
+        /// side by side).
+        #[arg(long, default_value = "default")]
+        account: String,
+    },
+    /// List the WorkBuddy accounts local-router holds.
+    Accounts,
+    /// Use another account from now on.
+    Use { name: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -988,7 +997,45 @@ async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
                 println!("  {m}");
             }
         }
-        WorkBuddyCmd::Login => login().await?,
+        WorkBuddyCmd::Login { account } => login(&account).await?,
+        WorkBuddyCmd::Accounts => {
+            let accounts = workbuddy::accounts()?;
+            if accounts.is_empty() {
+                println!("no WorkBuddy accounts yet; run: local-router workbuddy login");
+            } else {
+                println!("{:<16} {:<20} TOKEN", "ACCOUNT", "NICKNAME");
+                for (name, file) in accounts {
+                    let left = file
+                        .auth
+                        .expires_at
+                        .map(|at| format!("until {}", format_time(at)))
+                        .unwrap_or_else(|| "unknown".to_string());
+                    println!(
+                        "{:<16} {:<20} {left}",
+                        name,
+                        if file.account.nickname.is_empty() {
+                            file.account.uid.as_str()
+                        } else {
+                            file.account.nickname.as_str()
+                        }
+                    );
+                }
+                let pool = workbuddy::read_pool()?;
+                println!();
+                println!(
+                    "active: {}",
+                    if pool.active.is_empty() {
+                        "(none)"
+                    } else {
+                        &pool.active
+                    }
+                );
+            }
+        }
+        WorkBuddyCmd::Use { name } => {
+            workbuddy::use_account(&name)?;
+            println!("now using the WorkBuddy account {name}");
+        }
         WorkBuddyCmd::Checkin => match workbuddy::claim_checkin().await {
             Ok(outcome) if outcome.granted => {
                 println!(
@@ -1018,7 +1065,7 @@ async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
 /// in; the gateway polls until the tokens arrive. The tokens are stored in
 /// local-router's own session file — WorkBuddy's desktop app and its login
 /// file are left untouched.
-async fn login() -> anyhow::Result<()> {
+async fn login(account_name: &str) -> anyhow::Result<()> {
     let session = workbuddy::start_login().await?;
     println!("local-router {}", gateway::client::VERSION);
     println!("  open this link in a browser and sign in:");
@@ -1057,10 +1104,11 @@ async fn login() -> anyhow::Result<()> {
         .or_else(|| account.pointer("/account/nickname"))
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let name = account_name;
 
     // Store the session in local-router's own file, next to the config.
-    let path = workbuddy::store_session(&result.session, &account).await?;
-    println!("  signed in   {nickname}");
+    let path = workbuddy::store_session(&result.session, &account, name).await?;
+    println!("  signed in   {nickname}（账号名 {name}）");
     println!("  session     {}", path.display());
     println!(
         "  token until {}",
