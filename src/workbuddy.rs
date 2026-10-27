@@ -485,32 +485,28 @@ fn read_pool_at(path: &std::path::Path) -> anyhow::Result<SessionPool> {
 
 /// Read the pool: our own file when it exists, else the desktop app's file
 /// as a single account.
-pub fn read_pool() -> anyhow::Result<SessionPool> {
-    // An explicit path is authoritative, including when it does not exist:
-    // tests, containers and multi-account deployments use this to select one
-    // exact session instead of falling through to the desktop app.
+/// The file the pool lives in, consistently for reads and writes: the
+/// explicit session path wins, then WORKBUDDY_HOME, then local-router's own
+/// file next to the config.
+fn pool_path() -> std::path::PathBuf {
     if let Ok(explicit) = std::env::var("LOCAL_ROUTER_WORKBUDDY_SESSION") {
-        let path = PathBuf::from(explicit);
-        if !path.exists() {
-            anyhow::bail!(
-                "the WorkBuddy login file at {} was not found",
-                path.display()
-            );
-        }
-        return read_pool_at(&path);
+        return std::path::PathBuf::from(explicit);
     }
-    // WORKBUDDY_HOME is also an explicit deployment choice. It wins over
-    // local-router's own pool so the desktop/test session selected there is
-    // the one the caller asked us to use.
     if let Ok(dir) = std::env::var("WORKBUDDY_HOME") {
-        let path = PathBuf::from(dir).join("auth/workbuddy-desktop.info");
+        let path = std::path::PathBuf::from(dir).join("auth/workbuddy-desktop.info");
         if path.exists() {
-            return read_pool_at(&path);
+            return path;
         }
     }
-    let own = own_session_path();
-    if own.exists() {
-        return read_pool_at(&own);
+    own_session_path()
+}
+
+pub fn read_pool() -> anyhow::Result<SessionPool> {
+    // The pool path is the same one writes go to, so a sign-in and the next
+    // read always agree on the file.
+    let path = pool_path();
+    if path.exists() {
+        return read_pool_at(&path);
     }
     // The desktop app's own file (older versions kept the token in clear).
     let path = session_file().ok_or_else(|| {
@@ -582,7 +578,7 @@ pub fn use_account(name: &str) -> anyhow::Result<()> {
 
 /// Write the pool back to local-router's own file.
 fn write_pool(pool: &SessionPool) -> anyhow::Result<()> {
-    let path = own_session_path();
+    let path = pool_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -1208,11 +1204,10 @@ pub async fn store_session(
             scope: String::new(),
         },
     };
-    // The pool keeps every account; the one just signed in becomes active.
+    // The pool keeps every account; the one just signed in becomes the one
+    // in use — the deliberate act of signing in is also "switch to it".
     let mut pool = read_pool().unwrap_or_default();
-    if pool.accounts.is_empty() {
-        pool.active = name.to_string();
-    }
+    pool.active = name.to_string();
     pool.accounts.insert(name.to_string(), file);
     let body = serde_json::to_string_pretty(&pool)?;
     std::fs::write(&path, body)?;
@@ -1704,5 +1699,133 @@ mod pool_tests {
         assert_eq!(pool.active, "default");
         assert_eq!(pool.accounts["default"].auth.access_token, "at-1");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod multi_account_tests {
+    use super::*;
+
+    fn session_file(uid: &str, nickname: &str) -> SessionFile {
+        SessionFile {
+            account: Account {
+                uid: uid.into(),
+                nickname: nickname.into(),
+                account_type: "personal".into(),
+                last_login: true,
+            },
+            auth: Auth {
+                access_token: format!("at-{uid}"),
+                refresh_token: "rt".into(),
+                token_type: "Bearer".into(),
+                expires_at: Some(9_999_999_999_999),
+                refresh_expires_at: None,
+                domain: "www.codebuddy.cn".into(),
+                scope: String::new(),
+            },
+        }
+    }
+
+    /// Two accounts must live side by side: signing in a second one may not
+    /// throw the first away.
+    #[test]
+    fn a_second_account_does_not_throw_the_first_away() {
+        let dir = std::env::temp_dir().join(format!(
+            "local-router-pool-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("workbuddy-session.json");
+
+        let mut pool = SessionPool::default();
+        pool.accounts
+            .insert("work".into(), session_file("u-work", "工作号"));
+        pool.active = "work".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&pool).unwrap()).unwrap();
+
+        // A second sign-in, under another name.
+        let mut pool = read_pool_at(&path).unwrap();
+        pool.accounts
+            .insert("personal".into(), session_file("u-personal", "个人号"));
+        pool.active = "personal".into();
+        std::fs::write(&path, serde_json::to_string_pretty(&pool).unwrap()).unwrap();
+
+        let pool = read_pool_at(&path).unwrap();
+        assert_eq!(pool.accounts.len(), 2, "both accounts are kept");
+        assert!(pool.accounts.contains_key("work"));
+        assert!(pool.accounts.contains_key("personal"));
+        assert_eq!(pool.active, "personal");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod pool_path_tests {
+    use super::*;
+
+    /// The regression the user hit: with an explicit session path configured,
+    /// a sign-in wrote the pool to one file while reads came from another —
+    /// so a second account "vanished". Reads and writes must agree.
+    #[test]
+    fn reads_and_writes_use_the_same_pool_file() {
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("local-router-pool-path-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let explicit = dir.join("explicit-session.json");
+        // Point the config dir at the test dir too, so the fallback reads
+        // never touch a real user's pool.
+        std::env::set_var("LOCAL_ROUTER_HOME", &dir);
+        std::env::set_var("LOCAL_ROUTER_WORKBUDDY_SESSION", &explicit);
+        // First sign-in: the pool file is created at the explicit path.
+        let mut pool = read_pool().unwrap_or_default();
+        pool.accounts
+            .insert("work".into(), session_file_for_test("u-work", "at-work"));
+        pool.active = "work".into();
+        write_pool(&pool).unwrap();
+        assert!(
+            explicit.exists(),
+            "the pool is written to the explicit path"
+        );
+
+        // A second sign-in, under another name, lands in the SAME file.
+        let mut pool = read_pool().unwrap_or_default();
+        pool.accounts.insert(
+            "personal".into(),
+            session_file_for_test("u-personal", "at-personal"),
+        );
+        pool.active = "personal".into();
+        write_pool(&pool).unwrap();
+
+        let pool = read_pool().unwrap();
+        assert_eq!(pool.accounts.len(), 2, "both accounts survive");
+        assert!(pool.accounts.contains_key("work"));
+        assert!(pool.accounts.contains_key("personal"));
+        assert_eq!(pool.active, "personal");
+        std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_SESSION");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn session_file_for_test(uid: &str, token: &str) -> SessionFile {
+        SessionFile {
+            account: Account {
+                uid: uid.into(),
+                nickname: format!("{uid}-name"),
+                account_type: "personal".into(),
+                last_login: true,
+            },
+            auth: Auth {
+                access_token: token.into(),
+                refresh_token: "rt".into(),
+                token_type: "Bearer".into(),
+                expires_at: Some(9_999_999_999_999),
+                refresh_expires_at: None,
+                domain: "www.codebuddy.cn".into(),
+                scope: String::new(),
+            },
+        }
     }
 }
