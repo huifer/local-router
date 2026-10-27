@@ -44,6 +44,8 @@ export default function ProvidersPage() {
   const sessionSignIn = async (presetId: string) => {
     setSigningIn(true);
     try {
+      // The gateway creates the provider on sight if it is not configured
+      // yet: a session vendor needs no key, so there is nothing else to ask.
       const flow = await api<{ url: string }>(`/api/providers/${encodeURIComponent(presetId)}/login`, {
         method: "POST",
       });

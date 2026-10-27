@@ -886,6 +886,24 @@ async fn api_session_login_start(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // The provider may not exist yet: the console offers the sign-in on the
+    // preset, before anything is configured. Create it on sight — a
+    // session-backed vendor needs no key, so an empty provider is complete.
+    if state.config.read().await.provider(&id).is_none() {
+        let Some(preset) = crate::presets::get(&id) else {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("there is no provider called {id}")})),
+            ));
+        };
+        let provider = crate::presets::to_provider(preset, None);
+        let _ = state
+            .update(|config| {
+                config.providers.push(provider.clone());
+                Ok::<(), String>(())
+            })
+            .await;
+    }
     let kind = {
         let config = state.config.read().await;
         config.provider(&id).and_then(|p| p.auth)
