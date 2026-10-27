@@ -71,15 +71,7 @@ pub struct Projects {
 static REGISTRY: OnceLock<Arc<Mutex<Option<Projects>>>> = OnceLock::new();
 
 fn registry() -> &'static Arc<Mutex<Option<Projects>>> {
-    REGISTRY.get_or_init(|| {
-        let mut projects = Projects::default();
-        if let Ok(text) = std::fs::read_to_string(projects_file()) {
-            if let Ok(parsed) = serde_json::from_str::<Projects>(&text) {
-                projects = parsed;
-            }
-        }
-        Arc::new(Mutex::new(Some(projects)))
-    })
+    REGISTRY.get_or_init(|| Arc::new(Mutex::new(Some(read_from_disk()))))
 }
 
 /// Persist the registry to disk.
@@ -118,6 +110,28 @@ pub fn note(dir: &str) {
     let snapshot = projects.clone();
     drop(guard);
     save(&snapshot);
+}
+
+/// Re-read the registry from disk.
+///
+/// The registry is process-global, so a caller that moves the config
+/// directory (a test, or a tool that hosts several configurations) needs to
+/// drop the copy it loaded at startup.
+pub fn reload() {
+    let fresh = read_from_disk();
+    let mut guard = registry().lock().unwrap();
+    *guard = Some(fresh);
+}
+
+/// The registry as the file holds it.
+fn read_from_disk() -> Projects {
+    let mut projects = Projects::default();
+    if let Ok(text) = std::fs::read_to_string(projects_file()) {
+        if let Ok(parsed) = serde_json::from_str::<Projects>(&text) {
+            projects = parsed;
+        }
+    }
+    projects
 }
 
 /// Read the whole registry.
@@ -228,6 +242,7 @@ fn normalize(dir: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::IsolatedHome;
 
     /// The registry is process-global; the tests below share it, so every
     /// directory is namespaced and assertions never touch other tests' rows.
@@ -265,6 +280,9 @@ mod tests {
 
     #[test]
     fn note_is_idempotent_and_never_overwrites_a_name() {
+        // Never touch the user's real registry.
+        let _home = IsolatedHome::new("projects");
+        reload();
         let dir = udir("note");
         note(&dir);
         note(&dir);
@@ -275,6 +293,9 @@ mod tests {
 
     #[test]
     fn patch_renames_recolors_and_sets_budgets() {
+        // Never touch the user's real registry.
+        let _home = IsolatedHome::new("projects");
+        reload();
         let dir = udir("patch");
         note(&dir);
         let edit = ProjectPatch {
@@ -309,6 +330,9 @@ mod tests {
 
     #[test]
     fn merge_moves_the_row_and_its_friendly_fields() {
+        // Never touch the user's real registry.
+        let _home = IsolatedHome::new("projects");
+        reload();
         let from = udir("merge-from");
         let into = udir("merge-into");
         note(&from);
@@ -337,6 +361,9 @@ mod tests {
 
     #[test]
     fn empty_directories_are_not_registered() {
+        // Never touch the user's real registry.
+        let _home = IsolatedHome::new("projects");
+        reload();
         let marker = udir("marker");
         note(&marker);
         let before = load();

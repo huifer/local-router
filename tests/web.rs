@@ -13,6 +13,9 @@ use local_router::config::{AppState, Config, Settings, Store};
 /// One more unique number per test, so concurrent stores never share a file.
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// The environment is process-global; tests that change it take this lock.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 async fn state_at(web_addr: &str) -> AppState {
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let dir =
@@ -257,8 +260,19 @@ async fn the_usage_endpoint_carries_every_panel_shape() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn projects_flow_through_the_console_api() {
-    let dir = "/tmp/lr-web-proj-test";
-    local_router::projects::note(dir);
+    // The registry is process-global and resolves through the config dir:
+    // point it at a temp home so this test never writes the user's file.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = std::env::temp_dir().join(format!(
+        "local-router-web-proj-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var("LOCAL_ROUTER_HOME", &home);
+    local_router::projects::reload();
+    let dir = home.join("work").to_string_lossy().to_string();
+    local_router::projects::note(&dir);
     let state = state_at("127.0.0.1").await;
 
     // Listed with the row shape the Projects panel renders.
@@ -292,7 +306,7 @@ async fn projects_flow_through_the_console_api() {
         .oneshot(
             Request::builder()
                 .method("PATCH")
-                .uri(format!("/api/projects?id={}", urlencode(dir)))
+                .uri(format!("/api/projects?id={}", urlencode(&dir)))
                 .header("content-type", "application/json")
                 .body(Body::from(r#"{"name": "Renamed"}"#))
                 .unwrap(),
@@ -325,6 +339,8 @@ async fn projects_flow_through_the_console_api() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    std::env::remove_var("LOCAL_ROUTER_HOME");
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// Percent-encode everything a path segment may not carry.

@@ -49,15 +49,28 @@ pub struct Sessions {
 static BOOK: OnceLock<Arc<Mutex<Option<Sessions>>>> = OnceLock::new();
 
 fn book() -> &'static Arc<Mutex<Option<Sessions>>> {
-    BOOK.get_or_init(|| {
-        let mut sessions = Sessions::default();
-        if let Ok(text) = std::fs::read_to_string(sessions_file()) {
-            if let Ok(parsed) = serde_json::from_str::<Sessions>(&text) {
-                sessions = parsed;
-            }
+    BOOK.get_or_init(|| Arc::new(Mutex::new(Some(read_from_disk()))))
+}
+
+/// Re-read the book from disk.
+///
+/// The book is process-global, so a caller that moves the config directory
+/// (a test, most often) needs to drop the copy loaded at startup.
+pub fn reload() {
+    let fresh = read_from_disk();
+    let mut guard = book().lock().unwrap();
+    *guard = Some(fresh);
+}
+
+/// The book as the file holds it.
+fn read_from_disk() -> Sessions {
+    let mut sessions = Sessions::default();
+    if let Ok(text) = std::fs::read_to_string(sessions_file()) {
+        if let Ok(parsed) = serde_json::from_str::<Sessions>(&text) {
+            sessions = parsed;
         }
-        Arc::new(Mutex::new(Some(sessions)))
-    })
+    }
+    sessions
 }
 
 /// Load the book from memory (or disk on first use).
@@ -127,6 +140,7 @@ pub fn title_of(id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testenv::IsolatedHome;
 
     /// The book is process-global; the tests below share it, so every id
     /// is namespaced with a unique prefix and assertions are prefix-scoped.
@@ -140,6 +154,9 @@ mod tests {
 
     #[test]
     fn empty_ids_are_ignored() {
+        // Never touch the user's real session book.
+        let _home = IsolatedHome::new("sessions");
+        reload();
         let marker = uid("marker");
         note(&marker, Some("sentinel"));
         let before = load();
@@ -152,6 +169,9 @@ mod tests {
 
     #[test]
     fn note_creates_counts_and_titles() {
+        // Never touch the user's real session book.
+        let _home = IsolatedHome::new("sessions");
+        reload();
         let id = uid("note");
         note(&id, Some("帮我重构网关模块\n第二行不算"));
         note(&id, None);
@@ -167,6 +187,9 @@ mod tests {
 
     #[test]
     fn a_session_without_a_title_falls_back_to_its_id() {
+        // Never touch the user's real session book.
+        let _home = IsolatedHome::new("sessions");
+        reload();
         let id = uid("untitled");
         note(&id, None);
         note(&id, Some("   \n  ")); // whitespace-only titles do not stick

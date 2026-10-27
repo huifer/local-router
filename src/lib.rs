@@ -14,5 +14,7 @@ pub mod server;
 pub mod session_logins;
 pub mod sessions;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod testenv;
 pub mod web;
 pub mod workbuddy;
