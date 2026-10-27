@@ -401,6 +401,8 @@ EOF
 CLI 或控制台改了 `config.json`，网关在**下一个请求**自动重载（mtime 探测），
 不用重启。
 
+> 完整字段表与优先级见 [docs/CONFIG.md](docs/CONFIG.md)。
+
 ### 4.2 settings 字段
 
 | 字段 | 作用 |

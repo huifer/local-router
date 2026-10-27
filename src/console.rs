@@ -84,9 +84,9 @@ async fn handle(line: &str) -> anyhow::Result<()> {
         "status" => status().await?,
         "start" => {
             super::daemon_cmd(super::DaemonCmd::Start {
-                port: crate::env_port("LOCAL_ROUTER_GATEWAY_PORT", 3435),
+                port: None,
                 web_port: 0,
-                addr: "127.0.0.1".to_string(),
+                addr: None,
                 web_addr: None,
                 lan: false,
                 wait: true,

@@ -444,6 +444,7 @@ cd frontend && npm run dev   # 控制台热更新（API 代理到 :3435）
 ## 参与贡献
 
 - [USAGE.md](USAGE.md)：使用说明（安装、命令速查、场景做法、排障）
+- [docs/CONFIG.md](docs/CONFIG.md)：配置参考（文件格式、每个字段、覆盖优先级）
 - [CONTRIBUTING.md](CONTRIBUTING.md)：环境搭建、提交前检查、怎么改
 - [SECURITY.md](SECURITY.md)：漏洞私下报告渠道与安全模型
 - [CHANGELOG.md](CHANGELOG.md)：每个版本的变更

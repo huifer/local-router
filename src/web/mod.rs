@@ -175,6 +175,7 @@ async fn style_css() -> impl IntoResponse {
 // ------------------------------------------------------------------- api --
 
 async fn api_status(State(state): State<AppState>) -> Json<Value> {
+    state.sync().await;
     let config = state.config.read().await;
     Json(json!({
         "version": client::VERSION,
@@ -268,6 +269,7 @@ fn mask(key: &str) -> String {
 }
 
 async fn api_providers(State(state): State<AppState>) -> Json<Value> {
+    state.sync().await;
     let config = state.config.read().await;
     Json(json!({
         "providers": config.providers.iter().map(redact).collect::<Vec<_>>(),
@@ -895,6 +897,7 @@ async fn api_test_provider(
 }
 
 async fn api_models(State(state): State<AppState>) -> Json<Value> {
+    state.sync().await;
     let config = state.config.read().await;
     let mut out = Vec::new();
     for p in &config.providers {
@@ -922,6 +925,7 @@ async fn api_models(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn api_groups(State(state): State<AppState>) -> Json<Value> {
+    state.sync().await;
     let config = state.config.read().await;
     Json(json!({"groups": config.groups}))
 }
@@ -940,6 +944,9 @@ struct GroupInput {
     listed: Option<bool>,
     #[serde(default)]
     note: Option<String>,
+    /// The weight of each member, for `weight` routing (member=weight).
+    #[serde(default)]
+    weights: Option<BTreeMap<String, u32>>,
 }
 
 async fn api_add_group(
@@ -999,6 +1006,7 @@ async fn api_update_group(
         stays: None,
         listed: None,
         note: None,
+        weights: None,
     });
     state
         .update(|config| {
@@ -1022,6 +1030,9 @@ async fn api_update_group(
             }
             if input.note.is_some() {
                 g.note = input.note;
+            }
+            if let Some(w) = input.weights {
+                g.weights = w;
             }
             Ok(())
         })
@@ -1085,6 +1096,7 @@ fn slug(name: &str) -> String {
 // --------------------------------------------------------------- settings --
 
 async fn api_settings(State(state): State<AppState>) -> Json<Value> {
+    state.sync().await;
     let config = state.config.read().await;
     Json(json!({"settings": config.settings}))
 }

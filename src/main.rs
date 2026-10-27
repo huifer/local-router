@@ -10,6 +10,7 @@ use local_router::{
     config, gateway, presets, pricing, protocol, qwen, server, store, web, workbuddy,
 };
 
+use std::collections::BTreeMap;
 use std::io::IsTerminal;
 use std::sync::Arc;
 
@@ -81,15 +82,17 @@ enum DaemonCmd {
     /// Start the daemon in the background (gateway + console, one process).
     Start {
         /// The port the daemon listens on: the gateway and the console
-        /// share it.
-        #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3435)]
-        port: u16,
+        /// share it. Defaults to the file's setting, then the environment,
+        /// then 3435.
+        #[arg(long)]
+        port: Option<u16>,
         /// Deprecated: the console is on the daemon's port now.
         #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 0, hide = true)]
         web_port: u16,
-        /// The address to bind.
-        #[arg(long, env = "LOCAL_ROUTER_GATEWAY_ADDR", default_value = "127.0.0.1")]
-        addr: String,
+        /// The address to bind. Defaults to the file's setting, then the
+        /// environment, then 127.0.0.1.
+        #[arg(long)]
+        addr: Option<String>,
         /// Deprecated: the console binds with the gateway.
         #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR", hide = true)]
         web_addr: Option<String>,
@@ -138,29 +141,13 @@ enum QwenCmd {
     Login,
 }
 
-impl Default for ServeArgs {
-    fn default() -> Self {
-        ServeArgs {
-            port: env_port("LOCAL_ROUTER_GATEWAY_PORT", 3435),
-            web_port: 0,
-            no_console: false,
-            lan: false,
-            addr: std::env::var("LOCAL_ROUTER_GATEWAY_ADDR")
-                .ok()
-                .filter(|v| !v.trim().is_empty())
-                .unwrap_or_else(|| "127.0.0.1".to_string()),
-            web_addr: None,
-        }
-    }
-}
-
-#[derive(Args, Debug, Clone)]
+#[derive(Args, Debug, Clone, Default)]
 struct ServeArgs {
     /// The port local-router listens on: the gateway and the console share
-    /// it. Zero lets the system pick a free one. Defaults to
-    /// LOCAL_ROUTER_GATEWAY_PORT, then the file, then 3435.
-    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_PORT", default_value_t = 3435)]
-    port: u16,
+    /// it. Zero lets the system pick a free one. Defaults to the file's
+    /// setting, then LOCAL_ROUTER_GATEWAY_PORT, then 3435.
+    #[arg(long)]
+    port: Option<u16>,
     /// Deprecated: the console is on the gateway's port now. Zero still
     /// turns the console off.
     #[arg(long, env = "LOCAL_ROUTER_WEB_PORT", default_value_t = 0, hide = true)]
@@ -171,9 +158,10 @@ struct ServeArgs {
     /// Bind on the local network, so other computers can use the gateway.
     #[arg(long)]
     lan: bool,
-    /// The address to bind.
-    #[arg(long, env = "LOCAL_ROUTER_GATEWAY_ADDR", default_value = "127.0.0.1")]
-    addr: String,
+    /// The address to bind. Defaults to the file's setting, then
+    /// LOCAL_ROUTER_GATEWAY_ADDR, then 127.0.0.1.
+    #[arg(long)]
+    addr: Option<String>,
     /// Deprecated: the console binds with the gateway.
     #[arg(long, env = "LOCAL_ROUTER_WEB_ADDR", hide = true)]
     web_addr: Option<String>,
@@ -294,6 +282,13 @@ enum GroupCmd {
     List,
     /// Remove a group.
     Rm { id: String },
+    /// Set the weights of a weight-routed group (member=weight, comma separated).
+    Weights {
+        id: String,
+        /// e.g. `deepseek/deepseek-chat=3,glm/glm-4.6=1`; empty clears them.
+        #[arg(default_value = "", value_delimiter = ',')]
+        rules: Vec<String>,
+    },
 }
 
 #[tokio::main]
@@ -342,14 +337,6 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
-/// Read a port from the environment, falling back when absent or odd.
-fn env_port(name: &str, fallback: u16) -> u16 {
-    std::env::var(name)
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(fallback)
-}
-
 // ---------------------------------------------------------------- servers --
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
@@ -357,17 +344,23 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     let state = AppState::load(store).await?;
     let config = state.config.read().await;
     // Environment first (containers), then the command line (people).
+    // The file first, then the environment, then the command line: the
+    // command line wins only when it was actually given.
     let mut settings = config.settings.clone().from_env();
-    settings.gateway_port = args.port;
-    settings.gateway_addr = args.addr.clone();
-    if args.lan {
+    if let Some(port) = args.port {
+        settings.gateway_port = port;
+    }
+    if let Some(addr) = &args.addr {
+        settings.gateway_addr = addr.trim().to_string();
+    }
+    if args.lan || settings.lan {
         settings.gateway_addr = "0.0.0.0".to_string();
     }
     // The console lives on the gateway's port now. The switch that decides
     // whether it is served at all is `--no-console` (or `console: false` in
     // the file); a legacy `web_port` is only a leftover.
     let console = !args.no_console && settings.console;
-    if args.web_port != 0 && args.web_port != args.port {
+    if args.web_port != 0 && Some(args.web_port) != args.port {
         eprintln!(
             "note: the console now shares the gateway's port; --web-port {} is ignored",
             args.web_port
@@ -1296,10 +1289,13 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
                 println!("already running (pid {pid}) — stop it first: local-router daemon stop");
                 return Ok(());
             }
+            // The effective address: the file first, then the environment,
+            // then the command line (which is what the child will use).
+            let (port, addr) = effective_address(&args);
             start_daemon(&args)?;
             if wait {
                 // Wait until the port answers, or say what went wrong.
-                let gateway = format!("http://{}:{port}/health", args.addr);
+                let gateway = format!("http://{addr}:{port}/health");
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
                 loop {
                     let gateway_up = reqwest::get(&gateway)
@@ -1318,10 +1314,7 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
             }
-            println!(
-                "daemon started  gateway + console http://{}:{}",
-                args.addr, args.port
-            );
+            println!("daemon started  gateway + console http://{}:{}", addr, port);
             println!("logs: {}", log_file().display());
             Ok(())
         }
@@ -1354,9 +1347,11 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
             match running_pid() {
                 Some(pid) => {
                     let args = read_start_args().unwrap_or_default();
+                    let port = args.port.unwrap_or(3435);
+                    let addr = args.addr.clone().unwrap_or_else(|| "127.0.0.1".to_string());
                     println!("running    yes (pid {pid})");
-                    println!("gateway    http://{}:{}", args.addr, args.port);
-                    println!("console    http://{}:{}  (same port)", args.addr, args.port);
+                    println!("gateway    http://{addr}:{port}");
+                    println!("console    http://{addr}:{port}  (same port)");
                     println!("logs       {}", log_file().display());
                 }
                 None => println!("running    no"),
@@ -1384,9 +1379,9 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct DaemonStart {
-    port: u16,
+    port: Option<u16>,
     web_port: u16,
-    addr: String,
+    addr: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     web_addr: Option<String>,
     #[serde(default)]
@@ -1399,6 +1394,23 @@ fn read_start_args() -> Option<DaemonStart> {
 }
 
 /// Spawn this same binary as a detached background process.
+/// The port and address the daemon will actually bind: the file's setting,
+/// then the environment, then the command line.
+fn effective_address(args: &DaemonStart) -> (u16, String) {
+    let settings = load_config()
+        .map(|c| c.settings)
+        .unwrap_or_default()
+        .from_env();
+    let port = args.port.unwrap_or(settings.gateway_port);
+    let addr = args
+        .addr
+        .clone()
+        .unwrap_or(settings.gateway_addr)
+        .trim()
+        .to_string();
+    (port, addr)
+}
+
 fn start_daemon(args: &DaemonStart) -> anyhow::Result<()> {
     std::fs::create_dir_all(daemon_dir())?;
     let exe = std::env::current_exe()?;
@@ -1410,13 +1422,17 @@ fn start_daemon(args: &DaemonStart) -> anyhow::Result<()> {
     let mut command = std::process::Command::new(exe);
     command
         .arg("serve")
-        .arg("--port")
-        .arg(args.port.to_string())
-        .arg("--addr")
-        .arg(&args.addr)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
+    // Only pass what was actually given: the daemon inherits the file's
+    // settings otherwise.
+    if let Some(port) = args.port {
+        command.arg("--port").arg(port.to_string());
+    }
+    if let Some(addr) = &args.addr {
+        command.arg("--addr").arg(addr);
+    }
     if args.lan {
         command.arg("--lan");
     }
@@ -1541,6 +1557,38 @@ async fn group_cmd(cmd: GroupCmd) -> anyhow::Result<()> {
             }
             save_config(&config)?;
             println!("removed the group {id}");
+        }
+        GroupCmd::Weights { id, rules } => {
+            let mut weights: BTreeMap<String, u32> = BTreeMap::new();
+            for rule in &rules {
+                let Some((member, weight)) = rule.split_once('=') else {
+                    anyhow::bail!("{rule} 不是 member=weight 形式");
+                };
+                let weight: u32 = weight
+                    .trim()
+                    .parse()
+                    .with_context(|| format!("{weight} 不是一个数字（权重是 1–1000 的整数）"))?;
+                weights.insert(member.trim().to_string(), weight.clamp(1, 1000));
+            }
+            {
+                let Some(g) = config.group_mut(&id) else {
+                    anyhow::bail!("there is no group called {id}");
+                };
+                g.weights = weights.clone();
+            }
+            save_config(&config)?;
+            println!(
+                "{id} 的权重：{}",
+                if weights.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    weights
+                        .iter()
+                        .map(|(m, w)| format!("{m}={w}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            );
         }
     }
     Ok(())

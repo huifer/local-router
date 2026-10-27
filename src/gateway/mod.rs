@@ -254,7 +254,7 @@ async fn status(State(g): State<Gateway>) -> Json<Value> {
 
 /// The models the gateway serves, in the OpenAI list shape.
 async fn list_models(State(g): State<Gateway>, headers: HeaderMap) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let config = g.state.config.read().await;
@@ -313,7 +313,7 @@ async fn get_model(
     Path((provider, model)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let config = g.state.config.read().await;
@@ -332,7 +332,7 @@ async fn get_model(
 
 /// What the routing view shows.
 async fn route_info(State(g): State<Gateway>, headers: HeaderMap) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let config = g.state.config.read().await;
@@ -373,7 +373,7 @@ async fn route_info(State(g): State<Gateway>, headers: HeaderMap) -> Response {
 
 /// The quota windows of every provider that reports one.
 async fn quotas(State(g): State<Gateway>, headers: HeaderMap) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let config = g.state.config.read().await;
@@ -445,7 +445,7 @@ async fn usage_summary(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let (period, days) = usage_period(&query);
@@ -506,7 +506,7 @@ async fn usage_requests(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let (period, days) = usage_period(&query);
@@ -585,6 +585,16 @@ pub(crate) fn presented_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// The auth check every endpoint goes through.
+///
+/// It reloads the configuration first when the file changed, so a key or a
+/// provider added by hand (or by the CLI) takes effect on the very next
+/// request — on any endpoint, not just the chat ones.
+async fn authorize(g: &Gateway, headers: &HeaderMap) -> Result<(), ApiError> {
+    g.state.sync().await;
+    check_auth(g, headers)
+}
+
 fn check_auth(g: &Gateway, headers: &HeaderMap) -> Result<(), ApiError> {
     let Some(presented) = presented_key(headers) else {
         return Err(ApiError::Unauthorized(
@@ -633,7 +643,7 @@ async fn image_generations(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let requested = body.get("model").and_then(Value::as_str).unwrap_or("");
@@ -655,7 +665,7 @@ async fn image_edits(
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let mut fields: Vec<(String, Option<String>, Option<String>, bytes::Bytes)> = Vec::new();
@@ -703,7 +713,7 @@ async fn video_create(
     headers: HeaderMap,
     Json(mut body): Json<Value>,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let requested = body.get("model").and_then(Value::as_str).unwrap_or("");
@@ -1014,7 +1024,7 @@ async fn media_task_request(
     method: &str,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(e) = check_auth(g, &headers) {
+    if let Err(e) = authorize(g, &headers).await {
         return error_response(&e);
     }
     if id.contains('/') || id.contains("..") {
@@ -1129,7 +1139,7 @@ async fn count_tokens(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     let value: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
@@ -1232,7 +1242,7 @@ async fn handle(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Err(e) = check_auth(&g, &headers) {
+    if let Err(e) = authorize(&g, &headers).await {
         return error_response(&e);
     }
     // The CLI or the web page may have changed the file.

@@ -898,3 +898,161 @@ impl AppState {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod config_surface_tests {
+    use super::*;
+
+    /// Every field of the main config must survive a round trip through the
+    /// file: a field that silently drops is a setting the user cannot set.
+    #[test]
+    fn a_full_config_survives_the_file_unchanged() {
+        let mut config = Config::default();
+        config.providers.push(Provider {
+            id: "p".into(),
+            name: "P".into(),
+            kind: "custom".into(),
+            enabled: true,
+            protocol: Protocol::Anthropic,
+            base_url: Some("https://x/v1".into()),
+            anthropic_base_url: Some("https://x/a".into()),
+            responses_base_url: Some("https://x/r".into()),
+            gemini_base_url: Some("https://x/g".into()),
+            keys: vec![ProviderKey {
+                id: "k".into(),
+                key: "sk-1".into(),
+                enabled: true,
+                label: Some("l".into()),
+            }],
+            models: vec!["m".into()],
+            auto_include: vec!["m-*".into()],
+            catalog: Some("c".into()),
+            headers: BTreeMap::from([("x-a".to_string(), "1".to_string())]),
+            user_agent: Some("ua/{version}".into()),
+            forward_headers: vec!["x-session".into()],
+            remove_headers: vec!["x-drop".into()],
+            header_order: vec!["user-agent".into()],
+            proxy: None,
+            group_only: true,
+            auth: Some(AuthKind::QwenWork),
+            chat_path: Some("/v2/chat".into()),
+            stream_only: true,
+            hold_when_exhausted: true,
+            media_models: vec!["img".into()],
+            media_paths: None,
+        });
+        config.groups.push(Group {
+            id: "g".into(),
+            name: "G".into(),
+            models: vec!["p/m".into()],
+            routing: Routing::Weight,
+            weights: BTreeMap::from([("p/m".to_string(), 3u32)]),
+            stays: Stays::Strict,
+            listed: false,
+            note: Some("n".into()),
+        });
+        config.settings = Settings {
+            gateway_port: 1234,
+            console: false,
+            lan: true,
+            gateway_addr: "0.0.0.0".into(),
+            default_caller_key: "k".into(),
+            send_agent_user_agent: true,
+            masking: true,
+            record_usage: false,
+            locale: "en-US".into(),
+            cors_origins: vec!["*".into()],
+            workbuddy_auto_checkin: false,
+            ..Settings::default()
+        };
+        config.caller_keys.push(CallerKey {
+            id: "ck".into(),
+            name: "N".into(),
+            key: "sk-ck".into(),
+            enabled: true,
+            daily_tokens: Some(10),
+            monthly_cost: Some(1.5),
+        });
+
+        let raw = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&raw).unwrap();
+        let a = serde_json::to_value(&config).unwrap();
+        let b = serde_json::to_value(&back).unwrap();
+        assert_eq!(a, b, "the config changed on the way through the file");
+    }
+
+    /// A file that only knows the old fields still loads: the new ones fall
+    /// back to their defaults.
+    #[test]
+    fn an_old_file_gets_defaults_for_the_new_fields() {
+        let old = r#"{
+            "providers": [{
+                "id": "p", "name": "P",
+                "base_url": "https://x/v1",
+                "keys": [{"id": "k", "key": "sk"}]
+            }],
+            "groups": [],
+            "settings": {"gateway_port": 4000}
+        }"#;
+        let config: Config = serde_json::from_str(old).unwrap();
+        let p = &config.providers[0];
+        assert!(p.forward_headers.is_empty());
+        assert!(p.remove_headers.is_empty());
+        assert!(p.header_order.is_empty());
+        assert!(p.user_agent.is_none());
+        assert!(p.enabled, "enabled defaults to true");
+        assert!(config.settings.console, "the console is on by default");
+        assert!(config.settings.workbuddy_auto_checkin);
+    }
+
+    /// The env overlay only bends what it names; everything else is kept.
+    #[test]
+    fn the_env_overlay_keeps_the_file_values_it_does_not_name() {
+        let settings = Settings {
+            gateway_port: 4000,
+            masking: true,
+            ..Settings::default()
+        };
+        let out = settings.clone().from_env();
+        // No LOCAL_ROUTER_* set in the test process: the file wins.
+        assert_eq!(out.gateway_port, 4000);
+        assert!(out.masking);
+        assert_eq!(out.default_caller_key, settings.default_caller_key);
+    }
+}
+
+#[cfg(test)]
+mod precedence_tests {
+    use super::*;
+
+    /// The port must come out of the file when the command line and the
+    /// environment say nothing — the CLI's default must not silently win.
+    #[test]
+    fn the_files_port_survives_a_start_without_arguments() {
+        let mut config = Config::default();
+        config.settings.gateway_port = 13555;
+        config.settings.gateway_addr = "127.0.0.1".into();
+        let dir =
+            std::env::temp_dir().join(format!("local-router-precedence-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::at(dir.join("config.json"));
+        store.save(&config).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.settings.gateway_port, 13555);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The environment still beats the file.
+    #[test]
+    fn the_env_beats_the_file_for_the_port() {
+        let mut settings = Settings {
+            gateway_port: 13555,
+            ..Settings::default()
+        };
+        // SAFETY: single-threaded test body; no other thread reads it here.
+        std::env::set_var("LOCAL_ROUTER_GATEWAY_PORT", "13556");
+        let out = std::mem::take(&mut settings).from_env();
+        std::env::remove_var("LOCAL_ROUTER_GATEWAY_PORT");
+        assert_eq!(out.gateway_port, 13556);
+    }
+}
