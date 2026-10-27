@@ -8,6 +8,20 @@
 
 ### Added
 
+- **请求头重写**（对齐 [icebear0828/codex-proxy](https://github.com/icebear0828/codex-proxy)
+  的同名能力）：provider 新增五组请求头规则——
+  - `headers`：静态头注入，值支持 `{version}` / `{platform}` / `{arch}`
+    模板占位符（未知占位符原样保留，JSON 花括号不误伤）；
+  - `forward_headers`：把调用方发来的同名头**原样转发**给上游
+    （Console Go 上游要求调用方自己的 `x-opencode-session`；没带就不造）；
+  - `remove_headers`：发送前删除命名的头，最后执行、赢过其它规则
+    （可删掉厂商不认识的默认头）；
+  - `user_agent`：UA 模板，占位符同样展开；
+  - `header_order`：上游头的发送顺序提示。
+  CLI：`provider set-headers / forward-headers / remove-headers /
+  header-order / user-agent / headers`；控制台 PATCH 同字段；6 个单元测试
+  + 行为级冒烟（mock 记录收到的头逐一比对）。
+
 - **使用说明 USAGE.md**：面向使用者的完整操作手册——五分钟跑起来、CLI 命令
   速查、四种入口协议的 curl 示例、11 个常见场景（自动故障转移 / 轮询分摊 /
   最闲优先 / 会话粘性 / 局域网共享 / 开机自启 / 项目计费 / 密钥遮蔽 /

@@ -366,6 +366,39 @@ local-router claude qwenwork/qwen3-coder-plus   # 让 Claude Code 走 QwenWork
 - 容器里看不到宿主机登录态时，把会话文件挂进去并设
   `LOCAL_ROUTER_QWEN_SESSION`。
 
+### 请求头重写
+
+不同上游对请求头的挑剔程度不一样：有的中转站要求带上调用方自己的会话头，
+有的会拒绝陌生的 `anthropic-version`，还有的按头发顺序做指纹。provider 上
+有五组规则（对齐 [icebear0828/codex-proxy](https://github.com/icebear0828/codex-proxy)
+的请求头重写能力）：
+
+| 规则 | 作用 | 执行顺序 |
+| --- | --- | --- |
+| `headers` | 每个请求都带的静态头，值里 `{version}` / `{platform}` / `{arch}` 会展开 | 1 |
+| `forward_headers` | 把**调用方**发来的同名头原样转发给上游（没带就不造一个） | 2 |
+| `remove_headers` | 把命名的头删掉——鉴权头、静态头、转发来的都可能删 | 3（最后跑，赢过一切） |
+| `user_agent` | UA 模板，占位符同样展开；不设则透传 agent 的 UA（见 `send_agent_user_agent`） | — |
+| `header_order` | 上游头的发送顺序，没列的跟在后面（纯提示，多数厂商不在乎） | 发送时 |
+
+命令行：
+
+```sh
+local-router provider set-headers deepseek "x-profile=gw-{version}-{arch}" "x-team=infra"
+local-router provider forward-headers deepseek "x-opencode-session,x-request-id"
+local-router provider remove-headers deepseek "anthropic-version"
+local-router provider header-order deepseek "user-agent,authorization,x-profile"
+local-router provider user-agent deepseek "my-relay/{version} ({platform} {arch})"
+local-router provider headers deepseek        # 查看全部规则
+```
+
+控制台 PATCH `/api/providers/{id}` 同样接受 `headers` / `forward_headers` /
+`remove_headers` / `header_order` / `user_agent` 字段。
+
+典型用法：**OpenCode 的 Console Go 上游**会拒绝没有 `x-opencode-session`
+的请求——`forward-headers` 把 agent 自己的会话头原样带过去就能直连；
+**要删掉某厂商不认识的头**（有些中转对陌生头直接 400）用 `remove-headers`。
+
 ### 模型目录与自动纳新
 
 每个 provider 的 `models` 是对外暴露的白名单；「刷新模型」（控制台按钮或

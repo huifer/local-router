@@ -138,6 +138,7 @@ pub fn auth_headers(
     provider: &Provider,
     key: &str,
     agent_user_agent: Option<&str>,
+    caller_headers: Option<&reqwest::header::HeaderMap>,
 ) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::new();
     match protocol {
@@ -157,20 +158,88 @@ pub fn auth_headers(
         }
     }
     for (name, value) in &provider.headers {
-        headers.insert(name.to_lowercase(), value.clone());
+        // Static values may carry {version} / {platform} / {arch} — the way
+        // codex-proxy's user_agent_template does.
+        headers.insert(name.to_lowercase(), expand_template(value));
     }
     let ua = provider
         .user_agent
         .as_deref()
+        .map(expand_template)
         .filter(|v| !v.is_empty())
-        .or(agent_user_agent);
+        .or_else(|| agent_user_agent.map(|s| s.to_string()));
     match ua {
-        Some("local-router") | None => {}
+        Some(ua) if ua == "local-router" => {}
         Some(ua) => {
-            headers.insert("user-agent".to_string(), ua.to_string());
+            headers.insert("user-agent".to_string(), ua);
+        }
+        None => {}
+    }
+    apply_header_rules(&mut headers, provider, caller_headers);
+    headers
+}
+
+/// Expand `{version}` / `{platform}` / `{arch}` placeholders in a header
+/// value, the way codex-proxy's `user_agent_template` does. Unknown
+/// placeholders are left alone, so a header carrying JSON braces survives.
+pub fn expand_template(value: &str) -> String {
+    value
+        .replace("{version}", env!("CARGO_PKG_VERSION"))
+        .replace("{platform}", std::env::consts::OS)
+        .replace("{arch}", std::env::consts::ARCH)
+}
+
+/// Apply the provider's header rules, in codex-proxy's order:
+///
+/// 1. `forward_headers` — copy the named headers from the caller's request
+///    verbatim, when the caller sent them (Console Go refuses requests
+///    without the client's own `x-opencode-session`; relays that log want
+///    the caller's `x-request-id`).
+/// 2. `remove_headers` — drop named headers last, so a rule here wins over
+///    the auth header and anything injected above.
+///
+/// `header_order` is applied last, by `ordered_headers`, at send time.
+fn apply_header_rules(
+    headers: &mut BTreeMap<String, String>,
+    provider: &Provider,
+    agent_headers: Option<&reqwest::header::HeaderMap>,
+) {
+    if let Some(incoming) = agent_headers {
+        for name in &provider.forward_headers {
+            let name = name.to_lowercase();
+            if let Some(value) = incoming
+                .get(&name)
+                .and_then(|v| v.to_str().ok())
+                .filter(|v| !v.trim().is_empty())
+            {
+                headers.insert(name, value.to_string());
+            }
         }
     }
-    headers
+    for name in &provider.remove_headers {
+        headers.remove(&name.to_lowercase());
+    }
+}
+
+/// Send-time shape of the header map: the provider's `header_order` when it
+/// lists any, else the natural order. Ordering is a hint to picky relays;
+/// HTTP itself does not care.
+pub fn ordered_headers(
+    mut headers: BTreeMap<String, String>,
+    order: &[String],
+) -> Vec<(String, String)> {
+    if order.is_empty() {
+        return headers.into_iter().collect();
+    }
+    let mut out: Vec<(String, String)> = Vec::with_capacity(headers.len());
+    for name in order {
+        let name = name.to_lowercase();
+        if let Some(value) = headers.remove(&name) {
+            out.push((name, value));
+        }
+    }
+    out.extend(headers);
+    out
 }
 
 /// The headers for a provider that authenticates with a local app's
@@ -192,6 +261,7 @@ pub fn session_headers(
     for (name, value) in &provider.headers {
         headers.insert(name.to_lowercase(), value.clone());
     }
+    apply_header_rules(&mut headers, provider, None);
     headers
 }
 
@@ -220,7 +290,8 @@ pub async fn send(
     };
 
     let mut req = client.post(&url).json(&body);
-    for (name, value) in &headers {
+    // The provider's header_order, when it lists any, shapes the wire.
+    for (name, value) in ordered_headers(headers, &provider.header_order) {
         req = req.header(name.as_str(), value.as_str());
     }
     if stream {
@@ -427,5 +498,142 @@ mod tests {
             parse_frame("data: {\"y\":2}\r\n"),
             Some(serde_json::json!({"y": 2}))
         );
+    }
+}
+
+#[cfg(test)]
+mod header_rewrite_tests {
+    use super::*;
+    use reqwest::header::HeaderMap;
+
+    fn provider(
+        headers: &[(&str, &str)],
+        forward: &[&str],
+        remove: &[&str],
+        order: &[&str],
+    ) -> Provider {
+        Provider {
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            forward_headers: forward.iter().map(|s| s.to_string()).collect(),
+            remove_headers: remove.iter().map(|s| s.to_string()).collect(),
+            header_order: order.iter().map(|s| s.to_string()).collect(),
+            ..Provider::default()
+        }
+    }
+
+    fn caller(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                reqwest::header::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        map
+    }
+
+    // codex-proxy 的 user_agent_template 语义：占位符展开，未知占位符保留。
+    #[test]
+    fn templates_expand_version_platform_arch_and_keep_unknowns() {
+        let out = expand_template("codex_cli_rs/{version} ({platform} {arch})");
+        assert_eq!(
+            out,
+            format!(
+                "codex_cli_rs/{} ({} {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        );
+        // 未知占位符原样保留（JSON 体的花括号不能被误伤）。
+        assert_eq!(expand_template("{\"a\":1}"), "{\"a\":1}");
+        assert_eq!(expand_template("{nonce}"), "{nonce}");
+    }
+
+    // forward_headers：调用方的头原样带到上游；没带就不造一个。
+    #[test]
+    fn forward_headers_copy_the_callers_values_verbatim() {
+        let p = provider(&[], &["x-opencode-session", "x-request-id"], &[], &[]);
+        let incoming = caller(&[("x-opencode-session", "sess-42"), ("x-request-id", "req-9")]);
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&incoming));
+        assert_eq!(
+            out.get("x-opencode-session").map(String::as_str),
+            Some("sess-42")
+        );
+        assert_eq!(out.get("x-request-id").map(String::as_str), Some("req-9"));
+        // 没发送的转发头不会凭空出现。
+        let empty = HeaderMap::new();
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&empty));
+        assert!(!out.contains_key("x-opencode-session"));
+    }
+
+    // remove_headers 最后跑：能删掉默认鉴权头（例如中转站只要自己的头）。
+    #[test]
+    fn remove_headers_win_over_auth_and_static() {
+        let p = provider(
+            &[("x-static", "yes")],
+            &[],
+            &["authorization", "x-static"],
+            &[],
+        );
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, None);
+        assert!(!out.contains_key("authorization"));
+        assert!(!out.contains_key("x-static"));
+        // 鉴权头还在的默认行为不受影响。
+        let plain = Provider::default();
+        let out = auth_headers(Protocol::OpenAiChat, &plain, "sk", None, None);
+        assert_eq!(
+            out.get("authorization").map(String::as_str),
+            Some("Bearer sk")
+        );
+    }
+
+    // 转发 + 删除叠加：转发进来的也可能被删掉。
+    #[test]
+    fn remove_runs_after_forward() {
+        let p = provider(&[], &["x-session"], &["x-session"], &[]);
+        let incoming = caller(&[("x-session", "s")]);
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&incoming));
+        assert!(!out.contains_key("x-session"));
+    }
+
+    // header_order：列出的先按序排，其余跟在后面。
+    #[test]
+    fn header_order_puts_listed_headers_first() {
+        let p = provider(&[], &[], &[], &["user-agent", "authorization"]);
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", Some("agent-ua"), None);
+        let ordered = ordered_headers(
+            out,
+            &["user-agent".to_string(), "authorization".to_string()],
+        );
+        let names: Vec<&str> = ordered.iter().map(|(k, _)| k.as_str()).collect();
+        let ua = names.iter().position(|n| *n == "user-agent").unwrap();
+        let auth = names.iter().position(|n| *n == "authorization").unwrap();
+        assert!(
+            ua < auth,
+            "user-agent should come before authorization: {names:?}"
+        );
+        // 没列的头跟在后面，不丢。
+        assert!(!names.contains(&"anthropic-version")); // openai 协议没有这个头
+        assert!(ordered.iter().any(|(k, _)| k == "authorization"));
+    }
+
+    // UA 模板作为静态头注入时同样展开。
+    #[test]
+    fn static_header_values_expand_placeholders() {
+        let p = provider(
+            &[("user-agent", "my-relay/{version} ({arch})")],
+            &[],
+            &[],
+            &[],
+        );
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, None);
+        let ua = out.get("user-agent").unwrap();
+        assert!(ua.contains(env!("CARGO_PKG_VERSION")), "ua {ua}");
+        assert!(ua.contains(std::env::consts::ARCH), "ua {ua}");
+        assert!(!ua.contains("{version}"));
     }
 }

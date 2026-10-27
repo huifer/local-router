@@ -401,6 +401,16 @@ struct UpdateProvider {
     auto_include: Option<Vec<String>>,
     #[serde(default)]
     group_only: Option<bool>,
+    #[serde(default)]
+    headers: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    user_agent: Option<Option<String>>,
+    #[serde(default)]
+    forward_headers: Option<Vec<String>>,
+    #[serde(default)]
+    remove_headers: Option<Vec<String>>,
+    #[serde(default)]
+    header_order: Option<Vec<String>>,
 }
 
 async fn api_update_provider(
@@ -417,6 +427,11 @@ async fn api_update_provider(
         models: None,
         auto_include: None,
         group_only: None,
+        headers: None,
+        user_agent: None,
+        forward_headers: None,
+        remove_headers: None,
+        header_order: None,
     });
     state
         .update(|config| {
@@ -446,6 +461,21 @@ async fn api_update_provider(
             }
             if let Some(v) = input.group_only {
                 p.group_only = v;
+            }
+            if let Some(v) = input.headers {
+                p.headers = v;
+            }
+            if let Some(v) = input.user_agent {
+                p.user_agent = v.filter(|s| !s.trim().is_empty());
+            }
+            if let Some(v) = input.forward_headers {
+                p.forward_headers = v;
+            }
+            if let Some(v) = input.remove_headers {
+                p.remove_headers = v;
+            }
+            if let Some(v) = input.header_order {
+                p.header_order = v;
             }
             Ok(())
         })
@@ -807,7 +837,7 @@ async fn api_test_provider(
                 Json(json!({"error": "the provider has no key"})),
             ));
         };
-        client::auth_headers(provider.protocol, &provider, &key.key, None)
+        client::auth_headers(provider.protocol, &provider, &key.key, None, None)
     };
     let base = provider.base_url.clone().ok_or_else(|| {
         (

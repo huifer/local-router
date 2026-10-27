@@ -1,7 +1,6 @@
 //! The WorkBuddy session: reading the login file, refreshing it, and the
 //! credits the account holds.
 
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use axum::http::StatusCode;
@@ -172,8 +171,11 @@ async fn the_workbuddy_provider_needs_no_key() {
         models: vec!["hy3".into()],
         auto_include: Vec::new(),
         catalog: None,
-        headers: BTreeMap::new(),
+        headers: Default::default(),
         user_agent: None,
+        forward_headers: Vec::new(),
+        remove_headers: Vec::new(),
+        header_order: Vec::new(),
         proxy: None,
         group_only: false,
         auth: Some(AuthKind::WorkBuddy),

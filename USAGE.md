@@ -152,6 +152,14 @@ local-router provider test deepseek             # 发一个真实请求测连通
 local-router provider key deepseek sk-第二个key  # 加一把 key（多 key 轮试）
 local-router provider rm deepseek
 
+# 请求头重写（某些中转/上游挑剔头的时候用）
+local-router provider headers deepseek                            # 查看全部规则
+local-router provider set-headers deepseek "x-profile=gw-{version}"  # 静态头（{version}/{platform}/{arch} 会展开）
+local-router provider forward-headers deepseek "x-opencode-session"  # 把 agent 发来的同名头原样转给上游
+local-router provider remove-headers deepseek "anthropic-version"    # 删掉上游不认识的头
+local-router provider header-order deepseek "user-agent,authorization"  # 发送顺序（多数厂商不在乎）
+local-router provider user-agent deepseek "my-relay/{version} ({platform} {arch})"  # UA 模板
+
 # 路由组
 local-router group add backup --models deepseek/deepseek-chat,glm/glm-4.6 --routing order
 local-router group list

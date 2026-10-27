@@ -47,6 +47,14 @@ export interface Provider {
   auto_include: string[];
   catalog?: string;
   group_only: boolean;
+  /** 每个请求都带的静态头；{version}/{platform}/{arch} 会展开。 */
+  headers?: Record<string, string>;
+  /** 把调用方发来的同名头原样转发给上游。 */
+  forward_headers?: string[];
+  /** 发送前删除的头。 */
+  remove_headers?: string[];
+  /** 上游头的发送顺序（提示性的）。 */
+  header_order?: string[];
   /** Where the credential comes from; a local app's login session. */
   auth?: "workbuddy" | "qwenwork";
   chat_path?: string;

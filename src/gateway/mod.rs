@@ -914,7 +914,7 @@ async fn send_media_json_raw(
         .provider(&target.provider_id)
         .cloned()
         .ok_or_else(|| ApiError::NotFound("the provider disappeared".into()))?;
-    let headers = target_headers(&provider, target, None, false).await?;
+    let headers = target_headers(&provider, target, None, false, None).await?;
     let url = media_url(&provider, target, kind, None)?;
     tracing::debug!("media request to {url}");
     let http = g
@@ -947,7 +947,7 @@ async fn send_media_multipart(
         .provider(&target.provider_id)
         .cloned()
         .ok_or_else(|| ApiError::NotFound("the provider disappeared".into()))?;
-    let headers = target_headers(&provider, target, None, false).await?;
+    let headers = target_headers(&provider, target, None, false, None).await?;
     let url = media_url(&provider, target, kind, None)?;
     let http = g
         .client_for(&target.provider_id, &provider)
@@ -1053,7 +1053,7 @@ async fn media_task_request(
         Ok(url) => url,
         Err(e) => return error_response(&e),
     };
-    let auth = match target_headers(&task.provider, &task.target, None, false).await {
+    let auth = match target_headers(&task.provider, &task.target, None, false, None).await {
         Ok(headers) => headers,
         Err(e) => return error_response(&e),
     };
@@ -1084,7 +1084,7 @@ async fn download_media_result(g: &Gateway, task: &MediaTask, id: &str) -> Respo
             "the video {id} has no download url yet"
         )));
     };
-    let auth = match target_headers(&task.provider, &task.target, None, false).await {
+    let auth = match target_headers(&task.provider, &task.target, None, false, None).await {
         Ok(headers) => headers,
         Err(e) => return error_response(&e),
     };
@@ -1404,6 +1404,7 @@ async fn handle(
                 &provider,
                 agent_user_agent.as_deref(),
                 send_agent_ua,
+                &headers,
                 &context,
             )
             .await
@@ -1417,6 +1418,7 @@ async fn handle(
                 &provider,
                 agent_user_agent.as_deref(),
                 send_agent_ua,
+                &headers,
                 &context,
             )
             .await
@@ -1514,6 +1516,7 @@ async fn target_headers(
     target: &Target,
     agent_user_agent: Option<&str>,
     send_agent_ua: bool,
+    caller_headers: Option<&reqwest::header::HeaderMap>,
 ) -> Result<BTreeMap<String, String>, ApiError> {
     if provider.uses_session() {
         let session = crate::workbuddy::session()
@@ -1530,6 +1533,7 @@ async fn target_headers(
         } else {
             None
         },
+        caller_headers,
     ))
 }
 
@@ -1862,6 +1866,7 @@ async fn whole_attempt(
     provider: &Provider,
     agent_user_agent: Option<&str>,
     send_agent_ua: bool,
+    caller_headers: &reqwest::header::HeaderMap,
     context: &usage::ContextBreakdown,
 ) -> Result<Response, (ApiError, usage::UsageRecord)> {
     let mut rec = usage::UsageRecord::new(&request.model, target.protocol.as_str());
@@ -1882,7 +1887,15 @@ async fn whole_attempt(
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
     }
-    let headers = match target_headers(provider, target, agent_user_agent, send_agent_ua).await {
+    let headers = match target_headers(
+        provider,
+        target,
+        agent_user_agent,
+        send_agent_ua,
+        Some(caller_headers),
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => return Err((e, rec)),
     };
@@ -1971,6 +1984,7 @@ async fn stream_attempt(
     provider: &Provider,
     agent_user_agent: Option<&str>,
     send_agent_ua: bool,
+    caller_headers: &reqwest::header::HeaderMap,
     context: &usage::ContextBreakdown,
 ) -> Result<Response, (ApiError, usage::UsageRecord)> {
     let mut rec = usage::UsageRecord::new(&request.model, target.protocol.as_str());
@@ -1988,7 +2002,15 @@ async fn stream_attempt(
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
     }
-    let headers = match target_headers(provider, target, agent_user_agent, send_agent_ua).await {
+    let headers = match target_headers(
+        provider,
+        target,
+        agent_user_agent,
+        send_agent_ua,
+        Some(caller_headers),
+    )
+    .await
+    {
         Ok(h) => h,
         Err(e) => return Err((e, rec)),
     };

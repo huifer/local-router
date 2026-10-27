@@ -150,12 +150,28 @@ pub struct Provider {
     /// The models.dev catalog this provider borrows its list from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<String>,
-    /// Extra headers sent on every request to this provider.
+    /// Extra headers sent on every request to this provider. Values may
+    /// carry `{version}` / `{platform}` / `{arch}` placeholders.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Send the calling agent's own User-Agent instead of local-router's.
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Headers forwarded verbatim from the caller to this provider
+    /// (lowercase names). Useful for upstreams that demand the client's
+    /// own session id or device headers (Console Go wants
+    /// `x-opencode-session`; some relays want `x-request-id`).
+    #[serde(default)]
+    pub forward_headers: Vec<String>,
+    /// Headers dropped before the request goes out. Runs after `headers`
+    /// and `forward_headers`, so a rule here wins over everything else.
+    #[serde(default)]
+    pub remove_headers: Vec<String>,
+    /// The order the upstream headers are sent in. Headers not listed are
+    /// appended in their natural order. Purely a hint to picky relays;
+    /// most vendors ignore it.
+    #[serde(default)]
+    pub header_order: Vec<String>,
     /// An HTTP proxy for this provider's requests.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
@@ -205,6 +221,9 @@ impl Default for Provider {
             catalog: None,
             headers: BTreeMap::new(),
             user_agent: None,
+            forward_headers: Vec::new(),
+            remove_headers: Vec::new(),
+            header_order: Vec::new(),
             proxy: None,
             group_only: false,
             auth: None,

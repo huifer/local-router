@@ -2,7 +2,6 @@
 //! session, renews an expired token, and talks to a vendor that only
 //! answers streaming requests.
 
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -219,8 +218,11 @@ async fn world_with(hold_when_exhausted: bool) -> (String, Seen, String) {
         models: vec!["hy3".into(), "auto".into()],
         auto_include: Vec::new(),
         catalog: None,
-        headers: BTreeMap::new(),
+        headers: Default::default(),
         user_agent: None,
+        forward_headers: Vec::new(),
+        remove_headers: Vec::new(),
+        header_order: Vec::new(),
         proxy: None,
         group_only: false,
         auth: Some(AuthKind::WorkBuddy),

@@ -1,12 +1,16 @@
 //! local-router: a local gateway that gives every coding agent every model.
 //!
-//! The web page and the gateway are the same process. `local-router` starts both;
-//! `local-router serve` starts the gateway alone.
+//! The web page and the gateway are the same process. `local-router` starts
+//! both; `local-router serve` starts the gateway alone; `local-router
+//! console` drops the user into a small interactive prompt.
+
+pub(crate) mod console;
 
 use local_router::{
     config, gateway, presets, pricing, protocol, qwen, server, store, web, workbuddy,
 };
 
+use std::io::IsTerminal;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -31,6 +35,8 @@ struct Cli {
 enum Command {
     /// Start the gateway, and the web page with it.
     Serve(ServeArgs),
+    /// The interactive console: one short word per line, no flags to remember.
+    Console,
     /// Start only the web page.
     Web(WebArgs),
     /// Manage the providers.
@@ -229,6 +235,43 @@ enum ProviderCmd {
     Test { id: String },
     /// Add a key to a provider.
     Key { id: String, key: String },
+    /// Show a provider's header rules.
+    Headers { id: String },
+    /// Set the static headers a provider sends (name=value, repeated).
+    SetHeaders {
+        id: String,
+        /// name=value pairs; an empty list clears them all.
+        #[arg(value_delimiter = ' ')]
+        rules: Vec<String>,
+    },
+    /// Set which caller headers are forwarded to this provider.
+    ForwardHeaders {
+        id: String,
+        /// Header names, comma separated; empty clears the list.
+        #[arg(default_value = "", value_delimiter = ',')]
+        names: Vec<String>,
+    },
+    /// Set which headers are dropped before the request goes out.
+    RemoveHeaders {
+        id: String,
+        /// Header names, comma separated; empty clears the list.
+        #[arg(default_value = "", value_delimiter = ',')]
+        names: Vec<String>,
+    },
+    /// Set the order the upstream headers are sent in.
+    HeaderOrder {
+        id: String,
+        /// Header names, comma separated; empty clears the hint.
+        #[arg(default_value = "", value_delimiter = ',')]
+        names: Vec<String>,
+    },
+    /// Set the User-Agent template ({version} / {platform} / {arch} expand).
+    UserAgent {
+        id: String,
+        /// The template, or empty to stop sending one.
+        #[arg(default_value = "")]
+        template: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -266,6 +309,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Some(Command::Serve(args)) => serve(args).await,
+        Some(Command::Console) => console::run().await,
         Some(Command::Web(args)) => web_only(args).await,
         Some(Command::Provider(cmd)) => provider_cmd(cmd).await,
         Some(Command::Models) => models().await,
@@ -282,7 +326,19 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Prices) => prices().await,
         Some(Command::Dashboard) => local_router::dashboard::run().await,
         Some(Command::Daemon(cmd)) => daemon_cmd(cmd).await,
-        None => serve(ServeArgs::default()).await,
+        // Bare `local-router`: a terminal wants the gateway; a pipe (a
+        // beginner pasting into the wrong window, a script) wants the
+        // friendly console. Tell the two apart by whether stdin is a tty.
+        None => {
+            if std::io::stdin().is_terminal() {
+                serve(ServeArgs::default()).await
+            } else {
+                println!(
+                    "(看起来不是交互终端；进入交互模式。要直接启动网关，运行 local-router serve)"
+                );
+                console::run().await
+            }
+        }
     }
 }
 
@@ -613,6 +669,148 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
             save_config(&config)?;
             println!("{id} now has {count} keys");
         }
+        ProviderCmd::Headers { id } => {
+            let Some(p) = config.provider(&id) else {
+                anyhow::bail!("there is no provider called {id}");
+            };
+            println!("{id} 的请求头规则：");
+            if p.headers.is_empty() {
+                println!("  静态头    (none)");
+            } else {
+                println!("  静态头");
+                for (k, v) in &p.headers {
+                    println!("    {k}: {v}");
+                }
+            }
+            println!(
+                "  转发调用方  {}",
+                if p.forward_headers.is_empty() {
+                    "(none)".into()
+                } else {
+                    p.forward_headers.join(", ")
+                }
+            );
+            println!(
+                "  删除      {}",
+                if p.remove_headers.is_empty() {
+                    "(none)".into()
+                } else {
+                    p.remove_headers.join(", ")
+                }
+            );
+            println!(
+                "  发送顺序  {}",
+                if p.header_order.is_empty() {
+                    "(natural)".into()
+                } else {
+                    p.header_order.join(", ")
+                }
+            );
+            println!(
+                "  UA 模板    {}",
+                p.user_agent.as_deref().unwrap_or("(local-router 默认)")
+            );
+        }
+        ProviderCmd::SetHeaders { id, rules } => {
+            let mut headers = std::collections::BTreeMap::new();
+            for rule in &rules {
+                let Some((name, value)) = rule.split_once('=') else {
+                    anyhow::bail!("{rule} 不是 name=value 形式");
+                };
+                headers.insert(name.trim().to_string(), value.trim().to_string());
+            }
+            let count = headers.len();
+            {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.headers = headers;
+            }
+            save_config(&config)?;
+            println!("{id} 现在发送 {count} 个静态头");
+        }
+        ProviderCmd::ForwardHeaders { id, names } => {
+            let forwarded: Vec<String> = names
+                .iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.forward_headers = forwarded.clone();
+            }
+            save_config(&config)?;
+            println!(
+                "{id} 转发调用方的 {}",
+                if forwarded.is_empty() {
+                    "(none)".into()
+                } else {
+                    forwarded.join(", ")
+                }
+            );
+        }
+        ProviderCmd::RemoveHeaders { id, names } => {
+            let removed: Vec<String> = names
+                .iter()
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.remove_headers = removed.clone();
+            }
+            save_config(&config)?;
+            println!(
+                "{id} 删除 {}",
+                if removed.is_empty() {
+                    "(none)".into()
+                } else {
+                    removed.join(", ")
+                }
+            );
+        }
+        ProviderCmd::HeaderOrder { id, names } => {
+            let order: Vec<String> = names
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.header_order = order.clone();
+            }
+            save_config(&config)?;
+            println!(
+                "{id} 发送顺序 {}",
+                if order.is_empty() {
+                    "(natural)".into()
+                } else {
+                    order.join(", ")
+                }
+            );
+        }
+        ProviderCmd::UserAgent { id, template } => {
+            let ua = (!template.trim().is_empty()).then(|| template.trim().to_string());
+            {
+                let Some(p) = config.provider_mut(&id) else {
+                    anyhow::bail!("there is no provider called {id}");
+                };
+                p.user_agent = ua.clone();
+            }
+            save_config(&config)?;
+            match &ua {
+                Some(t) => {
+                    println!("{id} 的 UA 模板：{t}（{{version}}/{{platform}}/{{arch}} 会展开）")
+                }
+                None => println!("{id} 不再发送自定义 UA"),
+            }
+        }
     }
     Ok(())
 }
@@ -695,7 +893,7 @@ async fn test_provider(provider: &config::Provider) -> anyhow::Result<(u128, Str
             .next()
             .context("the provider has no key")?;
         (
-            gateway::client::auth_headers(provider.protocol, provider, &key.key, None),
+            gateway::client::auth_headers(provider.protocol, provider, &key.key, None, None),
             key.key.clone(),
         )
     };
