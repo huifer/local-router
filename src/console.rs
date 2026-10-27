@@ -39,10 +39,12 @@ pub const HELP: &str = "\
   usage                用量（近 7 天）
   doctor               自检
   prices               价目表
-  workbuddy [子命令]    WorkBuddy：login 登录（--account 名字，可多账号）/
+  workbuddy [子命令]    WorkBuddy：login 登录（--account 名字，可多账号；
+                       --no-open 只打印链接不开浏览器）/
                        status 状态 / credits 积分 / models 模型 /
                        checkin 签到 / accounts 列出账号 / use <名字> 切换
-  qwen [子命令]         QwenWork（千问办公）：login / status / credits / models
+  qwen [子命令]         QwenWork（千问办公）：login（链接会打印在终端里，
+                       自己打开即可；--no-open 不自动开浏览器）/ status / credits / models
   open                 在浏览器打开控制台
   clear | clean        清屏
   exit | quit          退出（Ctrl-D 也行）
@@ -360,8 +362,16 @@ async fn workbuddy(rest: &[&str]) -> anyhow::Result<()> {
     match sub {
         "login" => {
             // `workbuddy login [名字]`：不给名字就叫 default；给了就是账号名。
-            let name = rest.get(1).copied().unwrap_or("default").to_string();
-            super::workbuddy_cmd(crate::WorkBuddyCmd::Login { account: name }).await
+            // `--no-open` 只打印链接，不去开浏览器（远程 shell / 无桌面环境）。
+            let mut name = "default".to_string();
+            let mut no_open = false;
+            for word in rest.iter().skip(1) {
+                match *word {
+                    "--no-open" | "--noopen" => no_open = true,
+                    other => name = other.to_string(),
+                }
+            }
+            super::workbuddy_cmd(crate::WorkBuddyCmd::Login { account: name, no_open }).await
         }
         "status" | "s" => super::workbuddy_cmd(crate::WorkBuddyCmd::Status).await,
         "credits" | "credit" => super::workbuddy_cmd(crate::WorkBuddyCmd::Credits).await,
@@ -387,7 +397,13 @@ async fn workbuddy(rest: &[&str]) -> anyhow::Result<()> {
 async fn qwen(rest: &[&str]) -> anyhow::Result<()> {
     let sub = rest.first().copied().unwrap_or("status");
     match sub {
-        "login" => super::qwen_cmd(crate::QwenCmd::Login).await,
+        "login" => {
+            let no_open = rest
+                .iter()
+                .skip(1)
+                .any(|w| *w == "--no-open" || *w == "--noopen");
+            super::qwen_cmd(crate::QwenCmd::Login { no_open }).await
+        }
         "status" | "s" => super::qwen_cmd(crate::QwenCmd::Status).await,
         "credits" | "credit" => super::qwen_cmd(crate::QwenCmd::Credits).await,
         "models" | "m" => super::qwen_cmd(crate::QwenCmd::Models).await,

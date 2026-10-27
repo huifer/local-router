@@ -69,6 +69,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/usage", get(api_usage))
         .route("/api/projects", get(api_projects).patch(api_update_project))
         .route("/api/projects/merge", post(api_merge_projects))
+        // SPA deep links: everything that is not an API path or a known
+        // asset falls back to the app shell.
+        .fallback(spa_fallback)
         // Project ids are directories; a directory cannot ride in one path
         // segment (the %2F is decoded before routing), so an edit takes the
         // id as a query parameter instead.
@@ -153,6 +156,23 @@ async fn listens_locally(state: &AppState) -> bool {
 
 async fn index() -> Html<&'static str> {
     Html(INDEX_HTML)
+}
+
+/// The SPA's routes live in the browser; any unknown path the user lands on
+/// directly (a refresh on /providers, a bookmark, a shared link) must serve
+/// the app and let the router pick the page.
+///
+/// API-shaped paths (`/api/…`) are excluded: a mistyped API call should get
+/// a JSON 404 the console can display, not an HTML page it cannot parse.
+async fn spa_fallback(uri: axum::http::Uri) -> Response {
+    if uri.path().starts_with("/api/") {
+        return (
+            axum::http::StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({"error": "no such api path"})),
+        )
+            .into_response();
+    }
+    Html(INDEX_HTML).into_response()
 }
 
 async fn app_js() -> impl IntoResponse {

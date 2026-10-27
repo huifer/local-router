@@ -19,6 +19,10 @@
   可登录多个账号（`workbuddy login --account <名字>`）、列出
   （`workbuddy accounts`）、切换（`workbuddy use <名字>`）；网关的请求在
   多个账号之间**轮流走**，分摊额度，续期逻辑照旧。
+- **登录链接可复制**：`workbuddy login` / `qwen login` 的授权链接始终打印在
+  终端里（远程 shell、无桌面环境都能自己复制到浏览器打开），并新增
+  `--no-open` 表示不自动唤起本机浏览器；交互模式同样支持
+  `workbuddy login --no-open`。
 - **交互模式增强**：`local-router console` 新增 `clear`（`clean`/`cls` 同义）
   清屏；`add` 支持 `--protocol`（openai_chat 默认 / anthropic / gemini /
   openai_responses）自定义协议；密钥与 URL 会自动去掉粘贴时带的中英文引号；

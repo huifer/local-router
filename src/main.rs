@@ -131,6 +131,9 @@ enum WorkBuddyCmd {
         /// side by side).
         #[arg(long, default_value = "default")]
         account: String,
+        /// Only print the link; do not try to open a browser.
+        #[arg(long)]
+        no_open: bool,
     },
     /// List the WorkBuddy accounts local-router holds.
     Accounts,
@@ -147,7 +150,11 @@ enum QwenCmd {
     /// List the models the account may use.
     Models,
     /// Sign in to QwenWork: print a link, wait for the browser, wire it up.
-    Login,
+    Login {
+        /// Only print the link; do not try to open a browser.
+        #[arg(long)]
+        no_open: bool,
+    },
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -1026,7 +1033,7 @@ async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
                 println!("  {m}");
             }
         }
-        WorkBuddyCmd::Login { account } => login(&account).await?,
+        WorkBuddyCmd::Login { account, no_open } => login(&account, no_open).await?,
         WorkBuddyCmd::Accounts => {
             let accounts = workbuddy::accounts()?;
             if accounts.is_empty() {
@@ -1094,7 +1101,7 @@ async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
 /// in; the gateway polls until the tokens arrive. The tokens are stored in
 /// local-router's own session file — WorkBuddy's desktop app and its login
 /// file are left untouched.
-async fn login(account_name: &str) -> anyhow::Result<()> {
+async fn login(account_name: &str, no_open: bool) -> anyhow::Result<()> {
     let session = workbuddy::start_login().await?;
     println!("local-router {}", gateway::client::VERSION);
     println!("  open this link in a browser and sign in:");
@@ -1102,13 +1109,18 @@ async fn login(account_name: &str) -> anyhow::Result<()> {
     println!("  {}", session.auth_url);
     println!();
 
-    // Open the default browser for the person at the keyboard; on a
-    // machine without one the link above still works.
-    let _ = std::process::Command::new("open")
-        .arg(&session.auth_url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // Open the default browser for the person at the keyboard. When it
+    // cannot (a headless box, a remote shell), the link above is all they
+    // need — it is always printed.
+    if no_open {
+        println!("  (not opening a browser; open the link above yourself)");
+    } else {
+        let _ = std::process::Command::new("open")
+            .arg(&session.auth_url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 
     println!("  waiting for the sign-in (up to 5 minutes)…");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);
@@ -1217,7 +1229,7 @@ async fn qwen_cmd(cmd: QwenCmd) -> anyhow::Result<()> {
                 println!("  {m}");
             }
         }
-        QwenCmd::Login => qwen_login().await?,
+        QwenCmd::Login { no_open } => qwen_login(no_open).await?,
     }
     Ok(())
 }
@@ -1227,7 +1239,7 @@ async fn qwen_cmd(cmd: QwenCmd) -> anyhow::Result<()> {
 /// The device flow hands out a browser link; the browser signs in; the
 /// gateway polls until the device token arrives. The token is stored in
 /// local-router's own session file — QwenWork's own data is left untouched.
-async fn qwen_login() -> anyhow::Result<()> {
+async fn qwen_login(no_open: bool) -> anyhow::Result<()> {
     let session = qwen::login::start_login().await?;
     println!("local-router {}", gateway::client::VERSION);
     println!("  open this link in a browser and sign in:");
@@ -1235,11 +1247,16 @@ async fn qwen_login() -> anyhow::Result<()> {
     println!("  {}", session.auth_url);
     println!();
 
-    let _ = std::process::Command::new("open")
-        .arg(&session.auth_url)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
+    // The link is always printed; opening a browser is a convenience.
+    if no_open {
+        println!("  (not opening a browser; open the link above yourself)");
+    } else {
+        let _ = std::process::Command::new("open")
+            .arg(&session.auth_url)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
 
     println!("  waiting for the sign-in (up to 5 minutes)…");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5 * 60);

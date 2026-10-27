@@ -1,0 +1,276 @@
+import { useEffect, useState } from "react";
+import { useNavigate, useRouteLoaderData } from "react-router";
+import { Terminal } from "lucide-react";
+import {
+  Badge,
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+  EmptyState,
+} from "@/components/ui";
+import { formatTime } from "@/components/shared/bits";
+import type { AppData } from "@/App";
+import type { UsageData, WorkBuddyStatus } from "@/types";
+import { getUsage, getWorkBuddy } from "@/api";
+
+export default function OverviewPage() {
+  const { data } = useRouteLoaderData("shell") as { data: AppData };
+  const navigate = useNavigate();
+  const [usage, setUsage] = useState<UsageData | null>(null);
+  const [workbuddy, setWorkbuddy] = useState<WorkBuddyStatus | null>(null);
+
+  useEffect(() => {
+    getUsage().then(setUsage).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    getWorkBuddy().then(setWorkbuddy).catch(() => setWorkbuddy(null));
+  }, []);
+
+  const settings = data.status.settings;
+  const endpoint = `http://${settings.gateway_addr}:${settings.gateway_port}`;
+  const recent = usage?.recent ?? [];
+
+  return (
+    <div className="grid gap-5 pt-7">
+      <div className="grid grid-cols-[1.7fr_0.7fr_0.7fr] gap-3 max-[1100px]:grid-cols-1 max-[700px]:grid-cols-1">
+        <div className="signal-card signal-wide">
+          <span className="eyebrow">System status</span>
+          <div className="flex items-center gap-2.5">
+            <span className="inline-block size-2 rounded-full bg-primary shadow-[0_0_0_4px_rgba(158,240,191,0.08)]" />
+            <strong className="text-sm font-bold">Gateway operational</strong>
+          </div>
+          <div>
+            <span className="text-[11px] text-muted-foreground">All request paths are accepting traffic</span>
+            <div className="mt-1.5 font-mono text-[11px] text-primary">{endpoint}</div>
+          </div>
+        </div>
+        <div className="signal-card">
+          <span className="eyebrow">Providers</span>
+          <div>
+            <strong className="metric-value">{data.providers.length.toString().padStart(2, "0")}</strong>
+            <span className="metric-detail mt-2 block">configured upstreams</span>
+          </div>
+        </div>
+        <div className="signal-card">
+          <span className="eyebrow">Models</span>
+          <div>
+            <strong className="metric-value">{data.models.length.toString().padStart(2, "0")}</strong>
+            <span className="metric-detail mt-2 block">available endpoints</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="grid grid-cols-[1.2fr_0.8fr] gap-5 max-[1100px]:grid-cols-1">
+        <Card>
+          <CardHeader>
+            <CardDescription className="eyebrow">01 / quick access</CardDescription>
+            <CardTitle>Operator surface</CardTitle>
+          </CardHeader>
+          <CardContent className="p-0">
+            <div className="grid grid-cols-2 gap-px bg-border max-[700px]:grid-cols-1">
+              {[
+                { label: "Manage providers", detail: "Keys, endpoints, model catalog", to: "/providers", icon: "server" as const },
+                { label: "Configure routing", detail: "Failover, rotation, affinity", to: "/groups", icon: "activity" as const },
+                { label: "Browse model map", detail: "Every exposed model in one view", to: "/models", icon: "layers" as const },
+                { label: "Inspect usage", detail: "Tokens, latency, request history", to: "/usage", icon: "grid" as const },
+              ].map((item) => (
+                <button
+                  key={item.to}
+                  onClick={() => navigate(item.to)}
+                  className="flex min-h-24 cursor-pointer items-center gap-3 bg-card px-4 py-4 text-left transition-colors hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring/60 focus-visible:outline-none"
+                >
+                  <OperatorIcon name={item.icon} />
+                  <span className="min-w-0">
+                    <strong className="block text-xs">{item.label}</strong>
+                    <small className="mt-1 block text-[10px] text-muted-foreground">{item.detail}</small>
+                  </span>
+                  <span className="ml-auto text-[17px] text-muted-foreground">↗</span>
+                </button>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardDescription className="eyebrow">02 / connection</CardDescription>
+            <CardTitle>Agent environment</CardTitle>
+          </CardHeader>
+          <div className="code-block">
+            <div className="grid grid-cols-[180px_15px_1fr] max-[500px]:grid-cols-1">
+              <span className="code-key">OPENAI_BASE_URL</span>
+              <span>=</span>
+              <span className="break-all">{endpoint}/v1</span>
+            </div>
+            <div className="grid grid-cols-[180px_15px_1fr] max-[500px]:grid-cols-1">
+              <span className="code-key">ANTHROPIC_BASE_URL</span>
+              <span>=</span>
+              <span className="break-all">{endpoint}</span>
+            </div>
+            <div className="grid grid-cols-[180px_15px_1fr] max-[500px]:grid-cols-1">
+              <span className="code-key">LOCAL_ROUTER_API_KEY</span>
+              <span>=</span>
+              <span className="break-all">{settings.default_caller_key}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 border-t border-border px-4 py-3 font-mono text-[10px] text-muted-foreground/80">
+            <Terminal className="size-3.5" /> Export these variables to connect any compatible agent.
+          </div>
+        </Card>
+      </div>
+
+      <div className="grid grid-cols-[1.2fr_0.8fr] gap-5 max-[1100px]:grid-cols-1">
+        <Card>
+          <CardHeader className="flex-row items-center justify-between">
+            <div>
+              <CardDescription className="eyebrow">03 / live feed</CardDescription>
+              <CardTitle>Recent requests</CardTitle>
+            </div>
+            <button
+              className="cursor-pointer border-0 bg-transparent font-mono text-[11px] text-primary hover:underline focus-visible:outline-none"
+              onClick={() => navigate("/usage")}
+            >
+              View all ↗
+            </button>
+          </CardHeader>
+          {recent.length ? (
+            <div className="py-1">
+              {recent.slice(0, 5).map((record, index) => (
+                <RequestRow key={`${record.time}-${index}`} record={record} />
+              ))}
+            </div>
+          ) : (
+            <EmptyState title="No requests yet" detail="Traffic will appear here when an agent connects." />
+          )}
+        </Card>
+        <Card>
+          <CardHeader>
+            <CardDescription className="eyebrow">04 / routing posture</CardDescription>
+            <CardTitle>Groups at a glance</CardTitle>
+          </CardHeader>
+          <div className="px-5 py-2">
+            {data.groups.length ? (
+              data.groups.slice(0, 4).map((group) => (
+                <div key={group.id} className="flex items-center justify-between gap-3 border-b border-border py-3.5 last:border-b-0">
+                  <div>
+                    <strong className="block text-xs">{group.name}</strong>
+                    <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
+                      {group.models.length} members / {group.routing}
+                    </span>
+                  </div>
+                  <Badge variant="primary">group/{group.id}</Badge>
+                </div>
+              ))
+            ) : (
+              <EmptyState title="No routing groups" detail="Create a group to add failover or rotation." />
+            )}
+          </div>
+        </Card>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardDescription className="eyebrow">05 / account</CardDescription>
+          <CardTitle>WorkBuddy session</CardTitle>
+        </CardHeader>
+        <WorkBuddySection status={workbuddy} />
+      </Card>
+    </div>
+  );
+}
+
+function OperatorIcon({ name }: { name: "server" | "activity" | "layers" | "grid" }) {
+  // Kept as text glyphs rather than a second icon family: lucide covers the chrome.
+  const glyphs = { server: "▣", activity: "∿", layers: "≡", grid: "⊞" };
+  return (
+    <span className="grid size-8 shrink-0 place-items-center border border-input text-primary" aria-hidden="true">
+      {glyphs[name]}
+    </span>
+  );
+}
+
+function RequestRow({ record }: { record: UsageData["recent"][number] }) {
+  return (
+    <div className="grid grid-cols-[10px_minmax(0,1fr)_150px_60px_42px] items-center gap-2.5 border-b border-border/70 px-5 py-3 last:border-b-0 max-[700px]:grid-cols-[8px_minmax(0,1fr)_auto]">
+      <span className={`size-1.5 rounded-full ${record.ok ? "bg-ring" : "bg-destructive"}`} />
+      <div className="min-w-0">
+        <strong className="block truncate font-mono text-[11px]">{record.model}</strong>
+        <span className="block truncate font-mono text-[10px] text-muted-foreground">
+          {record.provider} / {record.protocol}
+        </span>
+      </div>
+      <span className="hidden font-mono text-[10px] text-muted-foreground max-[700px]:hidden sm:block">{formatTime(record.time)}</span>
+      <span className="hidden font-mono text-[10px] text-muted-foreground sm:block">{record.latency_ms}ms</span>
+      <Badge variant={record.ok ? "primary" : "destructive"} className="justify-self-end">
+        {record.ok ? "OK" : "FAIL"}
+      </Badge>
+    </div>
+  );
+}
+
+function WorkBuddySection({ status }: { status: WorkBuddyStatus | null }) {
+  if (!status) {
+    return <EmptyState title="Reading the session" detail="Looking for the local WorkBuddy login." />;
+  }
+  if (!status.signed_in) {
+    return (
+      <EmptyState
+        title="Not signed in to WorkBuddy"
+        detail={status.note ?? "Run local-router workbuddy login to sign in with a browser."}
+      />
+    );
+  }
+  const credits = status.credits;
+  const checkin = credits?.checkin;
+  return (
+    <div className="grid gap-4 p-5">
+      <div className="grid grid-cols-4 gap-3 max-[900px]:grid-cols-2">
+        <div className="signal-card min-h-28">
+          <span className="eyebrow">Account</span>
+          <div>
+            <strong className="metric-value text-2xl">{status.account?.nickname || "signed in"}</strong>
+            <span className="metric-detail mt-1.5 block">{status.account?.type || "personal"}</span>
+          </div>
+        </div>
+        <div className="signal-card min-h-28">
+          <span className="eyebrow">Credits left</span>
+          <div>
+            <strong className="metric-value text-2xl">{credits?.remaining ?? 0}</strong>
+            <span className="metric-detail mt-1.5 block">of {credits?.capacity ?? 0} this cycle</span>
+          </div>
+        </div>
+        <div className="signal-card min-h-28">
+          <span className="eyebrow">Check-in</span>
+          <div>
+            <strong className="metric-value text-2xl">{checkin ? (checkin.checked_in_today ? "DONE" : "TODO") : "--"}</strong>
+            <span className="metric-detail mt-1.5 block">{checkin ? `streak ${checkin.streak_days} days` : "unknown"}</span>
+          </div>
+        </div>
+        <div className="signal-card min-h-28">
+          <span className="eyebrow">Token</span>
+          <div>
+            <strong className="metric-value text-2xl">{status.token_expires_at ? formatTime(new Date(status.token_expires_at).toISOString()).slice(0, 10) : "--"}</strong>
+            <span className="metric-detail mt-1.5 block">access token expiry</span>
+          </div>
+        </div>
+      </div>
+      {credits?.packages.length ? (
+        <div className="overflow-auto">
+          <div className="grid grid-cols-[minmax(200px,2fr)_110px_130px_110px] gap-3 border-b border-border px-1 pb-2.5">
+            <span className="eyebrow">Package</span><span className="eyebrow">Remaining</span><span className="eyebrow">Capacity</span><span className="eyebrow">Used</span>
+          </div>
+          {credits.packages.map((item, index) => (
+            <div key={`${item.package_name}-${index}`} className="grid grid-cols-[minmax(200px,2fr)_110px_130px_110px] items-center gap-3 border-b border-border/70 py-3 last:border-b-0">
+              <div className="model-name"><span className="model-bullet" /><strong>{item.package_name}</strong></div>
+              <span className="font-mono text-[10px] text-muted-foreground">{item.remaining}</span>
+              <span className="font-mono text-[10px] text-muted-foreground">{item.capacity} {item.unit}</span>
+              <span className="font-mono text-[10px] text-muted-foreground">{item.used}</span>
+            </div>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}

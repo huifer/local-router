@@ -257,10 +257,15 @@ caller key；一把都没有时**拒绝一切请求**。
 ```sh
 local-router workbuddy login                # 浏览器登录（默认账号名 default）
 local-router workbuddy login --account work # 登录第二个账号
+local-router workbuddy login --no-open      # 只打印链接，不自动开浏览器
 local-router workbuddy accounts              # 列出所有账号与当前使用的
 local-router workbuddy use work             # 切换到某个账号
 local-router workbuddy status|credits|models|checkin
 ```
+
+**登录链接总是打在终端里**——复制到任何浏览器打开即可（远程 shell、
+无桌面环境、SSH 登录都适用）；`--no-open` 表示不自动唤起本机浏览器。
+千问办公同理：`local-router qwen login [--no-open]`。
 
 多个账号可以并存（存在 `~/.config/local-router/workbuddy-session.json`），
 网关让请求在它们之间**轮流走**，分摊额度；`use` 指定优先用哪个。
