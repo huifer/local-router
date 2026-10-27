@@ -51,9 +51,12 @@ export default function ProvidersPage() {
     try {
       // The gateway creates the provider on sight if it is not configured
       // yet: a session vendor needs no key, so there is nothing else to ask.
-      const flow = await api<{ url: string }>(`/api/providers/${encodeURIComponent(presetId)}/login`, {
-        method: "POST",
-      });
+      // The gateway picks a free slot name when none is sent, so a second
+      // sign-in never overwrites the first.
+      const flow = await api<{ url: string; account: string }>(
+        `/api/providers/${encodeURIComponent(presetId)}/login`,
+        { method: "POST", body: {} },
+      );
       window.open(flow.url, "_blank", "noopener");
       toast.success(t("providers.browserOpened"));
       // Poll the vendor until it says the session is good.
@@ -65,12 +68,12 @@ export default function ProvidersPage() {
             done: boolean;
             waiting: boolean;
             account?: string;
+            account_name?: string;
             setup?: { models?: number; checkin?: { granted?: boolean; credit?: number | null } };
           }>(`/api/providers/${encodeURIComponent(presetId)}/login/status`);
           if (status.done) {
-            toast.success(
-              status.account ? t("providers.signedInAs", { name: status.account }) : t("providers.signedIn"),
-            );
+            const who = status.account_name ?? status.account ?? "";
+            toast.success(who ? t("providers.signedInAs", { name: who }) : t("providers.signedIn"));
             // The gateway already pulled the models and claimed the
             // check-in; say so instead of making the user go look.
             if (status.setup?.models) {

@@ -1051,9 +1051,11 @@ async fn api_session_login_start(
                     account: account_name.clone(),
                 },
             );
-            Ok(Json(
-                json!({"url": session.auth_url, "state": session.state}),
-            ))
+            Ok(Json(json!({
+                "url": session.auth_url,
+                "state": session.state,
+                "account": account_name,
+            })))
         }
         Some(crate::config::AuthKind::QwenWork) => {
             let session = crate::qwen::login::start_login().await.map_err(oauth_err)?;
@@ -1112,6 +1114,7 @@ async fn api_session_login_status(
                         "done": true,
                         "waiting": false,
                         "account": nickname,
+                        "account_name": account,
                         "setup": setup,
                     })))
                 }
