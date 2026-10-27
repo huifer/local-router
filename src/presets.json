@@ -250,6 +250,19 @@
       "docs": "https://support.huaweicloud.com/modelarts"
     },
     {
+      "id": "qiniu",
+      "name": "七牛云（Qiniu AI）",
+      "group": "vendor",
+      "protocol": "openai_chat",
+      "base_url": "https://api.qnaigc.com/v1",
+      "default_models": [],
+      "auto_include": [
+        "*"
+      ],
+      "key_hint": "sk-…",
+      "docs": "https://developer.qiniu.com/ai"
+    },
+    {
       "id": "openrouter",
       "name": "OpenRouter",
       "group": "relay",

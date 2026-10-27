@@ -44,6 +44,10 @@ pub struct Preset {
     /// The models this vendor offers for image and video work.
     #[serde(default)]
     pub media_models: Vec<String>,
+    /// Glob patterns: a model the vendor newly lists is exposed on sight.
+    /// A relay that renames its models often uses `["*"]`.
+    #[serde(default)]
+    pub auto_include: Vec<String>,
     /// The vendor's native media endpoints, when they are not the OpenAI
     /// `/v1` family.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,7 +100,7 @@ pub fn to_provider(preset: &Preset, key: Option<&str>) -> Provider {
             .map(|k| vec![ProviderKey::new(k)])
             .unwrap_or_default(),
         models: preset.default_models.clone(),
-        auto_include: Vec::new(),
+        auto_include: preset.auto_include.clone(),
         catalog: preset.catalog.clone(),
         headers: BTreeMap::new(),
         user_agent: None,

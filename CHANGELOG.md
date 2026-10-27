@@ -8,6 +8,13 @@
 
 ### Added
 
+- **七牛云（Qiniu AI）内置预设**：`provider add qiniu --key sk-…` 直接可用
+  （base_url https://api.qnaigc.com/v1，OpenAI 兼容）。预设带
+  `auto_include: ["*"]`，`provider models qiniu` 拉到的模型会**全部自动
+  暴露**，厂商改模型名也不用手改配置。
+- **CLI 的 `provider models` 也会应用 auto_include**（此前只有控制台的
+  「刷新模型」会），并把新模型落盘。
+
 - **WorkBuddy 多账号**：登录态文件改成账号池（`workbuddy-session.json`），
   可登录多个账号（`workbuddy login --account <名字>`）、列出
   （`workbuddy accounts`）、切换（`workbuddy use <名字>`）；网关的请求在

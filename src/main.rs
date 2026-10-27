@@ -619,8 +619,37 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
             };
             let models = fetch_models(provider).await?;
             println!("the vendor lists {} models:", models.len());
-            for m in models {
+            for m in &models {
                 println!("  {m}");
+            }
+            // The provider's auto_include globs decide which of them the
+            // gateway exposes; the new ones are folded in and saved, so a
+            // vendor that renames its models needs no hand-editing.
+            let patterns = provider.auto_include.clone();
+            if !patterns.is_empty() {
+                let mut added = Vec::new();
+                for m in &models {
+                    let known = config
+                        .provider(&id)
+                        .map(|p| p.models.contains(m))
+                        .unwrap_or(false);
+                    if !known && patterns.iter().any(|pat| glob_match(pat, m)) {
+                        added.push(m.clone());
+                    }
+                }
+                if !added.is_empty() {
+                    let count = added.len();
+                    {
+                        let Some(p) = config.provider_mut(&id) else {
+                            anyhow::bail!("there is no provider called {id}");
+                        };
+                        p.models.extend(added.iter().cloned());
+                        p.models.sort();
+                        p.models.dedup();
+                    }
+                    save_config(&config)?;
+                    println!("  + {count} model(s) exposed by auto_include");
+                }
             }
         }
         ProviderCmd::Expose { id, models } => {
@@ -1640,6 +1669,17 @@ async fn group_cmd(cmd: GroupCmd) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a model id matches one glob (`*` is the only wildcard).
+fn glob_match(pattern: &str, model: &str) -> bool {
+    if !pattern.contains('*') {
+        return pattern == model;
+    }
+    let mut split = pattern.split('*');
+    let head = split.next().unwrap_or_default();
+    let last = split.next_back().unwrap_or_default();
+    model.len() >= head.len() + last.len() && model.starts_with(head) && model.ends_with(last)
 }
 
 fn slugify(name: &str) -> String {
