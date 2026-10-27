@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRouteLoaderData } from "react-router";
 import { LogIn, Plus, Search } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
-import type { Provider } from "@/types";
+import type { Provider, ProviderAccount } from "@/types";
 import type { Preset } from "@/types";
 import { api, getPresets } from "@/api";
 import {
@@ -11,6 +11,7 @@ import {
   EmptyState, Field, Input, Sheet, SheetBody, SheetContent, SheetDescription, SheetHeader, SheetTitle,
 } from "@/components/ui";
 import { useT } from "@/i18n";
+import { cn } from "@/lib/utils";
 import { SectionToolbar, StatusDot } from "@/components/shared/bits";
 
 export default function ProvidersPage() {
@@ -205,6 +206,11 @@ export default function ProvidersPage() {
               </div>
               <div className="flex gap-3 border-y border-border py-2.5 font-mono text-[10px] text-muted-foreground">
                 <span>{provider.auth ? t("providers.session") : t(provider.keys.length === 1 ? "providers.keys" : "providers.keysPlural", { n: provider.keys.length })}</span>
+                {provider.account?.nickname && (
+                  <span className="truncate text-primary" title={provider.account.uid}>
+                    {provider.account.nickname}
+                  </span>
+                )}
                 <span>{t("providers.models", { n: provider.models.length })}</span>
                 {provider.media_models?.length ? <span>{t("providers.media", { n: provider.media_models.length })}</span> : null}
                 <span className={provider.enabled ? "state-on" : "state-off"}>
@@ -241,7 +247,7 @@ export default function ProvidersPage() {
         </Card>
       )}
 
-      <ProviderDetail provider={detail} onClose={() => setDetail(null)} />
+      <ProviderDetail provider={detail} onClose={() => setDetail(null)} onChanged={reload} />
 
       <Dialog open={showAdd} onOpenChange={setShowAdd}>
         <DialogContent className="max-w-3xl">
@@ -346,7 +352,7 @@ export default function ProvidersPage() {
   );
 }
 
-function ProviderDetail({ provider, onClose }: { provider: Provider | null; onClose: () => void }) {
+function ProviderDetail({ provider, onClose, onChanged }: { provider: Provider | null; onClose: () => void; onChanged: () => Promise<void> }) {
   const { t } = useT();
   const yesNo = (value: boolean | undefined) => (value ? t("providers.yes") : t("providers.no"));
   return (
@@ -396,6 +402,9 @@ function ProviderDetail({ provider, onClose }: { provider: Provider | null; onCl
                   </div>
                 </div>
               ) : null}
+              {provider.auth ? (
+                <AccountPool provider={provider} onChanged={onChanged} />
+              ) : null}
             </SheetBody>
           </>
         )}
@@ -410,4 +419,139 @@ function DetailStat({ label, value, accent = false }: { label: string; value: st
 
 function DetailRow({ label, value }: { label: string; value: string }) {
   return <div className="grid grid-cols-[120px_1fr] gap-3 border-b border-border/60 py-2 last:border-b-0"><span className="eyebrow">{label}</span><span className="break-all font-mono text-[11px] text-muted-foreground">{value}</span></div>;
+}
+
+
+/**
+ * The accounts behind a session-backed provider: who is signed in, which
+ * one is in use, and a way to add another (the sign-in page opens, the
+ * gateway does the rest) or switch between them.
+ */
+function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: () => Promise<void> }) {
+  const { t } = useT();
+  const [accounts, setAccounts] = useState<ProviderAccount[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [adding, setAdding] = useState(false);
+  const [newName, setNewName] = useState("");
+
+  const load = useCallback(async () => {
+    try {
+      const response = await api<{ accounts: ProviderAccount[] }>(
+        `/api/providers/${encodeURIComponent(provider.id)}/accounts`,
+      );
+      setAccounts(response.accounts);
+    } catch {
+      setAccounts([]);
+    }
+  }, [provider.id]);
+
+  useEffect(() => { load(); }, [load]);
+
+  /** Sign in another account: the browser opens, the gateway finishes. */
+  const add = async () => {
+    const name = newName.trim() || "default";
+    setBusy(true);
+    try {
+      const flow = await api<{ url: string }>(`/api/providers/${encodeURIComponent(provider.id)}/login`, {
+        method: "POST",
+        body: { account: name },
+      });
+      window.open(flow.url, "_blank", "noopener");
+      toast.success(t("providers.accountOpened"));
+      const deadline = Date.now() + 5 * 60 * 1000;
+      while (Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        const status = await api<{ done: boolean; account?: string }>(
+          `/api/providers/${encodeURIComponent(provider.id)}/login/status`,
+        );
+        if (status.done) {
+          toast.success(t("providers.accountAdded", { name: status.account ?? name }));
+          setAdding(false);
+          setNewName("");
+          await load();
+          await onChanged();
+          return;
+        }
+      }
+      toast.error(t("providers.signInTimeout"));
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Switch to another account. */
+  const use = async (name: string) => {
+    try {
+      await api(`/api/providers/${encodeURIComponent(provider.id)}/accounts/active`, {
+        method: "POST",
+        body: { name },
+      });
+      toast.success(t("providers.accountSwitched", { name }));
+      await load();
+      await onChanged();
+    } catch (error) {
+      toast.error((error as Error).message);
+    }
+  };
+
+  return (
+    <div className="border-t border-border p-4">
+      <div className="mb-2 flex items-center justify-between gap-3">
+        <span className="eyebrow">{t("providers.accounts")}</span>
+        <Button variant="ghost" size="sm" onClick={() => setAdding((value) => !value)}>
+          <Plus /> {t("providers.addAccount")}
+        </Button>
+      </div>
+      {adding && (
+        <div className="mb-3 flex items-center gap-2">
+          <Input
+            autoFocus
+            className="h-8"
+            placeholder={t("providers.accountNamePlaceholder")}
+            value={newName}
+            onChange={(event) => setNewName(event.target.value)}
+            onKeyDown={(event) => { if (event.key === "Enter") add(); }}
+          />
+          <Button variant="default" size="sm" onClick={add} disabled={busy}>
+            {busy ? t("providers.accountWaiting") : t("providers.signIn")}
+          </Button>
+        </div>
+      )}
+      {accounts.length ? (
+        <div className="grid gap-1.5">
+          {accounts.map((account) => (
+            <div
+              key={account.name}
+              className={cn(
+                "flex items-center gap-2 border px-2.5 py-2",
+                account.active ? "border-primary/30 bg-primary/5" : "border-border",
+              )}
+            >
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-[11px] text-foreground">
+                  {account.nickname || account.name}
+                </span>
+                <span className="block truncate font-mono text-[9px] text-muted-foreground">
+                  {account.name}{account.uid ? ` · ${account.uid}` : ""}
+                </span>
+              </span>
+              {account.active ? (
+                <Badge variant="primary">{t("providers.inUse")}</Badge>
+              ) : (
+                <Button variant="ghost" size="sm" onClick={() => use(account.name)}>
+                  {t("providers.use")}
+                </Button>
+              )}
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="font-mono text-[10px] text-muted-foreground/70">
+          {t("providers.noAccounts")}
+        </p>
+      )}
+    </div>
+  );
 }

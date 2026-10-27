@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[derive(Clone)]
 pub enum Pending {
     /// A WorkBuddy sign-in, polled by its session state.
-    WorkBuddy { state: String },
+    WorkBuddy { state: String, account: String },
     /// A QwenWork device flow, polled by its device state.
     QwenWork {
         state: crate::qwen::login::LoginState,

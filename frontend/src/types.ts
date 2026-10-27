@@ -32,6 +32,16 @@ export interface ProviderKey {
   label?: string;
 }
 
+export interface ProviderAccount {
+  name: string;
+  nickname?: string;
+  uid?: string;
+  type?: string;
+  email?: string;
+  active?: boolean;
+  expires_at?: number | null;
+}
+
 export interface Provider {
   id: string;
   name: string;
@@ -65,6 +75,8 @@ export interface Provider {
   hold_when_exhausted?: boolean;
   /** The models this provider offers for image and video work. */
   media_models?: string[];
+  /** For a session-backed provider: who is signed in. */
+  account?: ProviderAccount;
 }
 
 export type Routing = "smart" | "order" | "rotate" | "usage" | "weight";

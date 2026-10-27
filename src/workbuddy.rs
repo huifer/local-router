@@ -535,6 +535,35 @@ pub fn read_pool() -> anyhow::Result<SessionPool> {
     Ok(pool)
 }
 
+/// Save identity fields filled by the account endpoint back to the active
+/// local-router account. This repairs sessions created by older versions
+/// that stored tokens before fetching the profile.
+pub async fn update_active_identity(profile: &Value) -> anyhow::Result<()> {
+    let mut pool = read_pool()?;
+    let name = if pool.active.is_empty() {
+        pool.accounts
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
+    } else {
+        pool.active.clone()
+    };
+    let Some(file) = pool.accounts.get_mut(&name) else {
+        anyhow::bail!("there is no active WorkBuddy account");
+    };
+    if let Some(uid) = profile.get("uid").and_then(Value::as_str) {
+        file.account.uid = uid.to_string();
+    }
+    if let Some(nickname) = profile.get("nickname").and_then(Value::as_str) {
+        file.account.nickname = nickname.to_string();
+    }
+    if let Some(kind) = profile.get("type").and_then(Value::as_str) {
+        file.account.account_type = kind.to_string();
+    }
+    write_pool(&pool)
+}
+
 /// The accounts local-router knows, by name.
 pub fn accounts() -> anyhow::Result<Vec<(String, SessionFile)>> {
     Ok(read_pool()?.accounts.into_iter().collect())
