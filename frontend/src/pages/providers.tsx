@@ -362,7 +362,57 @@ export default function ProvidersPage() {
 
 function ProviderDetail({ provider, onClose, onChanged }: { provider: Provider | null; onClose: () => void; onChanged: () => Promise<void> }) {
   const { t } = useT();
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; latency_ms?: number; error?: string } | null>(null);
+  const [cooldown, setCooldown] = useState<{ seconds_left: number; strikes: number } | null>(null);
   const yesNo = (value: boolean | undefined) => (value ? t("providers.yes") : t("providers.no"));
+
+  useEffect(() => {
+    if (!provider) {
+      setCooldown(null);
+      return;
+    }
+    let alive = true;
+    const load = async () => {
+      try {
+        const response = await api<{ cooldowns: { key: string; seconds_left: number; strikes: number }[] }>("/api/cooldowns");
+        const row = response.cooldowns.find((item) => item.key === provider.id);
+        if (alive) setCooldown(row ? { seconds_left: row.seconds_left, strikes: row.strikes } : null);
+      } catch {
+        // The cooldown indicator is advisory; provider details still work.
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 1000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [provider]);
+
+  const testChat = async () => {
+    if (!provider) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const result = await api<{ ok: boolean; latency_ms?: number; error?: string }>(
+        `/api/providers/${encodeURIComponent(provider.id)}/test`,
+        { method: "POST", body: {} },
+      );
+      setTestResult(result);
+      if (result.ok) {
+        toast.success(t("providers.testPassed", { ms: result.latency_ms ?? 0 }));
+      } else {
+        toast.error(`${t("providers.testFailed")}: ${result.error ?? t("providers.coolingDown")}`);
+      }
+    } catch (error) {
+      const message = (error as Error).message;
+      setTestResult({ ok: false, error: message });
+      toast.error(`${t("providers.testFailed")}: ${message}`);
+    } finally {
+      setTesting(false);
+    }
+  };
   return (
     <Sheet open={Boolean(provider)} onOpenChange={(open) => !open && onClose()}>
       <SheetContent>
@@ -377,6 +427,15 @@ function ProviderDetail({ provider, onClose, onChanged }: { provider: Provider |
                 <DetailStat label={t("providers.status")} value={provider.enabled ? t("providers.active") : t("providers.paused")} accent={provider.enabled} />
                 <DetailStat label={t("nav.models")} value={String(provider.models.length)} />
                 <DetailStat label={t("providers.keysLabel")} value={provider.auth ? t("providers.session") : String(provider.keys.length)} />
+              </div>
+              <div className="flex flex-wrap items-center gap-2 border-b border-border p-4">
+                <Button variant="default" size="sm" onClick={testChat} disabled={testing}>
+                  <RefreshCw className={cn(testing && "animate-spin")} /> {testing ? t("providers.testing") : t("providers.testChat")}
+                </Button>
+                {cooldown ? (
+                  <Badge variant="destructive">{t("providers.coolingDown")} · {t("providers.cooldownLeft", { n: cooldown.seconds_left })}</Badge>
+                ) : null}
+                {testResult?.ok ? <span className="font-mono text-[10px] text-primary">{t("providers.testPassed", { ms: testResult.latency_ms ?? 0 })}</span> : null}
               </div>
               <div className="grid gap-0 px-4 py-2">
                 <DetailRow label={t("providers.baseUrl")} value={provider.base_url ?? "—"} />

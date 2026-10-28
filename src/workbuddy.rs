@@ -737,7 +737,19 @@ pub struct ProviderQuota {
 /// The account's quota window, from the same numbers the credits view uses.
 pub async fn quota() -> anyhow::Result<ProviderQuota> {
     let session = session().await?;
-    let credits = credits().await?;
+    quota_for_session(&session).await
+}
+
+/// The quota window of one saved account (each has its own), by its slot.
+pub async fn quota_for(name: &str) -> anyhow::Result<ProviderQuota> {
+    let session = session_of(name)?;
+    quota_for_session(&session).await
+}
+
+/// The network half of [`quota`]: read one session's packages and shape
+/// them into the provider-quota view.
+async fn quota_for_session(session: &Session) -> anyhow::Result<ProviderQuota> {
+    let credits = credits_session(session).await?;
     let mut resets: Option<i64> = None;
     for item in &credits.packages {
         if item.remaining > 0 {
@@ -767,7 +779,8 @@ pub async fn quota() -> anyhow::Result<ProviderQuota> {
         name: "WorkBuddy".to_string(),
         kind: "subscription".to_string(),
         plan: "Free plan".to_string(),
-        user: session.account.nickname.clone(),
+        // The screen is shared; the holder's name stays behind a mask.
+        user: crate::mask::person(&session.account.nickname),
         windows,
         read_at: chrono::Utc::now().to_rfc3339(),
     })

@@ -8,6 +8,9 @@
 
 ### Added
 
+- **直接测试对话**：控制台 provider 抽屉新增「测试对话」，会发送一条最小 ping 并显示耗时；命令行使用 `local-router provider test <provider-id>`，输出耗时与上游回复。QwenWork/Trae CN 会走各自专用协议，不再被错误地当成普通 OpenAI 上游。
+- **429 全局冷却**：任何上游返回 HTTP 429 后，该 provider 默认冷却 60 秒；连续 429 会指数退避，最长 10 分钟。冷却期间网关在发送前跳过它并尝试下一个路由目标，控制台/CLI 的测试也不会绕过冷却。可用 `LOCAL_ROUTER_COOLDOWN_SECS` 与 `LOCAL_ROUTER_COOLDOWN_MAX_SECS` 调整。
+
 - **每个账号一份独立额度 + 一键签到**：会话型 provider 的账号池里，每个账号
   都有自己的额度与签到状态，现在逐账号读、逐账号领：
   - 新接口 `GET /api/providers/{id}/accounts/{name}/quota`：读**某一个**账号的

@@ -887,6 +887,8 @@ pub struct AppState {
     pub store: Arc<Store>,
     /// The SQLite usage store, when it is on.
     pub sqlite: Option<crate::store::Store>,
+    /// The in-process 429 cooldowns shared by gateway and console.
+    pub cooldowns: crate::gateway::cooldown::Registry,
     pub started: chrono::DateTime<chrono::Utc>,
     /// The address the web page actually listens on. Startup overlays the
     /// environment and the command line on the file; handlers that care —
@@ -906,6 +908,7 @@ impl AppState {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             store,
             sqlite: crate::store::Store::shared(),
+            cooldowns: crate::gateway::cooldown::Registry::default(),
             started: chrono::Utc::now(),
             web_bind: Arc::new(tokio::sync::RwLock::new(web_bind)),
             mtime: Arc::new(tokio::sync::Mutex::new(mtime)),

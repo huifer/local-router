@@ -7,7 +7,7 @@
 pub(crate) mod console;
 
 use local_router::{
-    config, gateway, presets, pricing, protocol, qwen, server, store, web, workbuddy,
+    config, gateway, presets, pricing, protocol, qwen, server, store, trae, web, workbuddy,
 };
 
 use std::collections::BTreeMap;
@@ -700,7 +700,7 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                 anyhow::bail!("there is no provider called {id}");
             };
             let provider = provider.clone();
-            match test_provider(&provider).await {
+            match test_provider(&provider, config.settings.gateway_port).await {
                 Ok((latency, reply)) => {
                     println!("{id} answered in {latency} ms");
                     println!("  {reply}");
@@ -928,11 +928,106 @@ async fn fetch_models(provider: &config::Provider) -> anyhow::Result<Vec<String>
     Ok(models)
 }
 
-async fn test_provider(provider: &config::Provider) -> anyhow::Result<(u128, String)> {
+async fn test_provider(
+    provider: &config::Provider,
+    gateway_port: u16,
+) -> anyhow::Result<(u128, String)> {
+    // Prefer the running gateway's console endpoint. This makes a CLI test
+    // observe the same cooldown map as the daemon and exercises the exact
+    // provider-specific protocol the web button uses. If no daemon is up,
+    // fall back to a direct vendor request below.
+    let local = reqwest::Client::new();
+    let local_url = format!(
+        "http://127.0.0.1:{gateway_port}/api/providers/{}/test",
+        provider.id
+    );
+    if let Ok(response) = local
+        .post(&local_url)
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+    {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        if status != reqwest::StatusCode::NOT_FOUND {
+            let value: Value =
+                serde_json::from_str(&body).unwrap_or_else(|_| serde_json::json!({"error": body}));
+            if !status.is_success() || value.get("ok").and_then(Value::as_bool) == Some(false) {
+                anyhow::bail!(
+                    "{}",
+                    value.get("error").and_then(Value::as_str).unwrap_or(&body)
+                );
+            }
+            return Ok((
+                value
+                    .get("latency_ms")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default() as u128,
+                value
+                    .get("reply")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            ));
+        }
+    }
+
     let model = provider
         .models
         .first()
         .context("the provider exposes no model")?;
+    if gateway::cooldown::provider_is_cooling(&provider.id).await {
+        anyhow::bail!(
+            "{} is cooling down after a 429; try again shortly",
+            provider.id
+        );
+    }
+    let started = std::time::Instant::now();
+    if provider.auth == Some(config::AuthKind::QwenWork) {
+        let session = qwen::login::session().await?;
+        let mut request = protocol::ir::ChatRequest {
+            model: model.clone(),
+            ..Default::default()
+        };
+        request.messages.push(protocol::ir::Message::user("ping"));
+        request.max_tokens = Some(16);
+        let body = gateway::build_qwen_body(&request, model);
+        let events = match qwen::client::chat(&session, &body).await {
+            Ok(events) => events,
+            Err(err) => {
+                if err.to_string().contains("429") || err.to_string().contains("限流") {
+                    gateway::cooldown::penalize(&provider.id, None).await;
+                }
+                return Err(err);
+            }
+        };
+        return Ok((
+            started.elapsed().as_millis(),
+            protocol::ir::ChatResponse::from_events(&events).text(),
+        ));
+    }
+    if provider.auth == Some(config::AuthKind::TraeCn) {
+        let (_account, session) = trae::session_rotating().await?;
+        let mut request = protocol::ir::ChatRequest {
+            model: model.clone(),
+            ..Default::default()
+        };
+        request.messages.push(protocol::ir::Message::user("ping"));
+        request.max_tokens = Some(16);
+        let events = match trae::chat(&session, &request).await {
+            Ok(events) => events,
+            Err(err) => {
+                if err.to_string().contains("429") || err.to_string().contains("限流") {
+                    gateway::cooldown::penalize(&provider.id, None).await;
+                }
+                return Err(err);
+            }
+        };
+        return Ok((
+            started.elapsed().as_millis(),
+            protocol::ir::ChatResponse::from_events(&events).text(),
+        ));
+    };
     // A session-backed provider has no stored key: the session is read
     // when the request goes out.
     let (headers, _token) = if provider.uses_session() {
@@ -979,8 +1074,16 @@ async fn test_provider(provider: &config::Provider) -> anyhow::Result<(u128, Str
     let latency = started.elapsed().as_millis();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("{}", text.chars().take(200).collect::<String>());
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            gateway::cooldown::penalize(&provider.id, None).await;
+        }
+        anyhow::bail!(
+            "HTTP {}: {}",
+            status,
+            text.chars().take(200).collect::<String>()
+        );
     }
+    gateway::cooldown::clear(&provider.id, None).await;
     Ok((latency, text.chars().take(200).collect()))
 }
 

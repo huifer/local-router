@@ -58,6 +58,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/providers/{id}/models", post(api_set_models))
         .route("/api/providers/{id}/refresh", post(api_refresh_models))
         .route("/api/providers/{id}/test", post(api_test_provider))
+        .route("/api/cooldowns", get(api_cooldowns))
         .route("/api/providers/{id}/oauth", post(api_oauth_start))
         .route("/api/providers/{id}/login", post(api_session_login_start))
         .route(
@@ -1678,6 +1679,10 @@ async fn oauth_callback(
     Html(html).into_response()
 }
 
+async fn api_cooldowns(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"cooldowns": state.cooldowns.snapshot().await}))
+}
+
 async fn api_test_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1698,6 +1703,106 @@ async fn api_test_provider(
             Json(json!({"error": "the provider exposes no model"})),
         ));
     };
+    if state.cooldowns.provider_is_cooling(&id).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({"error": "this provider is cooling down after a 429; try again shortly"})),
+        ));
+    }
+    let cooldowns = state.cooldowns.clone();
+    // Session vendors have a dedicated wire protocol. Use the same real
+    // request path as the gateway rather than pretending their endpoint is
+    // generic OpenAI.
+    if provider.auth == Some(crate::config::AuthKind::QwenWork) {
+        let session = crate::qwen::login::session().await.map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        let mut request = crate::protocol::ir::ChatRequest {
+            model: model.clone(),
+            ..Default::default()
+        };
+        request.messages.push(crate::protocol::ir::Message {
+            role: crate::protocol::ir::Role::User,
+            content: vec![crate::protocol::ir::ContentBlock::Text {
+                text: "ping".into(),
+            }],
+            tool_call_id: None,
+            name: None,
+        });
+        request.max_tokens = Some(16);
+        let body = crate::gateway::build_qwen_body(&request, &model);
+        let started = std::time::Instant::now();
+        let events = crate::qwen::client::chat(&session, &body)
+            .await
+            .map_err(|e| {
+                if e.to_string().contains("429") || e.to_string().contains("限流") {
+                    // Keep the provider quiet after a real vendor rate limit.
+                    let cooldowns = cooldowns.clone();
+                    tokio::spawn(async move {
+                        cooldowns.penalize("qwenwork", None).await;
+                    });
+                }
+                (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"ok": false, "error": e.to_string()})),
+                )
+            })?;
+        let reply = crate::protocol::ir::ChatResponse::from_events(&events).text();
+        state.cooldowns.clear("qwenwork", None).await;
+        return Ok(Json(json!({
+            "ok": true,
+            "status": 200,
+            "latency_ms": started.elapsed().as_millis() as u64,
+            "model": model,
+            "reply": reply,
+        })));
+    }
+    if provider.auth == Some(crate::config::AuthKind::TraeCn) {
+        let (account, session) = crate::trae::session_rotating().await.map_err(|e| {
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        let mut request = crate::protocol::ir::ChatRequest {
+            model: model.clone(),
+            ..Default::default()
+        };
+        request.messages.push(crate::protocol::ir::Message {
+            role: crate::protocol::ir::Role::User,
+            content: vec![crate::protocol::ir::ContentBlock::Text {
+                text: "ping".into(),
+            }],
+            tool_call_id: None,
+            name: None,
+        });
+        request.max_tokens = Some(16);
+        let started = std::time::Instant::now();
+        let events = crate::trae::chat(&session, &request).await.map_err(|e| {
+            if e.to_string().contains("429") || e.to_string().contains("限流") {
+                let cooldowns = cooldowns.clone();
+                tokio::spawn(async move {
+                    cooldowns.penalize("trae-cn", None).await;
+                });
+            }
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"ok": false, "error": e.to_string()})),
+            )
+        })?;
+        let reply = crate::protocol::ir::ChatResponse::from_events(&events).text();
+        state.cooldowns.clear("trae-cn", Some(&account)).await;
+        return Ok(Json(json!({
+            "ok": true,
+            "status": 200,
+            "latency_ms": started.elapsed().as_millis() as u64,
+            "model": model,
+            "reply": reply,
+        })));
+    }
     // The generic provider smoke test only applies to WorkBuddy's generic
     // OpenAI upstream; QwenWork and Trae have dedicated request protocols.
     if provider.auth == Some(crate::config::AuthKind::QwenWork)
@@ -1773,6 +1878,11 @@ async fn api_test_provider(
     let text = resp.text().await.unwrap_or_default();
     let latency = started.elapsed().as_millis() as u64;
     let ok = (200..300).contains(&status);
+    if status == 429 {
+        state.cooldowns.penalize(&id, None).await;
+    } else if ok {
+        state.cooldowns.clear(&id, None).await;
+    }
     Ok(Json(json!({
         "ok": ok,
         "status": status,
@@ -2316,9 +2426,12 @@ async fn api_usage(
     }))
 }
 
-/// The quota summary for the Usage page's Quota panel. Reads the WorkBuddy
-/// account when it is configured; every other provider reports no quota (it
-/// bills by token, not by window) and is listed as unlimited.
+/// The quota summary for the Usage page's Quota panel.
+///
+/// Session-backed providers list **each saved account with its own windows**
+/// — the vendor's quota and sign-in state are per account, not per provider.
+/// Every other provider bills by token (no window to run out of) and is
+/// listed as unlimited.
 async fn quota_summary(state: &AppState) -> Value {
     let config = state.config.read().await;
     let mut accounts: Vec<Value> = Vec::new();
@@ -2333,77 +2446,122 @@ async fn quota_summary(state: &AppState) -> Value {
             }));
             continue;
         }
-        if provider.id == "qwenwork" {
-            match crate::qwen::login::session().await {
-                Ok(session) => match crate::qwen::client::account_quota(&session).await {
-                    Ok(q) => accounts.push(json!({
-                        "provider": "qwenwork",
-                        "name": "QwenWork（千问办公）",
-                        "kind": "subscription",
-                        "user": session.account.nickname,
-                        "windows": [{
-                            "name": "Credits",
-                            "used": Value::Null,
-                            "remaining": q.pools.iter().map(|p| p.balance).sum::<f64>(),
-                            "resets_at": q.resets_at,
-                            "display": q.display,
-                            "unit": "credits",
-                            "unlimited": false,
-                            "holds_why": if q.empty { Some("balance is zero".to_string()) } else { None },
-                        }],
-                        "unlimited": false,
-                        "read_at": chrono::Utc::now().to_rfc3339(),
-                    })),
-                    Err(err) => accounts.push(json!({
-                        "provider": "qwenwork",
-                        "name": "QwenWork（千问办公）",
-                        "kind": "token",
-                        "windows": [],
-                        "unlimited": true,
-                        "error": err.to_string(),
-                    })),
-                },
-                Err(err) => accounts.push(json!({
-                    "provider": "qwenwork",
-                    "name": "QwenWork（千问办公）",
-                    "kind": "token",
-                    "windows": [],
-                    "unlimited": true,
-                    "error": err.to_string(),
-                })),
-            }
-            continue;
-        }
-        match crate::workbuddy::quota().await {
-            Ok(q) => accounts.push(json!({
-                "provider": q.provider,
-                "name": q.name,
-                "kind": q.kind,
-                "user": q.user,
-                "windows": q.windows
-                    .iter()
-                    .map(|w| json!({
-                        "name": w.name,
-                        "used": w.used,
-                        "remaining": w.remaining,
-                        "resets_at": w.resets_at,
-                        "display": w.display,
-                        "unit": w.unit,
-                        "unlimited": w.unlimited(),
-                        "holds_why": w.holds_why,
-                    }))
-                    .collect::<Vec<_>>(),
-                "unlimited": false,
-                "read_at": q.read_at,
-            })),
-            Err(err) => accounts.push(json!({
+        // The accounts the pool holds, by slot name: the vendor's quota is
+        // per account, so every one of them gets its own row.
+        let pool: Vec<(String, String)> = match provider.auth {
+            Some(crate::config::AuthKind::WorkBuddy) => crate::workbuddy::read_pool()
+                .map(|p| {
+                    p.accounts
+                        .into_iter()
+                        .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Some(crate::config::AuthKind::QwenWork) => crate::qwen::login::read_pool()
+                .map(|p| {
+                    p.accounts
+                        .into_iter()
+                        .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if pool.is_empty() {
+            accounts.push(json!({
                 "provider": provider.id,
                 "name": provider.name,
                 "kind": "token",
                 "windows": [],
                 "unlimited": true,
-                "error": err.to_string(),
-            })),
+                "error": "no account signed in",
+            }));
+            continue;
+        }
+        for (name, holder) in pool {
+            match provider.auth {
+                Some(crate::config::AuthKind::WorkBuddy) => {
+                    match crate::workbuddy::quota_for(&name).await {
+                        Ok(q) => accounts.push(json!({
+                            "provider": provider.id,
+                            "account": name,
+                            "name": q.name,
+                            "kind": q.kind,
+                            "user": holder,
+                            "windows": q.windows.iter().map(|w| json!({
+                                "name": w.name,
+                                "used": w.used,
+                                "remaining": w.remaining,
+                                "resets_at": w.resets_at,
+                                "display": w.display,
+                                "unit": w.unit,
+                                "unlimited": w.unlimited(),
+                                "holds_why": w.holds_why,
+                            })).collect::<Vec<_>>(),
+                            "unlimited": false,
+                            "read_at": q.read_at,
+                        })),
+                        Err(err) => accounts.push(json!({
+                            "provider": provider.id,
+                            "account": name,
+                            "name": provider.name,
+                            "kind": "token",
+                            "user": holder,
+                            "windows": [],
+                            "unlimited": true,
+                            "error": err.to_string(),
+                        })),
+                    }
+                }
+                Some(crate::config::AuthKind::QwenWork) => {
+                    match crate::qwen::login::session_of(&name) {
+                        Ok(session) => {
+                            match crate::qwen::client::account_quota(&session).await {
+                                Ok(q) => accounts.push(json!({
+                                    "provider": provider.id,
+                                    "account": name,
+                                    "name": "QwenWork（千问办公）",
+                                    "kind": "subscription",
+                                    "user": holder,
+                                    "windows": [{
+                                        "name": "Credits",
+                                        "used": Value::Null,
+                                        "remaining": q.pools.iter().map(|p| p.balance).sum::<f64>(),
+                                        "resets_at": q.resets_at,
+                                        "display": q.display,
+                                        "unit": "credits",
+                                        "unlimited": false,
+                                        "holds_why": if q.empty { Some("balance is zero".to_string()) } else { None },
+                                    }],
+                                    "unlimited": false,
+                                    "read_at": chrono::Utc::now().to_rfc3339(),
+                                })),
+                                Err(err) => accounts.push(json!({
+                                    "provider": provider.id,
+                                    "account": name,
+                                    "name": provider.name,
+                                    "kind": "token",
+                                    "user": holder,
+                                    "windows": [],
+                                    "unlimited": true,
+                                    "error": err.to_string(),
+                                })),
+                            }
+                        }
+                        Err(err) => accounts.push(json!({
+                            "provider": provider.id,
+                            "account": name,
+                            "name": provider.name,
+                            "kind": "token",
+                            "user": holder,
+                            "windows": [],
+                            "unlimited": true,
+                            "error": err.to_string(),
+                        })),
+                    }
+                }
+                _ => {}
+            }
         }
     }
     json!(accounts)

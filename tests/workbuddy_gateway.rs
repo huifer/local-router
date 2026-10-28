@@ -421,7 +421,7 @@ async fn the_quota_window_and_the_usage_are_readable_over_http() {
     let quota = &body["data"][0];
     assert_eq!(quota["provider"], "workbuddy");
     assert_eq!(quota["kind"], "subscription");
-    assert_eq!(quota["user"], "Tester");
+    assert_eq!(quota["user"], "T***");
     assert_eq!(quota["windows"][0]["name"], "Credits");
     assert_eq!(quota["windows"][0]["remaining"], 0.0);
     assert_eq!(quota["windows"][0]["holds_why"], "clock");

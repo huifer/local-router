@@ -17,7 +17,7 @@ import {
 import { RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
-import type { ProjectRow, UsageData, UsageTotals } from "@/types";
+import type { ProjectRow, QuotaAccount, UsageData, UsageTotals } from "@/types";
 import { api, getProjects, getUsage, mergeProjects, updateProject } from "@/api";
 import {
   Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Dialog,
@@ -232,6 +232,13 @@ function UsageOverview({ usage }: { usage: UsageData }) {
         </CardHeader>
         {usage.recent.length ? (
           <div className="py-1">
+            <div className="grid grid-cols-[10px_minmax(0,1fr)_150px_60px_42px] items-center gap-2.5 border-b border-border px-5 pb-2 max-[700px]:grid-cols-[8px_minmax(0,1fr)_auto]">
+              <span />
+              <span className="eyebrow">{t("usage.model")}</span>
+              <span className="eyebrow hidden sm:block">{t("usage.tokens")}</span>
+              <span className="eyebrow hidden sm:block">{t("usage.cost")}</span>
+              <span />
+            </div>
             {usage.recent.map((record, index) => (
               <div
                 key={`${record.time}-${index}`}
@@ -239,13 +246,33 @@ function UsageOverview({ usage }: { usage: UsageData }) {
               >
                 <span className={`size-1.5 rounded-full ${record.ok ? "bg-ring" : "bg-destructive"}`} />
                 <div className="min-w-0">
-                  <strong className="block truncate font-mono text-[11px]">{record.model}</strong>
+                  <strong className="block truncate font-mono text-[11px]" title={record.error}>{record.model}</strong>
                   <span className="block truncate font-mono text-[10px] text-muted-foreground">
                     {record.provider} / {record.protocol}
+                    {record.agent ? ` · ${record.agent}` : ""}
+                  </span>
+                  <span className="block truncate font-mono text-[9px] text-muted-foreground/60 sm:hidden">
+                    {formatTime(record.time)} · {record.latency_ms}ms · {formatTokens(record.input_tokens)}→{formatTokens(record.output_tokens)}
+                    {typeof record.cost_usd === "number" ? ` · $${record.cost_usd.toFixed(4)}` : ""}
+                    {typeof record.credits === "number" && record.credits > 0 ? ` · ${record.credits.toFixed(1)}cr` : ""}
                   </span>
                 </div>
-                <span className="hidden font-mono text-[10px] text-muted-foreground sm:block">{formatTime(record.time)}</span>
-                <span className="hidden font-mono text-[10px] text-muted-foreground sm:block">{record.latency_ms}ms</span>
+                <div className="hidden min-w-0 flex-col sm:flex">
+                  <span className="font-mono text-[10px] text-muted-foreground">{formatTime(record.time)}</span>
+                  <span className="font-mono text-[10px] text-foreground">
+                    {formatTokens(record.input_tokens)} → {formatTokens(record.output_tokens)}
+                  </span>
+                </div>
+                <div className="hidden flex-col items-end sm:flex">
+                  {typeof record.cost_usd === "number" ? (
+                    <span className="usage-number text-[11px]">${record.cost_usd.toFixed(4)}</span>
+                  ) : (
+                    <span className="font-mono text-[9px] text-muted-foreground/60">—</span>
+                  )}
+                  {typeof record.credits === "number" && record.credits > 0 ? (
+                    <span className="usage-credits text-[9px]">{record.credits.toFixed(1)}cr</span>
+                  ) : null}
+                </div>
                 <Badge variant={record.ok ? "primary" : "destructive"} className="justify-self-end">
                   {record.ok ? "OK" : "FAIL"}
                 </Badge>
@@ -630,50 +657,64 @@ function ContextPanel({ usage }: { usage: UsageData }) {
 function QuotaPanel({ usage }: { usage: UsageData }) {
   const { t } = useT();
   const accounts = usage.quota ?? [];
+  // Rows that hold real windows first; the token-billed "unlimited" ones
+  // and the error rows follow, so the numbers lead the panel.
+  const sorted = [...accounts].sort((a, b) => {
+    const rank = (q: QuotaAccount) => (q.windows.length ? 0 : q.error ? 2 : 1);
+    return rank(a) - rank(b);
+  });
   return (
-    <Card>
-      <CardHeader>
-        <CardDescription className="eyebrow">{t("usage.quotaEyebrow")}</CardDescription>
-        <CardTitle>{t("usage.balances")}</CardTitle>
-      </CardHeader>
-      {accounts.length ? (
-        <div className="grid">
-          {accounts.map((account) => (
-            <div key={account.provider} className="border-b border-border p-4.5 last:border-b-0">
-              <div className="flex items-baseline justify-between gap-3">
-                <strong className="text-xs">{account.name}</strong>
-                <span className="font-mono text-[10px] uppercase tracking-[0.08em] text-muted-foreground/70">
-                  {account.kind}{account.user ? ` · ${account.user}` : ""}{account.unlimited ? ` · ${t("usage.tokenBilled")}` : ""}
-                </span>
-              </div>
-              {account.windows.length ? (
-                account.windows.map((w) => (
-                  <div key={w.name} className="mt-3 grid gap-2">
-                    <div className="flex items-baseline justify-between">
-                      <span className="font-mono text-[10px] text-muted-foreground">{w.name}</span>
-                      <strong className="font-mono text-xs">{w.display}</strong>
-                    </div>
-                    {!w.unlimited && (
-                      <div className="budget-track h-1.5">
-                        <i
-                          className={w.remaining <= 0 ? "budget-fill budget-hot" : "budget-fill"}
-                          style={{ width: `${w.used + w.remaining > 0 ? (w.used / (w.used + w.remaining)) * 100 : 0}%` }}
-                        />
+    <>
+      <div className="flex items-center justify-end">
+        <Badge>{t("usage.quotaPerAccount")}</Badge>
+      </div>
+      {sorted.length ? (
+        <div className="grid grid-cols-2 gap-3 max-[1100px]:grid-cols-1">
+          {sorted.map((account, index) => (
+            <Card key={`${account.provider}-${account.account ?? index}`}>
+              <CardHeader className="pb-3">
+                <CardDescription className="eyebrow">{account.name}</CardDescription>
+                <CardTitle className="font-mono text-sm">{account.user || account.provider}</CardTitle>
+              </CardHeader>
+              <CardContent className="grid gap-3">
+                {account.windows.length ? (
+                  account.windows.map((w) => (
+                    <div key={w.name} className="grid gap-2">
+                      <div className="flex items-baseline justify-between">
+                        <span className="font-mono text-[10px] text-muted-foreground">{w.name}</span>
+                        <strong className="font-mono text-xs">{w.display}</strong>
                       </div>
-                    )}
-                    {w.resets_at && <div className="font-mono text-[9px] text-muted-foreground/60">{t("usage.resets", { when: formatTime(w.resets_at) })}</div>}
-                  </div>
-                ))
-              ) : (
-                <span className="mt-2.5 block font-mono text-[10px] text-muted-foreground/60">{account.error ?? t("usage.noWindows")}</span>
-              )}
-            </div>
+                      {!w.unlimited && (
+                        <div className="budget-track h-1.5">
+                          <i
+                            className={w.remaining <= 0 ? "budget-fill budget-hot" : "budget-fill"}
+                            style={{ width: `${w.used + w.remaining > 0 ? (w.used / (w.used + w.remaining)) * 100 : 0}%` }}
+                          />
+                        </div>
+                      )}
+                      {w.resets_at && <div className="font-mono text-[9px] text-muted-foreground/60">{t("usage.resets", { when: formatTime(w.resets_at) })}</div>}
+                    </div>
+                  ))
+                ) : (
+                  <span className="block font-mono text-[10px] text-muted-foreground/70">
+                    {account.error ?? (account.unlimited ? t("usage.tokenBilled") : t("usage.noWindows"))}
+                  </span>
+                )}
+                <div className="flex items-center gap-2 border-t border-border pt-2 font-mono text-[9px] text-muted-foreground/70">
+                  <span>{account.provider}</span>
+                  {account.account ? <span>· {account.account}</span> : null}
+                  {account.read_at ? <span className="ml-auto">{formatTime(account.read_at)}</span> : null}
+                </div>
+              </CardContent>
+            </Card>
           ))}
         </div>
       ) : (
-        <EmptyState title={t("usage.noAccounts")} detail={t("usage.noAccountsDetail")} />
+        <Card>
+          <EmptyState title={t("usage.noAccounts")} detail={t("usage.noAccountsDetail")} />
+        </Card>
       )}
-    </Card>
+    </>
   );
 }
 

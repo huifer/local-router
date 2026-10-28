@@ -292,8 +292,33 @@ pub struct AggregateRow {
     pub credits: Option<f64>,
 }
 
-/// Create the table if it is not there yet. A missing column is added, so
-/// an older database keeps working after a release adds a field.
+/// The columns the newest code writes. A database created by an older
+/// release may lack the later ones; each is added on open.
+const COLUMNS: [(&str, &str); 17] = [
+    ("provider", "TEXT NOT NULL DEFAULT ''"),
+    ("key_id", "TEXT"),
+    ("key_label", "TEXT"),
+    ("group_id", "TEXT"),
+    ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("reasoning_tokens", "INTEGER NOT NULL DEFAULT 0"),
+    ("latency_ms", "INTEGER NOT NULL DEFAULT 0"),
+    ("error", "TEXT"),
+    ("agent", "TEXT"),
+    ("session_id", "TEXT"),
+    ("context", "TEXT"),
+    ("project", "TEXT"),
+    ("cost_usd", "REAL"),
+    ("credits", "REAL"),
+    ("priced", "INTEGER NOT NULL DEFAULT 1"),
+    ("ok", "INTEGER NOT NULL DEFAULT 1"),
+];
+
+/// Create the table if it is not there yet, then add any column an older
+/// database is missing. `CREATE TABLE IF NOT EXISTS` does nothing on an old
+/// file — the new columns must be added one by one, or every insert fails
+/// with `no column named …` and the usage page goes quiet while the JSONL
+/// log keeps the truth.
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS usage_records (
@@ -321,10 +346,24 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             cost_usd REAL,
             credits REAL,
             priced INTEGER NOT NULL DEFAULT 1
-        );
-        CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_records(time);
-        CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_records(provider, time);
-        CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records(model, time);",
+        );",
+    )?;
+    let present: std::collections::BTreeSet<String> = {
+        let mut statement = conn.prepare("PRAGMA table_info(usage_records)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for (name, decl) in COLUMNS {
+        if !present.contains(name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE usage_records ADD COLUMN {name} {decl};"
+            ))?;
+        }
+    }
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_usage_time ON usage_records(time);
+         CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_records(provider, time);
+         CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records(model, time);",
     )?;
     Ok(())
 }
@@ -485,6 +524,68 @@ mod tests {
         assert!(projects.contains(&"/new/dir"));
         assert!(projects.contains(&"/other"));
         assert!(!projects.contains(&"/old/dir"));
+    }
+
+    #[test]
+    fn an_old_database_is_brought_up_to_the_new_columns() {
+        // The shape an early release created: no session_id, context,
+        // project, cost or credits. Every insert of the current code failed
+        // on it with `no column named …`, and the Usage page went quiet
+        // while the JSONL log kept the truth. The store must add the
+        // missing columns on open, and keep the old rows.
+        let dir = std::env::temp_dir().join(format!(
+            "local-router-store-legacy-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("usage.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE usage_records (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    time TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    protocol TEXT NOT NULL DEFAULT '',
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                    reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    status INTEGER NOT NULL DEFAULT 0,
+                    ok INTEGER NOT NULL DEFAULT 1,
+                    error TEXT,
+                    agent TEXT
+                );
+                INSERT INTO usage_records
+                    (time, model, protocol, input_tokens, output_tokens, status, ok)
+                VALUES ('2026-10-26T13:45:47+00:00', 'vendor/hy3', 'openai_chat', 11, 7, 200, 1);",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path);
+        // The old row reads back through the new shape.
+        let rows = store.read_all();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 11);
+        assert_eq!(rows[0].output_tokens, 7);
+        // And a new record — the kind the gateway writes after every
+        // request — inserts without a complaint.
+        let mut fresh = record("workbuddy", "hy3", 5, 3);
+        fresh.session_id = Some("s-9".into());
+        fresh.project = Some("/tmp/x".into());
+        fresh.cost_usd = Some(0.01);
+        store.record(&fresh);
+        let rows = store.read_all();
+        assert_eq!(rows.len(), 2);
+        let last = rows.last().unwrap();
+        assert_eq!(last.session_id.as_deref(), Some("s-9"));
+        assert_eq!(last.project.as_deref(), Some("/tmp/x"));
+        assert_eq!(last.cost_usd, Some(0.01));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

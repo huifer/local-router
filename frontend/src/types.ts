@@ -157,6 +157,9 @@ export interface UsageRecord {
   agent?: string;
   session_id?: string;
   project?: string;
+  cost_usd?: number | null;
+  credits?: number | null;
+  priced?: boolean;
 }
 
 export type UsageStorage = "sqlite" | "jsonl";
@@ -219,6 +222,8 @@ export interface QuotaWindow {
 export interface QuotaAccount {
   provider: string;
   name: string;
+  /** The pool slot this row is about, when the provider keeps a pool. */
+  account?: string;
   kind: string;
   user?: string;
   windows: QuotaWindow[];

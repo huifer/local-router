@@ -80,7 +80,38 @@ local-router qwen login
 厂商 id 记不住？`local-router provider list` 看已配的，
 `local-router models` 看网关对外暴露的模型。
 
-### 1.4 让 agent 用上
+### 1.4 直接测试是否可以对话
+
+```sh
+# 查看某个上游是否能真正完成一次最小对话
+local-router provider test deepseek
+local-router provider test workbuddy
+local-router provider test qwenwork
+```
+
+命令会使用该 provider 的第一个模型发送 `ping`，输出耗时和上游回复。控制台也可在
+「Providers → 供应商详情 → 测试对话」执行同一检查；WorkBuddy、QwenWork、Trae CN
+会使用各自的本机登录态和专用协议。如果上游返回 429，测试会记录该 provider 的冷却
+状态，不会在冷却期间继续请求它。
+
+### 1.5 429 冷却
+
+上游返回 HTTP 429 后，网关默认让该 provider 安静 60 秒；连续 429 会指数退避，最长
+10 分钟。冷却期间该 provider 会在路由发送前被跳过，路由组有其他成员时会尝试下一个
+成员。状态可读：
+
+```sh
+curl http://127.0.0.1:3435/api/cooldowns
+```
+
+可用环境变量调整时间（秒）：
+
+```sh
+LOCAL_ROUTER_COOLDOWN_SECS=30 \
+LOCAL_ROUTER_COOLDOWN_MAX_SECS=300 \
+local-router serve
+```
+### 1.6 让 agent 用上
 
 ```sh
 # 改写 agent 自己的配置文件（推荐）
@@ -103,7 +134,7 @@ export GEMINI_API_KEY=local-router
 
 **改完要重开 agent 会话**才生效。
 
-### 1.5 验证
+### 1.7 验证
 
 ```sh
 local-router doctor        # 一眼看出哪里没配好

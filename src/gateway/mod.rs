@@ -1,6 +1,7 @@
 //! The gateway: the HTTP surface every agent talks to.
 
 pub mod client;
+pub mod cooldown;
 pub mod route;
 pub mod usage;
 
@@ -150,15 +151,19 @@ pub struct Gateway {
     media_tasks: Arc<Mutex<HashMap<String, MediaTask>>>,
     /// The SQLite store, when it is on.
     pub sqlite: Option<store::Store>,
+    /// Shared with the console so a manual test cannot bypass a 429 gate.
+    pub cooldowns: cooldown::Registry,
 }
 
 impl Gateway {
     pub fn new(state: AppState) -> Self {
+        let cooldowns = state.cooldowns.clone();
         Gateway {
             state,
             router: Arc::new(Router::new()),
             clients: Arc::new(Mutex::new(HashMap::new())),
             media_tasks: Arc::new(Mutex::new(HashMap::new())),
+            cooldowns,
             sqlite: store::Store::shared(),
         }
     }
@@ -1414,6 +1419,16 @@ async fn handle(
                 }
             }
         }
+        // A provider in its 429 cooldown is skipped without sending it
+        // anything: hammering the vendor that just said "slow down" only
+        // makes the limit last longer. The next target answers instead.
+        if g.cooldowns.provider_is_cooling(&target.provider_id).await {
+            last_error = ApiError::RateLimited(format!(
+                "the provider {} is cooling down after a 429; try again shortly",
+                target.provider_id
+            ));
+            continue;
+        }
         let started = Instant::now();
         let result = if stream {
             stream_attempt(
@@ -1447,6 +1462,10 @@ async fn handle(
         match result {
             Ok(response) => {
                 g.router.note_used(&asked).await;
+                // The provider answered: its past 429s are forgiven, so a
+                // single unlucky rate limit hours later starts at the
+                // short cooldown again.
+                g.cooldowns.clear(&target.provider_id, None).await;
                 if let Some(session) = &session {
                     g.router.note_affinity(session, &target.key_id).await;
                     note_route_trace(
@@ -1473,6 +1492,16 @@ async fn handle(
                 if record {
                     crate::pricing::price_record(&mut rec);
                     persist_usage(&g.state, &g.sqlite, &rec);
+                }
+                // A rate limit puts the provider into a global cooldown:
+                // nothing is sent its way until it is over, so an agent's
+                // retries cannot keep poking a vendor that said stop.
+                if matches!(err, ApiError::RateLimited(_)) {
+                    g.cooldowns.penalize(&target.provider_id, None).await;
+                    tracing::warn!(
+                        "{} answered 429 — cooling down before it is asked again",
+                        target.provider_id
+                    );
                 }
                 last_error = err;
                 if !last_error.retryable() {
@@ -1614,6 +1643,15 @@ async fn trae_attempt(
         Ok(pair) => pair,
         Err(err) => return error_response(&ApiError::Unauthorized(err.to_string())),
     };
+    // A vendor that answered 429 is left alone until its cooldown is over.
+    if g.cooldowns
+        .account_is_cooling("trae-cn", &account_name)
+        .await
+    {
+        return error_response(&ApiError::RateLimited(
+            "trae-cn is cooling down after a 429; try again shortly".into(),
+        ));
+    }
     let target = match plan.targets.iter().find(|t| t.provider_id == "trae-cn") {
         Some(target) => target.clone(),
         None => return error_response(&ApiError::Upstream("no Trae CN target".into())),
@@ -1634,8 +1672,15 @@ async fn trae_attempt(
     let record = g.state.config.read().await.settings.record_usage;
     let sqlite = g.sqlite.clone();
     let events = match crate::trae::chat(&session, &trae_request).await {
-        Ok(events) => events,
+        Ok(events) => {
+            g.cooldowns.clear("trae-cn", Some(&account_name)).await;
+            events
+        }
         Err(err) => {
+            let text = err.to_string();
+            if text.contains("429") || text.contains("限流") || text.contains("rate limit") {
+                g.cooldowns.penalize("trae-cn", Some(&account_name)).await;
+            }
             rec.ok = false;
             rec.error = Some(err.to_string());
             rec.latency_ms = started.elapsed().as_millis() as u64;
@@ -1687,16 +1732,25 @@ async fn qwen_attempt(
 ) -> Response {
     // Several QwenWork accounts can live side by side; the requests take
     // turns so the load is shared instead of one account taking all of it.
-    let session = match crate::qwen::login::session_rotating().await {
-        Ok((_, session)) => session,
+    let (account_name, session) = match crate::qwen::login::session_rotating().await {
+        Ok((name, session)) => (name, session),
         Err(err) => {
             // A pool of one (or none) falls back to the plain reader.
             match crate::qwen::login::session().await {
-                Ok(session) => session,
+                Ok(session) => (String::new(), session),
                 Err(_) => return error_response(&ApiError::Unauthorized(err.to_string())),
             }
         }
     };
+    // A vendor that answered 429 is left alone until its cooldown is over.
+    if g.cooldowns
+        .account_is_cooling("qwenwork", &account_name)
+        .await
+    {
+        return error_response(&ApiError::RateLimited(
+            "qwenwork is cooling down after a 429; try again shortly".into(),
+        ));
+    }
     let target = match plan.targets.iter().find(|t| t.provider_id == "qwenwork") {
         Some(t) => t.clone(),
         None => return error_response(&ApiError::Upstream("no QwenWork target".into())),
@@ -1719,8 +1773,15 @@ async fn qwen_attempt(
     let sqlite = g.sqlite.clone();
 
     let events = match crate::qwen::client::chat(&session, &body).await {
-        Ok(events) => events,
+        Ok(events) => {
+            g.cooldowns.clear("qwenwork", Some(&account_name)).await;
+            events
+        }
         Err(err) => {
+            let rate_limited = err.to_string().contains("429") || err.to_string().contains("限流");
+            if rate_limited {
+                g.cooldowns.penalize("qwenwork", Some(&account_name)).await;
+            }
             let mut rec = rec;
             rec.ok = false;
             rec.error = Some(err.to_string());
@@ -1902,7 +1963,7 @@ fn mask_value_secrets(value: &mut Value) {
 }
 
 /// Build a QwenWork chat body from the caller's normalized request.
-fn build_qwen_body(request: &ChatRequest, model: &str) -> crate::qwen::client::QwenChatBody {
+pub fn build_qwen_body(request: &ChatRequest, model: &str) -> crate::qwen::client::QwenChatBody {
     let system: Vec<String> = request
         .system
         .iter()
