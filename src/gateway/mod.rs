@@ -1376,6 +1376,17 @@ async fn handle(
         )
         .await;
     }
+    if plan.targets.iter().any(|t| t.provider_id == "trae-cn") {
+        return trae_attempt(
+            &g,
+            protocol,
+            &request,
+            &plan,
+            agent_user_agent.as_deref(),
+            &context,
+        )
+        .await;
+    }
 
     let mut last_error: ApiError = ApiError::Upstream("no target could answer".into());
     for target in plan.targets.clone() {
@@ -1589,6 +1600,77 @@ fn downstream_response(protocol: Protocol, response: &ChatResponse, model: &str)
     }
 }
 
+/// One Trae CN request: send the caller's canonical request through the
+/// Cloud-IDE SSE bridge and render it back as the caller's protocol.
+async fn trae_attempt(
+    g: &Gateway,
+    caller_protocol: Protocol,
+    request: &ChatRequest,
+    plan: &RoutePlan,
+    agent_user_agent: Option<&str>,
+    context: &usage::ContextBreakdown,
+) -> Response {
+    let (account_name, session) = match crate::trae::session_rotating().await {
+        Ok(pair) => pair,
+        Err(err) => return error_response(&ApiError::Unauthorized(err.to_string())),
+    };
+    let target = match plan.targets.iter().find(|t| t.provider_id == "trae-cn") {
+        Some(target) => target.clone(),
+        None => return error_response(&ApiError::Upstream("no Trae CN target".into())),
+    };
+    let mut trae_request = request.clone();
+    trae_request.model = target.model.clone();
+    let mut rec = usage::UsageRecord::new(&request.model, "trae-cn");
+    rec.provider = "trae-cn".to_string();
+    rec.key_id = Some(account_name.clone());
+    rec.key_label = Some(session.account.nickname.clone());
+    rec.group = plan.group_id.clone();
+    rec.session_id = request.session_id.clone();
+    rec.project = request.project.clone();
+    rec.agent = agent_user_agent.and_then(agent_from_user_agent);
+    rec.context = Some(context.clone());
+    let started = Instant::now();
+    let usage_path = g.state.usage_path();
+    let record = g.state.config.read().await.settings.record_usage;
+    let sqlite = g.sqlite.clone();
+    let events = match crate::trae::chat(&session, &trae_request).await {
+        Ok(events) => events,
+        Err(err) => {
+            rec.ok = false;
+            rec.error = Some(err.to_string());
+            rec.latency_ms = started.elapsed().as_millis() as u64;
+            if record {
+                crate::pricing::price_record(&mut rec);
+                persist_usage(&g.state, &g.sqlite, &rec);
+            }
+            return error_response(&ApiError::Upstream(err.to_string()));
+        }
+    };
+    for event in &events {
+        rec.note_usage(event);
+    }
+    if request.stream {
+        events_to_stream(
+            events,
+            caller_protocol,
+            request.model.clone(),
+            rec,
+            usage_path,
+            record,
+            started,
+            sqlite,
+        )
+    } else {
+        let parsed = ChatResponse::from_events(&events);
+        Json(downstream_response(
+            caller_protocol,
+            &parsed,
+            &request.model,
+        ))
+        .into_response()
+    }
+}
+
 /// One QwenWork (千问办公) request: build the chat body from the caller's
 /// IR, sign and send it through the local `qwen` module, and render the
 /// COSY SSE reply back as the caller's protocol.
@@ -1603,9 +1685,17 @@ async fn qwen_attempt(
     agent_user_agent: Option<&str>,
     context: &usage::ContextBreakdown,
 ) -> Response {
-    let session = match crate::qwen::login::session().await {
-        Ok(s) => s,
-        Err(e) => return error_response(&ApiError::Unauthorized(e.to_string())),
+    // Several QwenWork accounts can live side by side; the requests take
+    // turns so the load is shared instead of one account taking all of it.
+    let session = match crate::qwen::login::session_rotating().await {
+        Ok((_, session)) => session,
+        Err(err) => {
+            // A pool of one (or none) falls back to the plain reader.
+            match crate::qwen::login::session().await {
+                Ok(session) => session,
+                Err(_) => return error_response(&ApiError::Unauthorized(err.to_string())),
+            }
+        }
     };
     let target = match plan.targets.iter().find(|t| t.provider_id == "qwenwork") {
         Some(t) => t.clone(),

@@ -53,6 +53,10 @@ impl IsolatedHome {
     }
 
     /// The directory this test may write to.
+    ///
+    /// Not every test needs it today; it is the handle for a test that
+    /// wants to look inside its own config dir.
+    #[allow(dead_code)]
     pub fn path(&self) -> &std::path::Path {
         &self.dir
     }

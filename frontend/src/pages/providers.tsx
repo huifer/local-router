@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouteLoaderData } from "react-router";
-import { LogIn, Plus, Search } from "lucide-react";
+import { Copy, LogIn, Plus, Search, X } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
-import type { Provider, ProviderAccount } from "@/types";
+import type { Provider, ProviderAccount, ProviderKey } from "@/types";
 import type { Preset } from "@/types";
 import { api, getPresets } from "@/api";
 import {
@@ -389,6 +389,9 @@ function ProviderDetail({ provider, onClose, onChanged }: { provider: Provider |
                 <DetailRow label={t("providers.removeHeaders")} value={provider.remove_headers?.join(", ") || "—"} />
                 <DetailRow label={t("providers.userAgent")} value={provider.user_agent || t("providers.default")} />
               </div>
+              {!provider.auth ? (
+                <KeyList provider={provider} />
+              ) : null}
               <div className="border-t border-border p-4">
                 <div className="eyebrow mb-2">{t("providers.exposedModels")}</div>
                 <div className="flex flex-wrap gap-1.5">
@@ -418,6 +421,83 @@ function ProviderDetail({ provider, onClose, onChanged }: { provider: Provider |
 
 function DetailStat({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) {
   return <div className="border border-border bg-secondary/50 p-2.5"><div className="eyebrow">{label}</div><strong className={`mt-1.5 block font-mono text-base ${accent ? "text-primary" : ""}`}>{value}</strong></div>;
+}
+
+/**
+ * The provider's stored keys: masked by default, and revealed on demand so
+ * they can be copied. The secret is fetched when the user asks for it, so
+ * it is not in the page until then.
+ */
+function KeyList({ provider }: { provider: Provider }) {
+  const { t } = useT();
+  const [revealed, setRevealed] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const reveal = async (key: ProviderKey) => {
+    if (revealed[key.id]) {
+      setRevealed((all) => {
+        const next = { ...all };
+        delete next[key.id];
+        return next;
+      });
+      return;
+    }
+    setBusy(key.id);
+    try {
+      const response = await api<{ key: string }>(
+        `/api/providers/${encodeURIComponent(provider.id)}/keys/${encodeURIComponent(key.id)}/secret`,
+      );
+      setRevealed((all) => ({ ...all, [key.id]: response.key }));
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const copy = async (key: ProviderKey) => {
+    const value = revealed[key.id] ?? key.key;
+    try {
+      await navigator.clipboard.writeText(value);
+      toast.success(t("providers.keyCopied", { name: key.label || key.id }));
+    } catch {
+      toast.error(t("providers.keyCopyFailed"));
+    }
+  };
+
+  if (!provider.keys.length) {
+    return (
+      <div className="border-t border-border p-4">
+        <div className="eyebrow mb-2">{t("providers.keysLabel")}</div>
+        <p className="font-mono text-[10px] text-muted-foreground">{t("providers.noKeys")}</p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="border-t border-border p-4">
+      <div className="eyebrow mb-2">{t("providers.keysLabel")}</div>
+      <div className="grid gap-1.5">
+        {provider.keys.map((key) => {
+          const shown = revealed[key.id];
+          return (
+            <div key={key.id} className="flex items-center gap-2 border border-border bg-secondary/40 px-2.5 py-2">
+              <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-foreground">
+                {shown ?? key.key}
+              </span>
+              {key.label ? <Badge className="shrink-0">{key.label}</Badge> : null}
+              <Button variant="ghost" size="sm" onClick={() => reveal(key)} disabled={busy === key.id}>
+                {shown ? t("providers.keyHide") : t("providers.keyShow")}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => copy(key)}>
+                <Copy /> {t("providers.keyCopy")}
+              </Button>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function DetailRow({ label, value }: { label: string; value: string }) {
@@ -452,23 +532,40 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
 
   /** Sign in another account: the browser opens, the gateway finishes. */
   const add = async () => {
-    const name = newName.trim() || "default";
+    // An empty name lets the gateway take the first free slot, so a new
+    // sign-in never overwrites an account that is already there.
+    const name = newName.trim();
     setBusy(true);
     try {
-      const flow = await api<{ url: string }>(`/api/providers/${encodeURIComponent(provider.id)}/login`, {
-        method: "POST",
-        body: { account: name },
-      });
+      const flow = await api<{ url: string; account?: string }>(
+        `/api/providers/${encodeURIComponent(provider.id)}/login`,
+        {
+          method: "POST",
+          body: name ? { account: name } : {},
+        },
+      );
       window.open(flow.url, "_blank", "noopener");
       toast.success(t("providers.accountOpened"));
       const deadline = Date.now() + 5 * 60 * 1000;
       while (Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
-        const status = await api<{ done: boolean; account?: string }>(
+        const status = await api<{
+          done: boolean;
+          account?: string;
+          account_name?: string;
+          same_uid_elsewhere?: boolean;
+        }>(
           `/api/providers/${encodeURIComponent(provider.id)}/login/status`,
         );
         if (status.done) {
-          toast.success(t("providers.accountAdded", { name: status.account ?? name }));
+          const who = status.account_name ?? flow.account ?? name;
+          toast.success(t("providers.accountAdded", { name: who }));
+          // The browser signed in whoever was logged in there. If that is
+          // the same person as another saved account, say so — the fix is
+          // "Switch Account" on the sign-in page, not a new entry.
+          if (status.same_uid_elsewhere) {
+            toast.info(t("providers.sameUidHint"));
+          }
           setAdding(false);
           setNewName("");
           await load();
@@ -499,6 +596,22 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
     }
   };
 
+  /** Forget one saved account (its login state is dropped). */
+  const remove = async (name: string) => {
+    if (!window.confirm(t("providers.removeConfirm", { name }))) return;
+    try {
+      await api(
+        `/api/providers/${encodeURIComponent(provider.id)}/accounts/${encodeURIComponent(name)}`,
+        { method: "DELETE" },
+      );
+      toast.success(t("providers.accountRemoved", { name }));
+      await load();
+      await onChanged();
+    } catch (error) {
+      toast.error((error as Error).message);
+    }
+  };
+
   return (
     <div className="border-t border-border p-4">
       <div className="mb-2 flex items-center justify-between gap-3">
@@ -522,6 +635,9 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
           </Button>
         </div>
       )}
+      <p className="mb-2 font-mono text-[9px] text-muted-foreground/70">
+        {t("providers.addAccountHint")}
+      </p>
       {accounts.length ? (
         <div className="grid gap-1.5">
           {accounts.map((account) => (
@@ -547,6 +663,14 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
                   {t("providers.use")}
                 </Button>
               )}
+              <Button
+                variant="ghost"
+                size="sm"
+                title={t("providers.removeAccount")}
+                onClick={() => remove(account.name)}
+              >
+                <X />
+              </Button>
             </div>
           ))}
         </div>

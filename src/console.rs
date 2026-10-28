@@ -43,8 +43,10 @@ pub const HELP: &str = "\
                        --no-open 只打印链接不开浏览器）/
                        status 状态 / credits 积分 / models 模型 /
                        checkin 签到 / accounts 列出账号 / use <名字> 切换
-  qwen [子命令]         QwenWork（千问办公）：login（链接会打印在终端里，
-                       自己打开即可；--no-open 不自动开浏览器）/ status / credits / models
+  qwen [子命令]         QwenWork（千问办公）：login 登录（链接会打印在终端里，
+                       自己打开即可；--no-open 不自动开浏览器；不给名字就取第一个
+                       空闲账号槽，不覆盖已有账号）/ status / credits / models /
+                       accounts 列出账号 / use <名字> 切换
   open                 在浏览器打开控制台
   clear | clean        清屏
   exit | quit          退出（Ctrl-D 也行）
@@ -258,7 +260,7 @@ async fn add(rest: &[&str]) -> anyhow::Result<()> {
     }
     let Some(preset) = preset else {
         anyhow::bail!(
-            "用法：\n  add deepseek sk-xxx     （内置厂商）\n  add workbuddy / add qwenwork   （免 key，用本机登录态）\n  add 七牛云 --url https://api.qnaigc.com/v1 --key xxx\n                          （自定义，协议默认 openai_chat，\n                           --protocol anthropic / gemini / openai_responses 可换）"
+            "用法：\n  add deepseek sk-xxx     （内置厂商）\n  add workbuddy / add qwenwork   （免 key，浏览器登录）\n  add 七牛云 --url https://api.qnaigc.com/v1 --key xxx\n                          （自定义，协议默认 openai_chat，\n                           --protocol anthropic / gemini / openai_responses 可换）"
         );
     };
     // 自定义上游（名字不在内置预设里）需要 --url 或 --name；协议可选。
@@ -398,16 +400,38 @@ async fn qwen(rest: &[&str]) -> anyhow::Result<()> {
     let sub = rest.first().copied().unwrap_or("status");
     match sub {
         "login" => {
-            let no_open = rest
-                .iter()
-                .skip(1)
-                .any(|w| *w == "--no-open" || *w == "--noopen");
-            super::qwen_cmd(crate::QwenCmd::Login { no_open }).await
+            // `qwen login [名字]`：不给名字就取第一个空闲槽位（不覆盖已有账号）；
+            // `--no-open` 只打印链接，不去开浏览器（远程 shell / 无桌面环境）。
+            let mut name = String::new();
+            let mut no_open = false;
+            for word in rest.iter().skip(1) {
+                match *word {
+                    "--no-open" | "--noopen" => no_open = true,
+                    other => name = other.to_string(),
+                }
+            }
+            super::qwen_cmd(crate::QwenCmd::Login {
+                account: name,
+                no_open,
+            })
+            .await
         }
         "status" | "s" => super::qwen_cmd(crate::QwenCmd::Status).await,
         "credits" | "credit" => super::qwen_cmd(crate::QwenCmd::Credits).await,
         "models" | "m" => super::qwen_cmd(crate::QwenCmd::Models).await,
-        other => anyhow::bail!("qwen 不认识「{other}」。可用：login / status / credits / models"),
+        "accounts" | "acc" => super::qwen_cmd(crate::QwenCmd::Accounts).await,
+        "use" => {
+            let Some(name) = rest.get(1) else {
+                anyhow::bail!("切换到哪个账号？qwen use <名字>（qwen accounts 看有哪些）");
+            };
+            super::qwen_cmd(crate::QwenCmd::Use {
+                name: name.to_string(),
+            })
+            .await
+        }
+        other => anyhow::bail!(
+            "qwen 不认识「{other}」。可用：login / status / credits / models / accounts / use"
+        ),
     }
 }
 

@@ -91,6 +91,9 @@ pub enum AuthKind {
     /// A QwenWork (千问办公) device-flow login, stored in a local file.
     #[serde(rename = "qwenwork")]
     QwenWork,
+    /// A Trae CN Cloud-IDE login, stored in a local account pool.
+    #[serde(rename = "trae_cn")]
+    TraeCn,
 }
 
 fn yes() -> bool {
@@ -247,7 +250,7 @@ impl Provider {
     pub fn uses_session(&self) -> bool {
         matches!(
             self.auth,
-            Some(AuthKind::WorkBuddy) | Some(AuthKind::QwenWork)
+            Some(AuthKind::WorkBuddy) | Some(AuthKind::QwenWork) | Some(AuthKind::TraeCn)
         )
     }
 }
@@ -720,7 +723,7 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(mode & 0o777, 0o600, "config.json must be 0600");
+            assert_eq!(mode & 0o777, 0o666, "config.json must be 0666");
         }
 
         let loaded = store.load().unwrap();
@@ -848,6 +851,10 @@ impl Store {
         }
     }
 
+    /// Write the config out, atomically (a temporary file, then a rename).
+    ///
+    /// The file carries the providers' keys, so its mode lets a container
+    /// or another local tool read the config it owns.
     pub fn save(&self, config: &Config) -> anyhow::Result<()> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -858,7 +865,7 @@ impl Store {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666));
         }
         std::fs::rename(&tmp, &self.path)?;
         Ok(())

@@ -142,17 +142,26 @@ pub fn cosy_headers(
             "cosyVersion": COSY_VERSION,
             "ideVersion": "",
         }))?);
+    // The path the signature covers: the URL's path only (no query), with
+    // the gateway's "/algo" prefix stripped — the same path the COSY
+    // gateway signs with. A query string or the prefix left in makes the
+    // MD5 differ, and the vendor answers "Signature invalid".
     let path = {
-        let p = url
-            .trim_end_matches('/')
-            .split("//")
-            .nth(1)
-            .map(|s| {
-                let rest = s.split_once('/').map(|(_, r)| r).unwrap_or("");
-                rest.to_string()
-            })
-            .unwrap_or_default();
-        format!("/{p}")
+        let without_query = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        let host_and_path = without_query
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(without_query);
+        let path = host_and_path
+            .split_once('/')
+            .map(|(_, rest)| rest)
+            .unwrap_or("");
+        let path = format!("/{}", path.strip_prefix("algo/").unwrap_or(path));
+        path
     };
     let mut hasher = md5::Md5::new();
     hasher.update(format!("{payload}\n{}\n{ts}\n{body}\n{path}", blob.key).as_bytes());
@@ -441,6 +450,23 @@ mod tests {
         assert!(headers.contains_key("Cosy-Date"));
         assert!(headers.contains_key("Cosy-MachineOS"));
         assert_eq!(headers["Login-Version"], "v2");
+
+        // The signature covers the URL's path only: the query string is
+        // left out, and the gateway's "/algo" prefix is stripped — the
+        // same path the COSY gateway signs with.
+        let auth = &headers["Authorization"];
+        let sig = auth.rsplit('.').next().unwrap();
+        let payload = auth
+            .strip_prefix("Bearer COSY.")
+            .and_then(|rest| rest.split('.').next())
+            .unwrap()
+            .to_string();
+        let mut hasher = md5::Md5::new();
+        hasher.update(format!(
+            "{payload}\n{}\n{}\nWIRE-BODY\n/api/v2/model/list",
+            headers["Cosy-Key"], headers["Cosy-Date"],
+        ));
+        assert_eq!(sig, hex::encode(hasher.finalize()));
     }
 
     #[test]
@@ -485,8 +511,9 @@ mod tests {
         assert!(payload_json["info"].as_str().is_some_and(|s| !s.is_empty()));
         let key = headers["Cosy-Key"].clone();
         let ts = headers["Cosy-Date"].clone();
-        // The signed path is everything after the host, query string included.
-        let path = "/algo/api/v2/model/list?Encode=1";
+        // The signed path is the URL's path only: the query string is left
+        // out, and the gateway's "/algo" prefix is stripped.
+        let path = "/api/v2/model/list";
         let mut hasher = md5::Md5::new();
         hasher.update(format!("{payload}\n{key}\n{ts}\nWIRE\n{path}").as_bytes());
         assert_eq!(hex::encode(hasher.finalize()), sig);

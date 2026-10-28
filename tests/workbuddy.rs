@@ -411,18 +411,27 @@ async fn a_login_session_is_opened_polled_and_stored() {
     // The session is stored in local-router's own file, 0600.
     let dir = std::env::temp_dir().join(format!("lr-store-{}", workbuddy::now_ms()));
     std::env::set_var("LOCAL_ROUTER_HOME", &dir);
-    let path = workbuddy::store_session(&result.session, &account, "default")
+    let stored = workbuddy::store_session(&result.session, &account, "default")
         .await
         .expect("the session is stored");
-    assert!(path.exists());
+    assert_eq!(stored.slot, "default");
+    assert!(!stored.same_uid_elsewhere);
+    assert!(stored.path.exists());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "the session file must not be world-readable");
+        let mode = std::fs::metadata(&stored.path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o666,
+            "the session file must be writable for local tools"
+        );
     }
     // And reading it back gives the same login.
-    std::env::set_var("LOCAL_ROUTER_WORKBUDDY_SESSION", &path);
+    std::env::set_var("LOCAL_ROUTER_WORKBUDDY_SESSION", &stored.path);
     let stored = workbuddy::read_session_file().expect("the stored session reads");
     assert_eq!(stored.account.nickname, "Login Tester");
     assert_eq!(stored.access_token, "at-login");

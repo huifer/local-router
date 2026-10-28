@@ -424,7 +424,10 @@ pub async fn session() -> anyhow::Result<Session> {
         return Ok(current);
     }
     match refresh(&current).await {
-        Ok(fresh) => Ok(fresh),
+        Ok(fresh) => {
+            let _ = persist_refreshed(&name, &fresh);
+            Ok(fresh)
+        }
         Err(err) => {
             // A refresh that fails is not fatal while the old token still
             // works; the request itself will say so if it does not.
@@ -576,6 +579,28 @@ pub fn use_account(name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Forget one account: drop it from the pool, and switch to another one
+/// when it happened to be the account in use.
+///
+/// Only local-router's own pool file may be edited — the desktop app's
+/// login file is its own, and deleting from it would sign the app out.
+pub fn remove_account(name: &str) -> anyhow::Result<bool> {
+    if pool_path() != own_session_path() {
+        anyhow::bail!(
+            "this account lives in the WorkBuddy app's own login file, not local-router's pool; sign out in the WorkBuddy app instead"
+        );
+    }
+    let mut pool = read_pool()?;
+    if pool.accounts.remove(name).is_none() {
+        anyhow::bail!("there is no WorkBuddy account called {name}");
+    }
+    if pool.active == name {
+        pool.active = pool.accounts.keys().next().cloned().unwrap_or_default();
+    }
+    write_pool(&pool)?;
+    Ok(pool.active == name)
+}
+
 /// Write the pool back to local-router's own file.
 fn write_pool(pool: &SessionPool) -> anyhow::Result<()> {
     let path = pool_path();
@@ -587,12 +612,28 @@ fn write_pool(pool: &SessionPool) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
     }
     Ok(())
 }
 
 /// The session of one named account.
+/// Persist a refreshed token pair back to the named account slot.
+pub fn persist_refreshed(name: &str, session: &Session) -> anyhow::Result<()> {
+    let mut pool = read_pool()?;
+    let file = pool
+        .accounts
+        .get_mut(name)
+        .ok_or_else(|| anyhow::anyhow!("there is no WorkBuddy account called {name}"))?;
+    file.account = session.account.clone();
+    file.auth.access_token = session.access_token.clone();
+    file.auth.refresh_token = session.refresh_token.clone();
+    file.auth.expires_at = session.expires_at;
+    file.auth.refresh_expires_at = session.expires_at.map(|at| at + 2 * 24 * 3600 * 1000);
+    file.auth.domain = session.domain.clone();
+    write_pool(&pool)
+}
+
 pub fn session_of(name: &str) -> anyhow::Result<Session> {
     let pool = read_pool()?;
     let file = pool
@@ -617,7 +658,10 @@ pub async fn session_rotating() -> anyhow::Result<(String, Session)> {
         return Ok((name, session));
     }
     match refresh(&session).await {
-        Ok(fresh) => Ok((name, fresh)),
+        Ok(fresh) => {
+            let _ = persist_refreshed(&name, &fresh);
+            Ok((name, fresh))
+        }
         Err(err) => {
             // A failed refresh is not fatal while the old token still works.
             tracing::warn!("the WorkBuddy token could not be refreshed: {err}");
@@ -1159,15 +1203,34 @@ pub async fn login_account(session: &Session, state: &str) -> anyhow::Result<Val
     }
 }
 
+/// The outcome of storing a finished sign-in.
+#[derive(Debug, Clone)]
+pub struct StoredLogin {
+    /// The file the pool lives in.
+    pub path: PathBuf,
+    /// The slot the account landed in.
+    pub slot: String,
+    /// Another slot in the pool already holds the same uid — the browser
+    /// signed the same person in again. The account is still filed under
+    /// its own slot; the flag only says so out loud.
+    pub same_uid_elsewhere: bool,
+}
+
 /// Store a finished login in local-router's own session file, next to the
 /// config, so it survives restarts without touching WorkBuddy's own files.
 ///
-/// The file is 0600: it carries tokens.
+/// The file carries tokens; its mode lets a container or another local tool
+/// read the pool it owns.
+///
+/// Every sign-in gets its own slot, so any number of accounts can live side
+/// by side. Two sign-ins of the same person are two entries too: the
+/// browser's own sign-in page signs in whoever is logged in there, and
+/// that is the user's call, not ours.
 pub async fn store_session(
     session: &Session,
     account: &Value,
     name: &str,
-) -> anyhow::Result<PathBuf> {
+) -> anyhow::Result<StoredLogin> {
     let path = own_session_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1206,17 +1269,30 @@ pub async fn store_session(
     };
     // The pool keeps every account; the one just signed in becomes the one
     // in use — the deliberate act of signing in is also "switch to it".
+    // Every sign-in gets its own slot: that is what lets any number of
+    // accounts live side by side.
     let mut pool = read_pool().unwrap_or_default();
-    pool.active = name.to_string();
-    pool.accounts.insert(name.to_string(), file);
+    let uid = file.account.uid.trim();
+    let same_uid_elsewhere = !uid.is_empty()
+        && pool
+            .accounts
+            .iter()
+            .any(|(held, f)| held.as_str() != name && f.account.uid.trim() == uid);
+    let slot = name.to_string();
+    pool.active = slot.clone();
+    pool.accounts.insert(slot.clone(), file);
     let body = serde_json::to_string_pretty(&pool)?;
     std::fs::write(&path, body)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
     }
-    Ok(path)
+    Ok(StoredLogin {
+        path,
+        slot,
+        same_uid_elsewhere,
+    })
 }
 
 /// The daily check-in state, for a caller that has no client yet.
@@ -1827,5 +1903,30 @@ mod pool_path_tests {
                 scope: String::new(),
             },
         }
+    }
+
+    #[test]
+    fn the_pool_holds_any_number_of_accounts_side_by_side() {
+        // Three accounts, each with its own identity and token.
+        let mut accounts = std::collections::BTreeMap::new();
+        for (name, uid) in [
+            ("default", "u-1"),
+            ("workbuddy-2", "u-2"),
+            ("workbuddy-3", "u-3"),
+        ] {
+            accounts.insert(
+                name.to_string(),
+                session_file_for_test(uid, &format!("tok-{uid}")),
+            );
+        }
+        let pool = SessionPool {
+            active: "workbuddy-3".to_string(),
+            accounts,
+        };
+        assert_eq!(pool.accounts.len(), 3);
+        assert_eq!(pool.active, "workbuddy-3");
+        assert_eq!(pool.accounts["default"].account.uid, "u-1");
+        assert_eq!(pool.accounts["workbuddy-2"].auth.access_token, "tok-u-2");
+        assert_eq!(pool.accounts["workbuddy-3"].account.uid, "u-3");
     }
 }

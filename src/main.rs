@@ -134,8 +134,8 @@ enum WorkBuddyCmd {
     /// Sign in to WorkBuddy: print a link, wait for the browser, wire it up.
     Login {
         /// The name to file this account under (several accounts can live
-        /// side by side).
-        #[arg(long, default_value = "default")]
+        /// side by side). Empty picks the first free slot.
+        #[arg(long, default_value = "")]
         account: String,
         /// Only print the link; do not try to open a browser.
         #[arg(long)]
@@ -157,10 +157,18 @@ enum QwenCmd {
     Models,
     /// Sign in to QwenWork: print a link, wait for the browser, wire it up.
     Login {
+        /// The name to file this account under (several accounts can live
+        /// side by side). Empty picks the first free slot.
+        #[arg(long, default_value = "")]
+        account: String,
         /// Only print the link; do not try to open a browser.
         #[arg(long)]
         no_open: bool,
     },
+    /// List the QwenWork accounts local-router holds.
+    Accounts,
+    /// Use another account from now on.
+    Use { name: String },
 }
 
 #[derive(Args, Debug, Clone, Default)]
@@ -1108,6 +1116,16 @@ async fn workbuddy_cmd(cmd: WorkBuddyCmd) -> anyhow::Result<()> {
 /// local-router's own session file — WorkBuddy's desktop app and its login
 /// file are left untouched.
 async fn login(account_name: &str, no_open: bool) -> anyhow::Result<()> {
+    // An empty name takes the first free slot, so a second sign-in never
+    // overwrites the first account.
+    let taken: Vec<String> = workbuddy::read_pool()
+        .map(|p| p.accounts.keys().cloned().collect())
+        .unwrap_or_default();
+    let name = if account_name.trim().is_empty() {
+        first_free_slot("workbuddy", &taken)
+    } else {
+        account_name.trim().to_string()
+    };
     let session = workbuddy::start_login().await?;
     println!("local-router {}", gateway::client::VERSION);
     println!("  open this link in a browser and sign in:");
@@ -1151,12 +1169,14 @@ async fn login(account_name: &str, no_open: bool) -> anyhow::Result<()> {
         .or_else(|| account.pointer("/account/nickname"))
         .and_then(Value::as_str)
         .unwrap_or("unknown");
-    let name = account_name;
 
     // Store the session in local-router's own file, next to the config.
-    let path = workbuddy::store_session(&result.session, &account, name).await?;
-    println!("  signed in   {nickname}（账号名 {name}）");
-    println!("  session     {}", path.display());
+    let stored = workbuddy::store_session(&result.session, &account, &name).await?;
+    println!("  signed in   {nickname}（账号名 {}）", stored.slot);
+    if stored.same_uid_elsewhere {
+        println!("  note        池里已有同一个 uid 的账号（浏览器可能自动登录了旧账号）");
+    }
+    println!("  session     {}", stored.path.display());
     println!(
         "  token until {}",
         result
@@ -1268,7 +1288,31 @@ async fn qwen_cmd(cmd: QwenCmd) -> anyhow::Result<()> {
                 println!("  {m}");
             }
         }
-        QwenCmd::Login { no_open } => qwen_login(no_open).await?,
+        QwenCmd::Login { account, no_open } => qwen_login(&account, no_open).await?,
+        QwenCmd::Accounts => {
+            // No file yet is the same as "no accounts": say so instead of
+            // failing with an unreadable-file error.
+            let pool = qwen::login::read_pool().unwrap_or_default();
+            if pool.accounts.is_empty() {
+                println!("no QwenWork accounts yet; run: local-router qwen login");
+                return Ok(());
+            }
+            println!("{} QwenWork account(s):", pool.accounts.len());
+            for (name, file) in &pool.accounts {
+                let marker = if *name == pool.active { "*" } else { " " };
+                let who = if file.account.nickname.is_empty() {
+                    file.account.email.clone()
+                } else {
+                    file.account.nickname.clone()
+                };
+                println!("  {marker} {name:<12} {who}");
+            }
+            println!("  (* = the account in use)");
+        }
+        QwenCmd::Use { name } => {
+            qwen::login::use_account(&name)?;
+            println!("now using the QwenWork account {name}");
+        }
     }
     Ok(())
 }
@@ -1278,7 +1322,20 @@ async fn qwen_cmd(cmd: QwenCmd) -> anyhow::Result<()> {
 /// The device flow hands out a browser link; the browser signs in; the
 /// gateway polls until the device token arrives. The token is stored in
 /// local-router's own session file — QwenWork's own data is left untouched.
-async fn qwen_login(no_open: bool) -> anyhow::Result<()> {
+///
+/// Several accounts can live side by side: the one just signed in is filed
+/// under `account` and becomes the account in use.
+async fn qwen_login(account_name: &str, no_open: bool) -> anyhow::Result<()> {
+    // An empty name takes the first free slot, so a second sign-in never
+    // overwrites the first account.
+    let taken: Vec<String> = qwen::login::read_pool()
+        .map(|p| p.accounts.keys().cloned().collect())
+        .unwrap_or_default();
+    let name = if account_name.trim().is_empty() {
+        first_free_slot("qwenwork", &taken)
+    } else {
+        account_name.trim().to_string()
+    };
     let session = qwen::login::start_login().await?;
     println!("local-router {}", gateway::client::VERSION);
     println!("  open this link in a browser and sign in:");
@@ -1322,9 +1379,14 @@ async fn qwen_login(no_open: bool) -> anyhow::Result<()> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
 
-    let path = qwen::login::store_session(&token, &account, &session.state.machine_id).await?;
+    let stored =
+        qwen::login::store_session(&token, &account, &session.state.machine_id, &name).await?;
     println!("  signed in   {nickname}");
-    println!("  session     {}", path.display());
+    println!("  account     {}", stored.slot);
+    if stored.same_uid_elsewhere {
+        println!("  note        池里已有同一个 uid 的账号（浏览器可能自动登录了旧账号）");
+    }
+    println!("  session     {}", stored.path.display());
     println!(
         "  token until {}",
         token
@@ -1454,6 +1516,18 @@ fn log_file() -> std::path::PathBuf {
     daemon_dir().join("daemon.log")
 }
 
+/// Whether a process is still alive.
+fn process_alive(pid: u32) -> bool {
+    std::path::Path::new(&format!("/proc/{pid}")).exists()
+        || std::process::Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+}
+
 /// The pid of the running daemon, if there is one and it is alive.
 fn running_pid() -> Option<u32> {
     let pid: u32 = std::fs::read_to_string(pid_file())
@@ -1462,15 +1536,7 @@ fn running_pid() -> Option<u32> {
         .parse()
         .ok()?;
     // A pid file without a live process is a leftover: clean it up.
-    let alive = std::path::Path::new(&format!("/proc/{pid}")).exists()
-        || std::process::Command::new("kill")
-            .arg("-0")
-            .arg(pid.to_string())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-    if alive {
+    if process_alive(pid) {
         Some(pid)
     } else {
         let _ = std::fs::remove_file(pid_file());
@@ -1517,7 +1583,7 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
             // The effective address: the file first, then the environment,
             // then the command line (which is what the child will use).
             let (port, addr) = effective_address(&args);
-            start_daemon(&args)?;
+            let child_pid = start_daemon(&args)?;
             if wait {
                 // Wait until the port answers, or say what went wrong.
                 let gateway = format!("http://{addr}:{port}/health");
@@ -1538,6 +1604,14 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
+            }
+            // The child may have died right away — the port was taken, for
+            // example. Saying "started" then would be a lie.
+            if !process_alive(child_pid) {
+                anyhow::bail!(
+                    "the daemon did not stay up (the port may be in use); see {}",
+                    log_file().display()
+                );
             }
             println!("daemon started  gateway + console http://{}:{}", addr, port);
             println!("logs: {}", log_file().display());
@@ -1574,7 +1648,12 @@ async fn daemon_cmd(cmd: DaemonCmd) -> anyhow::Result<()> {
             let _ = std::fs::create_dir_all(daemon_dir());
             let _ = std::fs::write(pid_file(), std::process::id().to_string());
             let result = serve(ServeArgs::default()).await;
-            let _ = std::fs::remove_file(pid_file());
+            // Only clear the pid file when it is still ours: a daemon that
+            // starts later may have taken the file over already, and
+            // deleting it then would leave that one unreachable.
+            if running_pid() == Some(std::process::id()) {
+                let _ = std::fs::remove_file(pid_file());
+            }
             result
         }
         DaemonCmd::Install => {
@@ -1656,7 +1735,7 @@ fn effective_address(args: &DaemonStart) -> (u16, String) {
     (port, addr)
 }
 
-fn start_daemon(args: &DaemonStart) -> anyhow::Result<()> {
+fn start_daemon(args: &DaemonStart) -> anyhow::Result<u32> {
     std::fs::create_dir_all(daemon_dir())?;
     let exe = std::env::current_exe()?;
     let log = std::fs::OpenOptions::new()
@@ -1682,9 +1761,14 @@ fn start_daemon(args: &DaemonStart) -> anyhow::Result<()> {
         command.arg("--lan");
     }
     let child = command.spawn().context("the daemon could not be spawned")?;
-    std::fs::write(pid_file(), child.id().to_string())?;
+    // Another daemon may already own the port — launchd's `daemon run`
+    // does, and it wrote its own pid. Do not take the pid file away from
+    // a live daemon: the new child would only fail on the port anyway.
+    if running_pid().is_none() {
+        std::fs::write(pid_file(), child.id().to_string())?;
+    }
     save_start_args(args)?;
-    Ok(())
+    Ok(child.id())
 }
 
 /// The price table in effect, and how to teach the gateway a new one.
@@ -1733,6 +1817,23 @@ fn format_time(millis: i64) -> String {
     chrono::DateTime::from_timestamp_millis(millis)
         .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The first free slot name for a new account: `default`, then
+/// `{provider}-2`, `{provider}-3`, … so a second sign-in never overwrites
+/// the first account.
+fn first_free_slot(provider_id: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|n| n == "default") {
+        return "default".to_string();
+    }
+    let mut index = 2;
+    loop {
+        let candidate = format!("{provider_id}-{index}");
+        if !taken.iter().any(|n| n == &candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
 }
 
 // ---------------------------------------------------------------- groups --

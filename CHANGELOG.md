@@ -4,6 +4,67 @@
 格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本遵循 [Semantic Versioning](https://semver.org/lang/zh-CN/)。
 
+## [Unreleased]
+
+### Added
+
+- **Trae CN（Cloud-IDE）接入**：新增 `src/trae.rs` 模块与内置预设 `trae-cn`。
+  Trae 不是普通的 OpenAI 兼容上游——它要 `Cloud-IDE-JWT` 鉴权头、发自己的
+  SSE 事件词汇，所以走网关里的专用通道（`Protocol::TraeCn` 的 provider 不进
+  通用 HTTP 管道）：
+  - 会话存成本地账号池 `trae-session.json`（多账号 + `active`），
+    access token 临期自动用 refresh token 换新并回写磁盘；
+  - 账号池支持列出、切换（`use_account`）、删除，网关发请求时按账号轮转，
+    分摊额度；
+  - 当前只支持**导入的会话**（从 Magpie 迁移过来的 Cloud-IDE 登录态），
+    浏览器登录尚未接通（控制台会明确说明这一点）。
+- **会话型 provider 的多账户池**（WorkBuddy / QwenWork / Trae CN 统一一套模型）：
+  - **槽位在「登录开始」时选、在「登录完成」时落盘**：不给账号名就取第一个
+    空闲槽（`default` → `{provider}-2` → `{provider}-3`），所以第二次登录
+    不再覆盖第一个；还在途的登录也算占位，两次并发登录不会抢同一个槽；
+  - **同 uid 不合并**：每次登录都存成独立槽位（浏览器登录的是谁由用户决定），
+    若这次的 uid 和池里已有的某个相同，界面会提示「池里已有同一个 uid 的
+    账号」（厂商登录页上点「切换账号」即可换人，不用先退出浏览器）；
+  - **网关轮转**：请求按原子游标轮流用不同账号，多个账号分摊而不是一个吃满；
+  - **账号管理**：控制台抽屉里可切换（`POST /api/providers/{id}/accounts/active`）
+    与删除（`DELETE /api/providers/{id}/accounts/{name}`），删掉正在用的账号会
+    自动切到剩下的第一个；WorkBuddy 桌面端自己的登录文件不允许删（避免把
+    客户端登出）；
+  - **CLI**：`qwen accounts` 列出、`qwen use <名字>` 切换、`qwen login [名字]`
+    登录到指定槽位（不给名字即取第一个空闲槽）。
+- **控制台可看完整密钥**：provider 详情抽屉里列出该 provider 的所有 key，
+  默认打码，点「显示」才去后端取原文并可复制。新接口
+  `GET /api/providers/{id}/keys/{key_id}/secret` **只允许本机访问**——绑定在
+  非回环地址时，即使带着网关 key 也一律 403（网关 key 是用来调模型的，不是
+  用来读供应商密钥的）。
+- **`scripts/import_magpie_keys.py`**：magpie 磁盘上的密钥是不可逆的
+  `{{API_KEY_xxx}}` 占位符，真实值只在运行中的 magpie 进程内存里。脚本先让
+  magpie 把网页开在本机（Settings → 网页 →「此电脑」），再逐个问真实密钥并
+  写进 local-router 同名 provider 的 keys。
+
+### Fixed
+
+- **QwenWork 签名路径修正**（`code 101 Signature invalid` 的根因）：COSY 签名
+  覆盖的是 URL 的**路径部分**，此前把 query string（`?FetchKeys=…&Encode=1`）
+  一起算进去了，并且多留了一层 `/algo` 前缀——两处都会让 MD5 对不上。修完
+  有自检测试钉住签名。
+- **WorkBuddy / QwenWork 续期后的 token 回写磁盘**：以前刷新出来的新 token
+  只在内存里用，进程一退就丢，池里的文件还写着过期的那一份。
+- **daemon 不再谎报启动成功**：`daemon start` 现在检查子进程是否真的活着，
+  起不来（端口被占之类）直接报错并指向日志；`daemon run` 只在 pid 文件仍然
+  属于自己时才删它，不会把后来启动的 daemon 的 pid 文件带走。
+
+### Changed
+
+- **配置文件与会话文件的权限放宽到 0666**：`config.json` 与
+  `workbuddy-session.json` / `qwen-session.json` / `trae-session.json`
+  之前是 0600。它们装的是供应商密钥与登录 token，但容器（uid 10001）与
+  其它本地工具经常需要读写同一个目录（例如把 `~/.config/local-router`
+  直接挂进容器），0600 会让容器读不了也写不了。现在这些文件对本机其他
+  进程可读写——**注意：同一台机器上的其它用户也能读到这些密钥**。
+- **预设文案**：`WorkBuddy` / `QwenWork` 的名字去掉「用本机登录态」后缀
+  （现在是浏览器登录），提示文案改为「(无需 key，使用浏览器登录)」。
+
 ## [0.1.1] - 2026-10-27
 
 ### Added

@@ -285,8 +285,8 @@ local-router daemon uninstall   # 卸掉
 ### 2.7 WorkBuddy：登录与多账号
 
 ```sh
-local-router workbuddy login                # 浏览器登录（默认账号名 default）
-local-router workbuddy login --account work # 登录第二个账号
+local-router workbuddy login                # 浏览器登录（不给名字就取第一个空闲账号槽）
+local-router workbuddy login --account work # 登录到指定账号槽
 local-router workbuddy login --no-open      # 只打印链接，不自动开浏览器
 local-router workbuddy accounts              # 列出所有账号与当前使用的
 local-router workbuddy use work             # 切换到某个账号
@@ -295,14 +295,39 @@ local-router workbuddy status|credits|models|checkin
 
 **登录链接总是打在终端里**——复制到任何浏览器打开即可（远程 shell、
 无桌面环境、SSH 登录都适用）；`--no-open` 表示不自动唤起本机浏览器。
-千问办公同理：`local-router qwen login [--no-open]`。
+千问办公同理：
 
-多个账号可以并存（存在 `~/.config/local-router/workbuddy-session.json`），
-网关让请求在它们之间**轮流走**，分摊额度；`use` 指定优先用哪个。
+```sh
+local-router qwen login                  # 浏览器登录（不给名字就取第一个空闲账号槽）
+local-router qwen login --account work   # 登录到指定账号槽
+local-router qwen login --no-open        # 只打印链接，不自动开浏览器
+local-router qwen accounts               # 列出所有千问办公账号与当前使用的
+local-router qwen use <名字>              # 切换到某个账号
+```
+
+多个账号可以并存（WorkBuddy 存 `~/.config/local-router/workbuddy-session.json`，
+千问办公存 `qwen-session.json`），网关让请求在它们之间**轮流走**，分摊额度；
+`use` 指定优先用哪个。
+
+> **账号槽**：不给账号名时，网关取第一个空闲槽（`default` → `workbuddy-2`
+> → `workbuddy-3`），所以登录第二次不会覆盖第一个账号；删账号用控制台
+> provider 抽屉里的 ✕，或 `workbuddy accounts` / `qwen accounts` 看清有哪些。
+>
+> **登录页上换人**：厂商的登录页（WorkBuddy / 千问办公）浏览器已经登录时会
+> 直接用那个身份；要换成另一个人，在登录页点「切换账号」即可，**不用先
+> 退出浏览器**。
 
 > 本机装了 WorkBuddy 桌面版时，它自己的登录文件也能直接用——但新版本把
 > token 加密存了，local-router 读不出来，所以请用上面的 `workbuddy login`
 > （浏览器登录一次即可，之后自动续期）。
+
+### 2.7.1 Trae CN
+
+Trae CN 是 Cloud-IDE 协议（`Cloud-IDE-JWT` 鉴权），不是普通 OpenAI 兼容
+上游，local-router 为它走专用通道。当前**只支持导入的会话**（从 Magpie
+迁移过来的 Cloud-IDE 登录态，存 `trae-session.json`），浏览器登录尚未
+接通——控制台点登录会明确告诉你这一点。导入后的账号同样可以列出、切换、
+删除，网关按账号轮转分摊额度。
 
 ### 2.8 观察网关内部
 

@@ -51,6 +51,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/providers/{id}/keys", post(api_add_key))
         .route("/api/providers/{id}/keys/{key_id}", delete(api_delete_key))
+        .route(
+            "/api/providers/{id}/keys/{key_id}/secret",
+            get(api_provider_key_secret),
+        )
         .route("/api/providers/{id}/models", post(api_set_models))
         .route("/api/providers/{id}/refresh", post(api_refresh_models))
         .route("/api/providers/{id}/test", post(api_test_provider))
@@ -64,6 +68,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/providers/{id}/accounts/active",
             post(api_provider_account_active),
+        )
+        .route(
+            "/api/providers/{id}/accounts/{name}",
+            delete(api_provider_account_remove),
         )
         .route("/api/providers/{id}/oauth", get(api_oauth_status))
         // The vendor redirects the browser here after the user signed in.
@@ -282,6 +290,7 @@ async fn api_presets() -> Json<Value> {
                     "session_login": match p.auth {
                         Some(crate::config::AuthKind::WorkBuddy) => Some("workbuddy"),
                         Some(crate::config::AuthKind::QwenWork) => Some("qwenwork"),
+                        Some(crate::config::AuthKind::TraeCn) => Some("trae_cn"),
                         _ => None,
                     },
                 })).collect::<Vec<_>>(),
@@ -313,6 +322,43 @@ fn mask(key: &str) -> String {
     } else {
         format!("{}…{}", &key[..4], &key[key.len() - 4..])
     }
+}
+
+/// The full secret of one stored key, for the console to show and copy.
+///
+/// Only the machine the console runs on may read it: the loopback rule is
+/// the same one the guard uses for the rest of the API. A remote caller
+/// holds a gateway key, which is for calling models, not for reading the
+/// providers' secrets.
+async fn api_provider_key_secret(
+    State(state): State<AppState>,
+    Path((id, key_id)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if !listens_locally(&state).await {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(json!({"error":"the key can only be read from the machine the console runs on"})),
+        ));
+    }
+    let provider = {
+        let config = state.config.read().await;
+        config.provider(&id).cloned()
+    };
+    let Some(provider) = provider else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "there is no provider with that id"})),
+        ));
+    };
+    let Some(key) = provider.keys.iter().find(|k| k.id == key_id) else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "there is no such key"})),
+        ));
+    };
+    Ok(Json(
+        json!({"id": key.id, "key": key.key, "label": key.label}),
+    ))
 }
 
 async fn api_providers(State(state): State<AppState>) -> Json<Value> {
@@ -361,6 +407,16 @@ async fn session_identity(provider: &Provider) -> Option<Value> {
             let session = crate::qwen::login::read_session_file().ok()?;
             Some(
                 json!({"nickname": session.account.nickname, "uid": session.account.uid, "email": session.account.email}),
+            )
+        }
+        Some(crate::config::AuthKind::TraeCn) => {
+            let pool = crate::trae::read_pool().ok()?;
+            let file = pool
+                .accounts
+                .get(&pool.active)
+                .or_else(|| pool.accounts.values().next())?;
+            Some(
+                json!({"nickname": file.account.nickname, "uid": file.account.uid, "type": file.account.account_type}),
             )
         }
         _ => None,
@@ -725,8 +781,8 @@ async fn api_refresh_models(
             Json(json!({"error": "there is no provider with that id"})),
         ));
     };
-    // A session-backed provider lists its models from its own account.
-    if provider.uses_session() {
+    // A session-backed provider lists models from its own account API.
+    if provider.auth == Some(crate::config::AuthKind::WorkBuddy) {
         let models = crate::workbuddy::models().await.map_err(|e| {
             (
                 StatusCode::BAD_GATEWAY,
@@ -737,6 +793,27 @@ async fn api_refresh_models(
         ids.sort();
         ids.dedup();
         return Ok(Json(json!({"models": ids})));
+    }
+    if provider.auth == Some(crate::config::AuthKind::QwenWork) {
+        let session = crate::qwen::login::session().await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        let mut ids = crate::qwen::client::models(&session).await.map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?;
+        ids.sort();
+        ids.dedup();
+        return Ok(Json(json!({"models": ids})));
+    }
+    if provider.auth == Some(crate::config::AuthKind::TraeCn) {
+        let models = provider.models.clone();
+        return Ok(Json(json!({"models": models})));
     }
     let base = provider.base_url.clone().ok_or_else(|| {
         (
@@ -953,22 +1030,46 @@ async fn api_provider_accounts(
             Ok(Json(json!({"accounts": accounts, "active": pool.active})))
         }
         "qwenwork" => {
-            let accounts = crate::qwen::login::read_session_file()
-                .ok()
-                .map(|s| {
-                    vec![json!({
-                        "name": "default", "nickname": s.account.nickname, "uid": s.account.uid,
-                        "email": s.account.email, "active": true, "expires_at": s.expires_at,
-                    })]
+            let pool = crate::qwen::login::read_pool().unwrap_or_default();
+            let accounts: Vec<Value> = pool
+                .accounts
+                .iter()
+                .map(|(name, file)| {
+                    json!({
+                        "name": name,
+                        "nickname": file.account.nickname,
+                        "uid": file.account.uid,
+                        "email": file.account.email,
+                        "active": *name == pool.active,
+                        "expires_at": file.auth.expires_at,
+                    })
                 })
-                .unwrap_or_default();
-            Ok(Json(json!({"accounts": accounts, "active": "default"})))
+                .collect();
+            Ok(Json(json!({"accounts": accounts, "active": pool.active})))
+        }
+        "trae-cn" => {
+            let pool = crate::trae::read_pool().unwrap_or_default();
+            let accounts: Vec<Value> = pool
+                .accounts
+                .iter()
+                .map(|(name, file)| {
+                    json!({
+                        "name": name,
+                        "nickname": file.account.nickname,
+                        "uid": file.account.uid,
+                        "type": file.account.account_type,
+                        "active": *name == pool.active,
+                        "expires_at": file.auth.expires_at,
+                    })
+                })
+                .collect();
+            Ok(Json(json!({"accounts": accounts, "active": pool.active})))
         }
         _ => Ok(Json(json!({"accounts": [], "active": ""}))),
     }
 }
 
-/// Switch the active account in a WorkBuddy account pool.
+/// Switch the active account in a session-backed provider's account pool.
 async fn api_provider_account_active(
     State(_state): State<AppState>,
     Path(id): Path<String>,
@@ -984,13 +1085,18 @@ async fn api_provider_account_active(
                 Json(json!({"error":"name is required"})),
             )
         })?;
-    if id != "workbuddy" {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error":"this provider has one account"})),
-        ));
-    }
-    crate::workbuddy::use_account(&name).map_err(|e| {
+    let result = match id.as_str() {
+        "workbuddy" => crate::workbuddy::use_account(&name),
+        "qwenwork" => crate::qwen::login::use_account(&name),
+        "trae-cn" => crate::trae::use_account(&name),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"this provider has one account"})),
+            ))
+        }
+    };
+    result.map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(json!({"error":e.to_string()})),
@@ -999,11 +1105,83 @@ async fn api_provider_account_active(
     Ok(Json(json!({"ok": true, "active": name})))
 }
 
+/// Forget one saved account of a session-backed provider.
+async fn api_provider_account_remove(
+    State(_state): State<AppState>,
+    Path((id, name)): Path<(String, String)>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let result = match id.as_str() {
+        "workbuddy" => crate::workbuddy::remove_account(&name),
+        "qwenwork" => crate::qwen::login::remove_account(&name),
+        "trae-cn" => crate::trae::remove_account(&name),
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error":"this provider has one account"})),
+            ))
+        }
+    };
+    let was_active = result.map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error":e.to_string()})),
+        )
+    })?;
+    Ok(Json(
+        json!({"ok": true, "removed": name, "was_active": was_active}),
+    ))
+}
+
+/// The pool slot a new sign-in should fill when the caller did not name
+/// one: the first free name, so a second sign-in never overwrites the
+/// first account.
+///
+/// `default` first, then `workbuddy-2`, `workbuddy-3`, … (the provider id
+/// keeps the names apart when several vendors share one console).
+fn free_slot_name(provider_id: &str, taken: &[String]) -> String {
+    if !taken.iter().any(|n| n == "default") {
+        return "default".to_string();
+    }
+    let mut index = 2;
+    loop {
+        let candidate = format!("{provider_id}-{index}");
+        if !taken.iter().any(|n| n == &candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+/// The accounts a session-backed provider already holds, by name.
+///
+/// A sign-in that is still in flight counts as taken: it has already
+/// claimed a slot, and it only lands in the pool when it finishes.
+fn taken_slot_names(provider_id: &str) -> Vec<String> {
+    let mut names: Vec<String> = match provider_id {
+        "workbuddy" => crate::workbuddy::read_pool()
+            .map(|p| p.accounts.keys().cloned().collect())
+            .unwrap_or_default(),
+        "qwenwork" => crate::qwen::login::read_pool()
+            .map(|p| p.accounts.keys().cloned().collect())
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    let pending = crate::session_logins::peek_all(provider_id);
+    for one in pending {
+        let name = one.slot().to_string();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
 /// Start a browser sign-in for a vendor that keeps its own session
 /// (WorkBuddy, QwenWork): no key, no OAuth — the vendor's own login page.
 ///
 /// The console opens the returned URL and polls the status endpoint; the
-/// session lands in local-router's own 0600 file when the sign-in lands.
+/// session lands in local-router's own file next to the config when the
+/// sign-in lands.
 async fn api_session_login_start(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1018,7 +1196,13 @@ async fn api_session_login_start(
                 .map(|s| s.to_string())
         })
         .filter(|s| !s.trim().is_empty());
-    let account_name = wanted.unwrap_or_else(|| "default".to_string());
+    // The pool slot this sign-in fills. When the caller does not name one,
+    // the first free slot is taken — so signing in twice keeps both
+    // accounts instead of the second overwriting the first.
+    let account_name = match wanted {
+        Some(name) => name,
+        None => free_slot_name(&id, &taken_slot_names(&id)),
+    };
     // The provider may not exist yet: the console offers the sign-in on the
     // preset, before anything is configured. Create it on sight — a
     // session-backed vendor needs no key, so an empty provider is complete.
@@ -1057,15 +1241,25 @@ async fn api_session_login_start(
                 "account": account_name,
             })))
         }
+        Some(crate::config::AuthKind::TraeCn) => Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error":"Trae CN imported sessions are supported; browser sign-in is not yet wired"}),
+            ),
+        )),
         Some(crate::config::AuthKind::QwenWork) => {
             let session = crate::qwen::login::start_login().await.map_err(oauth_err)?;
             crate::session_logins::remember(
                 &id,
                 crate::session_logins::Pending::QwenWork {
                     state: session.state.clone(),
+                    account: account_name.clone(),
                 },
             );
-            Ok(Json(json!({"url": session.auth_url})))
+            Ok(Json(json!({
+                "url": session.auth_url,
+                "account": account_name,
+            })))
         }
         _ => Err((
             StatusCode::BAD_REQUEST,
@@ -1075,85 +1269,116 @@ async fn api_session_login_start(
 }
 
 /// Whether the browser sign-in finished, and what it produced.
+///
+/// Several sign-ins can be in flight for one provider (each claims its own
+/// slot in the account pool). Every one of them is polled, and the first
+/// that lands is reported; the others stay in flight for the next poll.
 async fn api_session_login_status(
     State(app_state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let pending = crate::session_logins::take_or_peek(&id);
-    let Some(pending) = pending else {
+    let pending = crate::session_logins::peek_all(&id);
+    if pending.is_empty() {
         // Nothing in flight: the session file tells us whether it worked.
         let signed_in = match crate::config::AuthKind::WorkBuddy {
             crate::config::AuthKind::WorkBuddy => crate::workbuddy::read_session_file().is_ok(),
             crate::config::AuthKind::QwenWork => crate::qwen::login::read_session_file().is_ok(),
+            crate::config::AuthKind::TraeCn => crate::trae::read_pool().is_ok(),
             crate::config::AuthKind::Stored => false,
         };
         return Ok(Json(json!({"done": signed_in, "waiting": false})));
-    };
-    match pending {
-        crate::session_logins::Pending::WorkBuddy { state, account } => {
-            match crate::workbuddy::poll_login(&state).await {
-                Ok(crate::workbuddy::LoginPoll::Waiting) => {
-                    Ok(Json(json!({"done": false, "waiting": true})))
+    }
+    for one in pending {
+        match one {
+            crate::session_logins::Pending::WorkBuddy { state, account } => {
+                match crate::workbuddy::poll_login(&state).await {
+                    Ok(crate::workbuddy::LoginPoll::Waiting) => continue,
+                    Ok(crate::workbuddy::LoginPoll::Ready(result)) => {
+                        let nickname = result
+                            .account
+                            .get("nickname")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let stored = crate::workbuddy::store_session(
+                            &result.session,
+                            &result.account,
+                            &account,
+                        )
+                        .await
+                        .unwrap_or_else(|_| {
+                            crate::workbuddy::StoredLogin {
+                                path: crate::workbuddy::own_session_path(),
+                                slot: account.clone(),
+                                same_uid_elsewhere: false,
+                            }
+                        });
+                        crate::session_logins::forget_slot(&id, &account);
+                        // Signing in is only the first step: wire the provider,
+                        // pull the model list, claim the day's check-in. The user
+                        // asked to sign in, not to run four more commands.
+                        let setup = complete_workbuddy_signin(&app_state).await;
+                        return Ok(Json(json!({
+                            "done": true,
+                            "waiting": false,
+                            "account": nickname,
+                            "account_name": stored.slot,
+                            "same_uid_elsewhere": stored.same_uid_elsewhere,
+                            "setup": setup,
+                        })));
+                    }
+                    Err(err) => {
+                        crate::session_logins::forget_slot(&id, &account);
+                        return Err(oauth_err(err));
+                    }
                 }
-                Ok(crate::workbuddy::LoginPoll::Ready(result)) => {
-                    let nickname = result
-                        .account
-                        .get("nickname")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let _ =
-                        crate::workbuddy::store_session(&result.session, &result.account, &account)
-                            .await;
-                    crate::session_logins::forget(&id);
-                    // Signing in is only the first step: wire the provider,
-                    // pull the model list, claim the day's check-in. The user
-                    // asked to sign in, not to run four more commands.
-                    let setup = complete_workbuddy_signin(&app_state).await;
-                    Ok(Json(json!({
-                        "done": true,
-                        "waiting": false,
-                        "account": nickname,
-                        "account_name": account,
-                        "setup": setup,
-                    })))
-                }
-                Err(err) => Err(oauth_err(err)),
             }
-        }
-        crate::session_logins::Pending::QwenWork { state: login_state } => {
-            match crate::qwen::login::poll_login(&login_state).await {
-                Ok(crate::qwen::login::LoginPoll::Waiting) => {
-                    Ok(Json(json!({"done": false, "waiting": true})))
-                }
+            crate::session_logins::Pending::QwenWork {
+                state: login_state,
+                account,
+            } => match crate::qwen::login::poll_login(&login_state).await {
+                Ok(crate::qwen::login::LoginPoll::Waiting) => continue,
                 Ok(crate::qwen::login::LoginPoll::Ready(token)) => {
-                    let account = crate::qwen::login::login_account(&login_state, &token)
+                    let account_info = crate::qwen::login::login_account(&login_state, &token)
                         .await
                         .unwrap_or(serde_json::Value::Null);
-                    let nickname = account
+                    let nickname = account_info
                         .get("nickname")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
-                    let _ = crate::qwen::login::store_session(
+                    let stored = crate::qwen::login::store_session(
                         &token,
-                        &account,
+                        &account_info,
                         &login_state.machine_id,
+                        &account,
                     )
-                    .await;
-                    crate::session_logins::forget(&id);
+                    .await
+                    .unwrap_or_else(|_| crate::qwen::login::StoredLogin {
+                        path: crate::qwen::login::own_session_path(),
+                        slot: account.clone(),
+                        same_uid_elsewhere: false,
+                    });
+                    crate::session_logins::forget_slot(&id, &account);
                     let setup = complete_qwenwork_signin(&app_state).await;
-                    Ok(Json(json!({
+                    return Ok(Json(json!({
                         "done": true,
                         "waiting": false,
                         "account": nickname,
+                        "account_name": stored.slot,
+                        "same_uid_elsewhere": stored.same_uid_elsewhere,
                         "setup": setup,
-                    })))
+                    })));
                 }
-                Err(err) => Err(oauth_err(err)),
-            }
+                Err(err) => {
+                    crate::session_logins::forget_slot(&id, &account);
+                    return Err(oauth_err(err));
+                }
+            },
         }
     }
+    // None of them has landed yet.
+    Ok(Json(json!({"done": false, "waiting": true})))
 }
 
 /// Everything that follows a WorkBuddy sign-in: the provider exists, the
@@ -1510,9 +1735,19 @@ async fn api_test_provider(
             Json(json!({"error": "the provider exposes no model"})),
         ));
     };
-    // A session-backed provider has no stored key: the session is read
-    // when the request goes out.
-    let headers = if provider.uses_session() {
+    // The generic provider smoke test only applies to WorkBuddy's generic
+    // OpenAI upstream; QwenWork and Trae have dedicated request protocols.
+    if provider.auth == Some(crate::config::AuthKind::QwenWork)
+        || provider.auth == Some(crate::config::AuthKind::TraeCn)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"error":"this session provider uses a dedicated protocol and cannot use the generic test"}),
+            ),
+        ));
+    }
+    let headers = if provider.auth == Some(crate::config::AuthKind::WorkBuddy) {
         let session = crate::workbuddy::session().await.map_err(|e| {
             (
                 StatusCode::UNAUTHORIZED,
@@ -2490,6 +2725,74 @@ mod tests {
     fn a_missing_host_header_refuses_everything() {
         let headers = HeaderMap::new();
         assert!(!same_origin("http://127.0.0.1:3426", &headers));
+    }
+
+    #[test]
+    fn a_new_sign_in_takes_the_first_free_slot() {
+        // Nothing taken yet: the first slot is "default".
+        assert_eq!(free_slot_name("workbuddy", &[]), "default");
+        // "default" is taken: the next free name is used, so the first
+        // account is never overwritten.
+        assert_eq!(
+            free_slot_name("workbuddy", &["default".to_string()]),
+            "workbuddy-2"
+        );
+        assert_eq!(
+            free_slot_name(
+                "workbuddy",
+                &["default".to_string(), "workbuddy-2".to_string()]
+            ),
+            "workbuddy-3"
+        );
+        // A gap is filled before a new number is handed out.
+        assert_eq!(
+            free_slot_name(
+                "workbuddy",
+                &["default".to_string(), "workbuddy-3".to_string()]
+            ),
+            "workbuddy-2"
+        );
+        // Each vendor keeps its own names apart.
+        assert_eq!(
+            free_slot_name("qwenwork", &["default".to_string()]),
+            "qwenwork-2"
+        );
+    }
+
+    #[test]
+    fn the_pool_holds_more_than_two_accounts() {
+        // Three accounts side by side: the pool is a map, not a pair.
+        let mut accounts = std::collections::BTreeMap::new();
+        for name in ["default", "second", "third"] {
+            accounts.insert(
+                name.to_string(),
+                crate::workbuddy::SessionFile {
+                    account: crate::workbuddy::Account {
+                        uid: format!("uid-{name}"),
+                        nickname: name.to_string(),
+                        account_type: "personal".to_string(),
+                        last_login: true,
+                    },
+                    auth: crate::workbuddy::Auth {
+                        access_token: format!("token-{name}"),
+                        refresh_token: format!("refresh-{name}"),
+                        token_type: "Bearer".to_string(),
+                        expires_at: Some(9_000_000_000_000),
+                        refresh_expires_at: None,
+                        domain: "www.codebuddy.cn".to_string(),
+                        scope: String::new(),
+                    },
+                },
+            );
+        }
+        let pool = crate::workbuddy::SessionPool {
+            active: "third".to_string(),
+            accounts,
+        };
+        assert_eq!(pool.accounts.len(), 3);
+        assert_eq!(pool.active, "third");
+        assert_eq!(pool.accounts["second"].account.nickname, "second");
+        assert_eq!(pool.accounts["third"].auth.access_token, "token-third");
     }
 }
 

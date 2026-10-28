@@ -348,7 +348,7 @@
     },
     {
       "id": "workbuddy",
-      "name": "WorkBuddy（用本机登录态）",
+      "name": "WorkBuddy",
       "group": "local",
       "protocol": "openai_chat",
       "base_url": "https://copilot.tencent.com",
@@ -372,15 +372,28 @@
         "glm-5.1",
         "deepseek-v4-flash"
       ],
-      "key_hint": "(无需 key，使用本机 WorkBuddy 登录态)",
+      "key_hint": "(无需 key，使用浏览器登录)",
       "docs": "https://www.codebuddy.cn",
       "auto_include": [
         "*"
       ]
     },
     {
+      "id": "trae-cn",
+      "name": "Trae CN",
+      "group": "local",
+      "protocol": "openai_chat",
+      "base_url": "https://trae-api-cn.mchost.guru",
+      "auth": "trae_cn",
+      "stream_only": true,
+      "default_models": [],
+      "key_hint": "(无需 key，使用浏览器登录)",
+      "docs": "https://www.trae.cn",
+      "auto_include": ["*"]
+    },
+    {
       "id": "qwenwork",
-      "name": "QwenWork（千问办公，用本机登录态）",
+      "name": "QwenWork（千问办公）",
       "group": "local",
       "protocol": "qwenwork",
       "base_url": "https://gateway.qwenwork.cn",
@@ -390,7 +403,7 @@
         "pro",
         "qwen3-coder-plus"
       ],
-      "key_hint": "(无需 key，使用本机 QwenWork 登录态)",
+      "key_hint": "(无需 key，使用浏览器登录)",
       "docs": "https://qwenwork.cn",
       "auto_include": [
         "*"

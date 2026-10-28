@@ -16,5 +16,6 @@ pub mod sessions;
 pub mod store;
 #[cfg(test)]
 pub(crate) mod testenv;
+pub mod trae;
 pub mod web;
 pub mod workbuddy;

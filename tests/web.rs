@@ -2,13 +2,17 @@
 //!
 //! Loopback stays key-less; any other bind needs a key on `/api`; writes
 //! from a mismatched Origin are refused wherever the page is served from.
+//!
+//! The env-locking test holds one std::sync::Mutex across awaits on
+//! purpose: the whole test body must own the process-level env vars.
+#![allow(clippy::await_holding_lock)]
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use tower::ServiceExt;
 
-use local_router::config::{AppState, Config, Settings, Store};
+use local_router::config::{AppState, Config, ProviderKey, Settings, Store};
 
 /// One more unique number per test, so concurrent stores never share a file.
 static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -72,6 +76,75 @@ async fn the_console_is_open_on_loopback() {
     let state = state_at("127.0.0.1").await;
     let (status, _) = get(state, "/api/status").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// A stored key is readable on the machine the console runs on, so it can be
+/// shown and copied — but never from another machine, even with the
+/// gateway's own key.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stored_key_is_readable_on_loopback_only() {
+    let state = state_at("127.0.0.1").await;
+    let mut provider = local_router::config::Provider {
+        id: "testkey".to_string(),
+        name: "Test".to_string(),
+        ..Default::default()
+    };
+    provider.keys = vec![ProviderKey {
+        id: "k1".to_string(),
+        key: "sk-secret-value-123456".to_string(),
+        enabled: true,
+        label: Some("primary".to_string()),
+    }];
+    let _ = state
+        .update(|config| {
+            config.providers.push(provider);
+            Ok::<(), String>(())
+        })
+        .await;
+
+    // On this machine the key comes back in full.
+    let (status, body) = get(state.clone(), "/api/providers/testkey/keys/k1/secret").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("sk-secret-value-123456"), "{body}");
+
+    // The provider list still masks it.
+    let (status, body) = get(state.clone(), "/api/providers").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("sk-secret-value-123456"), "{body}");
+    assert!(body.contains("sk-s…3456"), "{body}");
+
+    // Away from the machine, the key stays out of reach even for a caller
+    // that holds the gateway key.
+    let remote = state_at("0.0.0.0").await;
+    let mut remote_provider = local_router::config::Provider {
+        id: "testkey".to_string(),
+        name: "Test".to_string(),
+        ..Default::default()
+    };
+    remote_provider.keys = vec![ProviderKey {
+        id: "k1".to_string(),
+        key: "sk-secret-value-123456".to_string(),
+        enabled: true,
+        label: Some("primary".to_string()),
+    }];
+    remote
+        .update(|config| {
+            config.providers.push(remote_provider);
+            Ok::<(), String>(())
+        })
+        .await
+        .ok();
+    let response = console(remote)
+        .oneshot(
+            Request::builder()
+                .uri("/api/providers/testkey/keys/k1/secret")
+                .header("authorization", "Bearer local-router")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 }
 
 #[tokio::test(flavor = "multi_thread")]

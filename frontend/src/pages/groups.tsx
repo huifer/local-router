@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useRouteLoaderData } from "react-router";
-import { Check, Plus, Search } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, Plus, Search, X } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
 import type { Group } from "@/types";
@@ -13,19 +13,19 @@ import { SectionToolbar, StatusDot } from "@/components/shared/bits";
 import { useT } from "@/i18n";
 
 const routingOptions = [
-  { value: "order", label: "order — primary then failover" },
-  { value: "rotate", label: "rotate — round robin" },
-  { value: "usage", label: "usage — least used" },
-  { value: "smart", label: "smart — quota-aware" },
-  { value: "weight", label: "weight — weighted interleave" },
+  { value: "order", label: "order", detailKey: "groups.routingOrderDetail" },
+  { value: "rotate", label: "rotate", detailKey: "groups.routingRotateDetail" },
+  { value: "usage", label: "usage", detailKey: "groups.routingUsageDetail" },
+  { value: "smart", label: "smart", detailKey: "groups.routingSmartDetail" },
+  { value: "weight", label: "weight", detailKey: "groups.routingWeightDetail" },
 ];
 
 const staysOptions = [
-  { value: "auto", label: "auto — preserve useful cache" },
-  { value: "session", label: "session — keep the session" },
-  { value: "turn", label: "turn — keep the turn" },
-  { value: "off", label: "off — no affinity" },
-  { value: "strict", label: "strict — never fail over" },
+  { value: "auto", label: "auto", detailKey: "groups.staysAutoDetail" },
+  { value: "session", label: "session", detailKey: "groups.staysSessionDetail" },
+  { value: "turn", label: "turn", detailKey: "groups.staysTurnDetail" },
+  { value: "off", label: "off", detailKey: "groups.staysOffDetail" },
+  { value: "strict", label: "strict", detailKey: "groups.staysStrictDetail" },
 ];
 
 /** The members a group can be built from: every exposed upstream model. */
@@ -42,6 +42,18 @@ export default function GroupsPage() {
   const { data, reload } = useRouteLoaderData("shell") as { data: AppData; reload: () => Promise<void> };
   const [showAdd, setShowAdd] = useState(false);
   const [form, setForm] = useState({ name: "", members: [] as string[], routing: "order", stays: "auto" });
+  const catalog = useMemberCatalog();
+  // The id the group will be reachable under: the name as written, lowercased
+  // and trimmed to what a path segment can hold.
+  const groupId = useMemo(
+    () =>
+      form.name
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9._-]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "group",
+    [form.name],
+  );
 
   const create = async () => {
     if (!form.members.length) {
@@ -117,9 +129,24 @@ export default function GroupsPage() {
               <div className="border-t border-border">
                 {group.models.map((model, index) => {
                   const owner = model.split("/")[0];
+                  const last = index === group.models.length - 1;
                   return (
-                    <div key={model} className="flex items-center gap-2.5 border-b border-border py-3 font-mono text-[11px] last:border-b-0">
-                      <i className="not-italic text-muted-foreground/70">{String(index + 1).padStart(2, "0")}</i>
+                    <div key={model} className="flex items-center gap-2.5 py-2.5 font-mono text-[11px]">
+                      <span className="relative grid w-5 shrink-0 place-items-center self-stretch">
+                        <span
+                          className="absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-border"
+                          style={{ display: last ? "none" : undefined }}
+                        />
+                        <span
+                          className={`relative grid size-4 place-items-center border text-[8px] ${
+                            index === 0
+                              ? "border-primary/50 bg-primary/10 text-primary"
+                              : "border-border bg-secondary text-muted-foreground"
+                          }`}
+                        >
+                          {index + 1}
+                        </span>
+                      </span>
                       <span className="truncate">{model}</span>
                       <Badge className="ml-auto shrink-0">{owner}</Badge>
                       {index === 0 && group.routing === "order" && (
@@ -148,37 +175,84 @@ export default function GroupsPage() {
       )}
 
       <Dialog open={showAdd} onOpenChange={setShowAdd}>
-        <DialogContent className="max-w-2xl">
-          <DialogHeader>
+        <DialogContent className="flex h-[min(86vh,780px)] max-w-4xl flex-col overflow-hidden p-0">
+          <DialogHeader className="shrink-0 border-b border-border px-5 py-4">
             <DialogTitle>{t("groups.create")}</DialogTitle>
+            <p className="mt-1 font-mono text-[10px] text-muted-foreground/70">
+              {t("groups.createDetail")}
+            </p>
           </DialogHeader>
-          <div className="grid gap-4 px-5 py-5">
-            <Field label={t("groups.groupName")}>
-              <Input
-                autoFocus
-                value={form.name}
-                placeholder={t("groups.groupNamePlaceholder")}
-                onChange={(event) => setForm({ ...form, name: event.target.value })}
-              />
-            </Field>
-            <Field label={t("groups.membersLabel")} help={t("groups.membersHelp")}>
+
+          <div className="flex min-h-0 flex-1 max-[860px]:flex-col">
+            {/* Left: the model catalog. */}
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col border-r border-border max-[860px]:border-b max-[860px]:border-r-0">
+              <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2.5">
+                <span className="eyebrow">{t("groups.catalog")}</span>
+                <span className="ml-auto font-mono text-[9px] text-muted-foreground/60">
+                  {t("groups.modelsCount", { n: catalog.length })}
+                </span>
+              </div>
               <MemberPicker
                 selected={form.members}
                 onChange={(members) => setForm({ ...form, members })}
               />
+            </div>
+
+            {/* Right: the route being built. */}
+            <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+              <div className="flex shrink-0 items-center gap-2 border-b border-border px-4 py-2.5">
+                <span className="eyebrow">{t("groups.routePreview")}</span>
+                <span className="ml-auto font-mono text-[9px] text-muted-foreground/60">
+                  {t("groups.selectedCountPlural", { n: form.members.length })}
+                </span>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto px-4 py-3">
+                <RouteChain
+                  selected={form.members}
+                  onChange={(members) => setForm({ ...form, members })}
+                />
+              </div>
+            </div>
+          </div>
+
+          {/* The policy: how the chain is walked. */}
+          <div className="grid shrink-0 gap-4 border-t border-border px-5 py-4">
+            <Field label={t("groups.routing")} help={t("groups.routingHelp")}>
+              <div className="grid grid-cols-5 gap-1.5 max-[720px]:grid-cols-2">
+                {routingOptions.map((option) => {
+                  const active = form.routing === option.value;
+                  return (
+                    <button
+                      key={option.value}
+                      type="button"
+                      onClick={() => setForm({ ...form, routing: option.value })}
+                      className={`cursor-pointer border px-2.5 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
+                        active
+                          ? "border-primary/40 bg-primary/5"
+                          : "border-border bg-secondary/40 hover:border-input hover:bg-accent"
+                      }`}
+                    >
+                      <span className={`block font-mono text-[11px] ${active ? "text-primary" : "text-foreground"}`}>
+                        {option.label}
+                      </span>
+                      <span className="mt-1 block text-[10px] leading-snug text-muted-foreground/80">
+                        {t(option.detailKey)}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
             </Field>
-            <div className="grid grid-cols-2 gap-3.5 max-[500px]:grid-cols-1">
-              <Field label={t("groups.routing")}>
-                <Select value={form.routing} onValueChange={(value) => setForm({ ...form, routing: value })}>
-                  <SelectTrigger><SelectValue /></SelectTrigger>
-                  <SelectContent>
-                    {routingOptions.map((option) => (
-                      <SelectItem key={option.value} value={option.value}>{option.label}</SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+
+            <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-4 max-[560px]:grid-cols-1">
+              <Field label={t("groups.groupName")}>
+                <Input
+                  value={form.name}
+                  placeholder={t("groups.groupNamePlaceholder")}
+                  onChange={(event) => setForm({ ...form, name: event.target.value })}
+                />
               </Field>
-              <Field label={t("groups.affinity")}>
+              <Field label={t("groups.affinity")} help={t("groups.affinityHelp")}>
                 <Select value={form.stays} onValueChange={(value) => setForm({ ...form, stays: value })}>
                   <SelectTrigger><SelectValue /></SelectTrigger>
                   <SelectContent>
@@ -187,12 +261,21 @@ export default function GroupsPage() {
                     ))}
                   </SelectContent>
                 </Select>
+                <p className="font-mono text-[10px] text-muted-foreground/70">
+                  {t(staysOptions.find((option) => option.value === form.stays)?.detailKey ?? "groups.staysAutoDetail")}
+                </p>
               </Field>
             </div>
           </div>
-          <DialogFooter>
-            <span className="mr-auto font-mono text-[10px] text-muted-foreground">
-              {t(form.members.length === 1 ? "groups.selectedCount" : "groups.selectedCountPlural", { n: form.members.length })}
+
+          <DialogFooter className="shrink-0 border-t border-border px-5 py-3.5">
+            <span className="mr-auto flex min-w-0 items-center gap-2 font-mono text-[10px] text-muted-foreground">
+              <span className="shrink-0 text-ring">group/{groupId}</span>
+              <span className="truncate">
+                {form.members.length
+                  ? form.members.join(" → ")
+                  : t("groups.previewEmpty")}
+              </span>
             </span>
             <Button variant="secondary" onClick={() => setShowAdd(false)}>{t("groups.cancel")}</Button>
             <Button variant="default" onClick={create} disabled={!form.members.length}>
@@ -206,10 +289,101 @@ export default function GroupsPage() {
 }
 
 /**
+ * The route being built: the members in the order they are tried. It is a
+ * chain, so it is drawn as one — the first member answers, the rest are
+ * failover — and the order can be changed here.
+ */
+function RouteChain({ selected, onChange }: { selected: string[]; onChange: (next: string[]) => void }) {
+  const { t } = useT();
+
+  const move = (index: number, delta: number) => {
+    const next = [...selected];
+    const target = index + delta;
+    if (target < 0 || target >= next.length) return;
+    [next[index], next[target]] = [next[target], next[index]];
+    onChange(next);
+  };
+
+  const remove = (id: string) => onChange(selected.filter((item) => item !== id));
+
+  if (!selected.length) {
+    return (
+      <div className="grid place-items-center border border-dashed border-border px-4 py-10 text-center">
+        <div>
+          <div className="font-mono text-[11px] text-muted-foreground/70">{t("groups.chainEmpty")}</div>
+          <div className="mt-1.5 font-mono text-[10px] text-muted-foreground/40">
+            {t("groups.chainEmptyDetail")}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <ol className="grid gap-0">
+      {selected.map((id, index) => (
+        <li key={id} className="relative flex items-center gap-3 pb-2.5 pl-0 last:pb-0">
+          {/* The chain: a rail down the left with a node per member. */}
+          <span className="relative grid w-6 shrink-0 place-items-center self-stretch">
+            <span className="absolute left-1/2 top-0 h-full w-px -translate-x-1/2 bg-ring/25" style={{ display: index === selected.length - 1 ? "none" : undefined }} />
+            <span
+              className={`relative grid size-5 place-items-center border font-mono text-[9px] ${
+                index === 0
+                  ? "border-primary/50 bg-primary/10 text-primary"
+                  : "border-border bg-secondary text-muted-foreground"
+              }`}
+            >
+              {index + 1}
+            </span>
+          </span>
+
+          <span className="min-w-0 flex-1 border border-border bg-secondary/40 px-2.5 py-1.5">
+            <span className="flex items-center gap-2">
+              <span className="truncate font-mono text-[11px] text-foreground">{id}</span>
+              {index === 0 ? <Badge variant="primary">{t("groups.primary")}</Badge> : null}
+            </span>
+            <span className="mt-0.5 block font-mono text-[9px] text-muted-foreground/60">
+              {id.split("/")[0]}
+            </span>
+          </span>
+
+          <span className="flex shrink-0 items-center gap-0.5">
+            <button
+              type="button"
+              onClick={() => move(index, -1)}
+              disabled={index === 0}
+              title={t("groups.moveUp")}
+              className="grid size-6 cursor-pointer place-items-center border border-border text-muted-foreground transition-colors hover:border-input hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+            >
+              <ArrowUp className="size-3" />
+            </button>
+            <button
+              type="button"
+              onClick={() => move(index, 1)}
+              disabled={index === selected.length - 1}
+              title={t("groups.moveDown")}
+              className="grid size-6 cursor-pointer place-items-center border border-border text-muted-foreground transition-colors hover:border-input hover:text-foreground disabled:cursor-not-allowed disabled:opacity-30"
+            >
+              <ArrowDown className="size-3" />
+            </button>
+            <button
+              type="button"
+              onClick={() => remove(id)}
+              title={t("groups.removeMemberHint")}
+              className="grid size-6 cursor-pointer place-items-center border border-transparent text-muted-foreground transition-colors hover:border-destructive/30 hover:bg-destructive/10 hover:text-destructive"
+            >
+              <X className="size-3" />
+            </button>
+          </span>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+/**
  * The member picker: the models the providers expose, grouped by provider,
- * with a search box and an ordered selection. Order matters (it is the
- * failover order), so the picked list is numbered and can be reordered by
- * clicking it off and on again.
+ * with a search box. Picking a model adds it to the end of the chain.
  */
 function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (next: string[]) => void }) {
   const { t } = useT();
@@ -236,23 +410,23 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
   };
 
   return (
-    <div className="grid gap-2">
-      <div className="flex items-center gap-2 border border-input bg-[#0c1110] px-2.5 text-muted-foreground focus-within:border-ring">
+    <div className="flex min-h-0 flex-1 flex-col">
+      <div className="flex shrink-0 items-center gap-2 border-b border-border bg-[#0c1110] px-3 py-2 text-muted-foreground focus-within:border-ring">
         <Search className="size-3.5 shrink-0" />
         <Input
-          className="h-8 border-0 bg-transparent px-0 focus-visible:ring-0"
+          className="h-7 border-0 bg-transparent px-0 focus-visible:ring-0"
           placeholder={t("groups.searchModels")}
           value={query}
           onChange={(event) => setQuery(event.target.value)}
         />
       </div>
-      <div className="max-h-56 overflow-auto border border-border">
+      <div className="min-h-0 flex-1 overflow-auto">
         {byProvider.map(([provider, models]) => {
           const visible = models.filter(matches);
           if (!visible.length) return null;
           return (
-            <div key={provider} className="border-b border-border last:border-b-0">
-              <div className="flex items-center gap-2 bg-secondary/60 px-3 py-2">
+            <div key={provider}>
+              <div className="sticky top-0 z-10 flex items-center gap-2 border-b border-border bg-secondary/90 px-3 py-1.5 backdrop-blur">
                 <span className="eyebrow">{provider}</span>
                 <span className="font-mono text-[9px] text-muted-foreground/60">{t("groups.modelsCount", { n: visible.length })}</span>
               </div>
@@ -263,7 +437,7 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
                   <button
                     key={model.id}
                     onClick={() => toggle(model.id)}
-                    className={`flex w-full cursor-pointer items-center gap-2.5 border-t border-border/50 px-3 py-2 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
+                    className={`flex w-full cursor-pointer items-center gap-2.5 border-b border-border/40 px-3 py-1.5 text-left transition-colors outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/60 ${
                       picked ? "bg-primary/5 text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground"
                     }`}
                   >
@@ -275,7 +449,7 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
                       {picked && <Check className="size-3" />}
                     </span>
                     <span className="min-w-0 flex-1 truncate font-mono text-[11px]">{model.label}</span>
-                    {picked && <Badge variant="primary">{index + 1}</Badge>}
+                    {picked ? <Badge variant="primary">{index + 1}</Badge> : null}
                   </button>
                 );
               })}
@@ -283,27 +457,11 @@ function MemberPicker({ selected, onChange }: { selected: string[]; onChange: (n
           );
         })}
         {!catalog.length && (
-          <p className="px-3 py-6 text-center font-mono text-[10px] text-muted-foreground/70">
+          <p className="px-3 py-8 text-center font-mono text-[10px] text-muted-foreground/70">
             {t("groups.noModelsExposed")}
           </p>
         )}
       </div>
-      {selected.length > 0 && (
-        <div className="flex flex-wrap gap-1.5 border border-border bg-secondary/40 p-2">
-          {selected.map((id, index) => (
-            <button
-              key={id}
-              onClick={() => toggle(id)}
-              title={t("groups.removeMemberHint")}
-              className="flex cursor-pointer items-center gap-1.5 border border-primary/30 bg-primary/5 px-1.5 py-1 font-mono text-[10px] text-primary hover:border-destructive/40 hover:text-destructive"
-            >
-              <span className="opacity-70">{index + 1}</span>
-              {id}
-              <span aria-hidden="true">×</span>
-            </button>
-          ))}
-        </div>
-      )}
     </div>
   );
 }

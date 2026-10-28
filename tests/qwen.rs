@@ -55,7 +55,7 @@ fn store_session(home: &std::path::Path, token: &str, refresh: &str, expires_in:
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666));
     }
     local_router::qwen::login::read_session_file().unwrap()
 }
@@ -259,6 +259,181 @@ async fn session_file_round_trip_and_missing_file() {
     assert!(local_router::qwen::login::read_session_file().is_err());
 }
 
+/// Several QwenWork accounts live side by side: more than two, each with its
+/// own identity and token, and the one in use can be switched.
+#[tokio::test]
+async fn several_qwenwork_accounts_live_side_by_side() {
+    let _env = env_guard::ENV_LOCK.lock().unwrap();
+    let (_dir, home) = temp_home("qwen-session-pool");
+    std::env::set_var("LOCAL_ROUTER_HOME", &home);
+
+    // Sign in three accounts, each filed under its own name.
+    for (slot, uid) in [("default", "u-1"), ("work", "u-2"), ("personal", "u-3")] {
+        let token = local_router::qwen::login::DeviceToken {
+            token: format!("tok-{uid}"),
+            refresh_token: format!("ref-{uid}"),
+            expires_at: Some(local_router::qwen::login::now_ms() + 3_600_000),
+            user_id: uid.to_string(),
+        };
+        let account = json!({"data": {"user": {
+            "id": uid, "name": format!("User {uid}"), "email": format!("{uid}@example.com")
+        }}});
+        local_router::qwen::login::store_session(&token, &account, "machine-1", slot)
+            .await
+            .unwrap();
+    }
+
+    // All three are held; the last one signed in is the one in use.
+    let pool = local_router::qwen::login::read_pool().unwrap();
+    assert_eq!(pool.accounts.len(), 3);
+    assert_eq!(pool.active, "personal");
+    assert_eq!(pool.accounts["default"].account.uid, "u-1");
+    assert_eq!(pool.accounts["work"].account.uid, "u-2");
+    assert_eq!(pool.accounts["personal"].account.uid, "u-3");
+    // Each account keeps its own token — they do not overwrite each other.
+    assert_eq!(pool.accounts["default"].auth.device_token, "tok-u-1");
+    assert_eq!(pool.accounts["work"].auth.device_token, "tok-u-2");
+    assert_eq!(pool.accounts["personal"].auth.device_token, "tok-u-3");
+
+    // The accounts list shows all of them.
+    assert_eq!(local_router::qwen::login::accounts().unwrap().len(), 3);
+
+    // A named account can be read on its own.
+    let work = local_router::qwen::login::session_of("work").unwrap();
+    assert_eq!(work.device_token, "tok-u-2");
+    assert_eq!(work.account.nickname, "User u-2");
+
+    // Switching the account in use works, and an unknown name is refused.
+    local_router::qwen::login::use_account("work").unwrap();
+    let pool = local_router::qwen::login::read_pool().unwrap();
+    assert_eq!(pool.active, "work");
+    assert_eq!(
+        local_router::qwen::login::read_session_file()
+            .unwrap()
+            .device_token,
+        "tok-u-2"
+    );
+    assert!(local_router::qwen::login::use_account("nope").is_err());
+
+    // The rotating reader walks the accounts instead of always using one.
+    let mut seen = std::collections::BTreeSet::new();
+    for _ in 0..6 {
+        let (name, _) = local_router::qwen::login::session_rotating().await.unwrap();
+        seen.insert(name);
+    }
+    assert_eq!(seen.len(), 3, "every account should take a turn: {seen:?}");
+
+    // An old single-session file still reads (as one account named default).
+    std::fs::write(
+        home.join("qwen-session.json"),
+        serde_json::to_string(&SessionFile {
+            account: local_router::qwen::login::QwenAccount {
+                uid: "u-old".into(),
+                nickname: "Old".into(),
+                email: "old@example.com".into(),
+            },
+            auth: local_router::qwen::login::QwenAuth {
+                device_token: "tok-old".into(),
+                refresh_token: "ref-old".into(),
+                expires_at: Some(local_router::qwen::login::now_ms() + 3_600_000),
+            },
+            machine_id: "machine-old".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let pool = local_router::qwen::login::read_pool().unwrap();
+    assert_eq!(pool.accounts.len(), 1);
+    assert_eq!(pool.active, "default");
+    assert_eq!(pool.accounts["default"].account.uid, "u-old");
+}
+
+/// Every sign-in is filed under its own slot, so any number of accounts can
+/// live side by side. Signing the same person in twice gives two entries:
+/// the browser's sign-in page signs in whoever is logged in there, and that
+/// is the user's call — the pool never merges accounts behind their back.
+#[tokio::test]
+async fn every_sign_in_becomes_its_own_account() {
+    let _env = env_guard::ENV_LOCK.lock().unwrap();
+    let (_dir, home) = temp_home("qwen-session-multi");
+    std::env::set_var("LOCAL_ROUTER_HOME", &home);
+
+    let token_of = |tok: &str| local_router::qwen::login::DeviceToken {
+        token: tok.to_string(),
+        refresh_token: format!("ref-{tok}"),
+        expires_at: Some(local_router::qwen::login::now_ms() + 3_600_000),
+        user_id: "u-1".to_string(),
+    };
+    let account = json!({"data": {"user": {
+        "id": "u-1", "name": "Zhang", "email": "z@example.com"
+    }}});
+
+    // The first sign-in lands in the slot it was given.
+    let first = local_router::qwen::login::store_session(
+        &token_of("tok-1"),
+        &account,
+        "machine-1",
+        "default",
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.slot, "default");
+    assert!(!first.same_uid_elsewhere);
+
+    // The second sign-in of the same person is kept as its own entry — it
+    // is not merged into the first one.
+    let second = local_router::qwen::login::store_session(
+        &token_of("tok-2"),
+        &account,
+        "machine-1",
+        "qwenwork-2",
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.slot, "qwenwork-2");
+    assert!(
+        second.same_uid_elsewhere,
+        "the pool says out loud that the uid is already there"
+    );
+
+    let pool = local_router::qwen::login::read_pool().unwrap();
+    assert_eq!(pool.accounts.len(), 2);
+    assert_eq!(pool.active, "qwenwork-2");
+    assert_eq!(pool.accounts["default"].auth.device_token, "tok-1");
+    assert_eq!(pool.accounts["qwenwork-2"].auth.device_token, "tok-2");
+
+    // A different uid is a different account, and says nothing about it.
+    let other = json!({"data": {"user": {
+        "id": "u-2", "name": "Li", "email": "li@example.com"
+    }}});
+    let third = local_router::qwen::login::store_session(
+        &token_of("tok-3"),
+        &other,
+        "machine-1",
+        "qwenwork-3",
+    )
+    .await
+    .unwrap();
+    assert_eq!(third.slot, "qwenwork-3");
+    assert!(!third.same_uid_elsewhere);
+    assert_eq!(
+        local_router::qwen::login::read_pool()
+            .unwrap()
+            .accounts
+            .len(),
+        3
+    );
+
+    // Removing an account drops it and moves the active marker when needed:
+    // the account in use goes, the first remaining one takes over.
+    let was_active = local_router::qwen::login::remove_account("qwenwork-3").unwrap();
+    assert!(was_active);
+    let pool = local_router::qwen::login::read_pool().unwrap();
+    assert_eq!(pool.accounts.len(), 2);
+    assert_eq!(pool.active, "default");
+    assert!(local_router::qwen::login::remove_account("nope").is_err());
+}
+
 /// A stand-in QwenWork: the device flow's select-accounts, poll, refresh,
 /// the account-context and the wallets.
 async fn mock_qwen(
@@ -412,16 +587,22 @@ async fn login_flow_polls_until_the_token_arrives() {
     assert_eq!(account.pointer("/data/user/name").unwrap(), "Bob");
 
     // Storing it lands in the home with 0600 and reads back.
-    let path =
-        local_router::qwen::login::store_session(&token, &account, &session.state.machine_id)
-            .await
-            .unwrap();
-    assert!(path.starts_with(&home));
+    let saved = local_router::qwen::login::store_session(
+        &token,
+        &account,
+        &session.state.machine_id,
+        "default",
+    )
+    .await
+    .unwrap();
+    assert_eq!(saved.slot, "default");
+    assert!(!saved.same_uid_elsewhere);
+    assert!(saved.path.starts_with(&home));
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let mode = std::fs::metadata(&saved.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666);
     }
     let stored = local_router::qwen::login::read_session_file().unwrap();
     assert_eq!(stored.device_token, "dev-tok");
@@ -457,10 +638,10 @@ async fn an_expiring_token_refreshes_before_use() {
     assert_eq!(fresh.device_token, "tok-new");
     assert_eq!(fresh.refresh_token, "ref-new");
     assert!(!fresh.needs_refresh());
-    // The refreshed token is returned, never written back to disk: the
-    // stored file still holds what the login wrote.
+    // The refreshed token is returned and persisted to the same account slot
+    // so a restart does not fall back to the expired token.
     let on_disk = local_router::qwen::login::read_session_file().unwrap();
-    assert_eq!(on_disk.device_token, "tok-old");
+    assert_eq!(on_disk.device_token, "tok-new");
 
     std::env::remove_var("LOCAL_ROUTER_QWEN_ENDPOINT");
 }
