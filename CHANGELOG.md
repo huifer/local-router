@@ -8,6 +8,19 @@
 
 ### Added
 
+- **每个账号一份独立额度 + 一键签到**：会话型 provider 的账号池里，每个账号
+  都有自己的额度与签到状态，现在逐账号读、逐账号领：
+  - 新接口 `GET /api/providers/{id}/accounts/{name}/quota`：读**某一个**账号的
+    额度（WorkBuddy 读资源包与签到状态，QwenWork 读套餐余额与钱包池，Trae CN
+    没有额度可言就明说）；
+  - 新接口 `POST /api/providers/{id}/accounts/{name}/checkin`：给**某一个**账号
+    领当天的签到额度（只有 WorkBuddy 有签到）；厂商回答“今天已签到”不算错误；
+  - 控制台 provider 抽屉的账号行里：这一行的剩余额度、资源包、签到状态，
+    行尾一个 **刷新额度**；抽屉右上角一个 **刷新全部**，一次更新所有账号的
+    额度与签到状态（打开抽屉时也会自动刷一遍）；
+  - 总览页的 WorkBuddy 卡片上也加了一键签到与刷新额度（作用在正在用的账号上）。
+- **控制台的用户名打码**：账号昵称显示成 `张*` / `嘘***`，uid 显示成 `47d4…`
+  ——控制台会展示账号持有人，截图不该带出人名。
 - **Trae CN（Cloud-IDE）接入**：新增 `src/trae.rs` 模块与内置预设 `trae-cn`。
   Trae 不是普通的 OpenAI 兼容上游——它要 `Cloud-IDE-JWT` 鉴权头、发自己的
   SSE 事件词汇，所以走网关里的专用通道（`Protocol::TraeCn` 的 provider 不进
@@ -53,6 +66,13 @@
 - **daemon 不再谎报启动成功**：`daemon start` 现在检查子进程是否真的活着，
   起不来（端口被占之类）直接报错并指向日志；`daemon run` 只在 pid 文件仍然
   属于自己时才删它，不会把后来启动的 daemon 的 pid 文件带走。
+
+### Removed
+
+- **控制台的「账号」页（`/accounts`）下线**：账号、额度、签到都收进供应商
+  provider 的抽屉里（每个账号一行），不再单独开一页；后端
+  `GET /api/accounts` 与 `POST /api/checkin` 一并去掉（逐账号的新接口取代
+  了它们）。
 
 ### Changed
 

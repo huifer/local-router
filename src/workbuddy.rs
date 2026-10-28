@@ -865,6 +865,19 @@ pub struct CheckinOutcome {
 /// the second call of the day.
 pub async fn claim_checkin() -> anyhow::Result<CheckinOutcome> {
     let session = session().await?;
+    claim_checkin_session(&session).await
+}
+
+/// Claim the day's check-in for one saved account (by its pool slot), so each
+/// account claims its own credits instead of only the one in use.
+pub async fn claim_checkin_for(name: &str) -> anyhow::Result<CheckinOutcome> {
+    let session = session_of(name)?;
+    claim_checkin_session(&session).await
+}
+
+/// The network half of [`claim_checkin`]: post the daily check-in with the
+/// given session's headers.
+async fn claim_checkin_session(session: &Session) -> anyhow::Result<CheckinOutcome> {
     let mut headers = session.auth_headers();
     headers.insert("content-type".to_string(), "application/json".to_string());
     headers.insert("accept".to_string(), "application/json".to_string());
@@ -1306,6 +1319,19 @@ pub async fn checkin_state() -> Option<Checkin> {
 /// Read the account's resource packages and its check-in state.
 pub async fn credits() -> anyhow::Result<Credits> {
     let session = session().await?;
+    credits_session(&session).await
+}
+
+/// Read the resource packages and check-in state for one saved account (by
+/// its pool slot), each of which has its own independent quota.
+pub async fn credits_for(name: &str) -> anyhow::Result<Credits> {
+    let session = session_of(name)?;
+    credits_session(&session).await
+}
+
+/// The network half of [`credits`]: read one session's resource packages and
+/// check-in state.
+async fn credits_session(session: &Session) -> anyhow::Result<Credits> {
     let headers = session.auth_headers();
     let http = client()?;
 

@@ -295,7 +295,26 @@ export interface AccountView {
 export interface WorkBuddyStatus {
   signed_in: boolean;
   account: { uid: string; nickname: string; type: string } | null;
+  /** The pool slot of the account in use (the one the buttons act on). */
+  account_name?: string;
   token_expires_at: number | null;
   credits: WorkBuddyCredits | null;
   note: string | null;
+}
+
+/** QwenWork's plan balance and wallet pools, as the dashboard reads it. */
+export interface QwenAccountQuota {
+  plan: string;
+  balance: string;
+  resets_at?: string | null;
+  pools: { name: string; balance: number }[];
+  display: string;
+  empty: boolean;
+}
+
+/** The live quota of one saved account, keyed by provider kind. */
+export interface ProviderAccountQuota {
+  kind: "workbuddy" | "qwenwork" | "trae-cn";
+  credits?: WorkBuddyCredits;
+  quota?: QwenAccountQuota;
 }

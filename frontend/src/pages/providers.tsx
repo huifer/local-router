@@ -1,9 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 import { useRouteLoaderData } from "react-router";
-import { Copy, LogIn, Plus, Search, X } from "lucide-react";
+import { Copy, LogIn, Plus, RefreshCw, Search, X } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
-import type { Provider, ProviderAccount, ProviderKey } from "@/types";
+import type {
+  Provider,
+  ProviderAccount,
+  ProviderAccountQuota,
+  ProviderKey,
+} from "@/types";
 import type { Preset } from "@/types";
 import { api, getPresets } from "@/api";
 import {
@@ -11,7 +16,7 @@ import {
   EmptyState, Field, Input, Sheet, SheetBody, SheetContent, SheetDescription, SheetHeader, SheetTitle,
 } from "@/components/ui";
 import { useT } from "@/i18n";
-import { cn } from "@/lib/utils";
+import { cn, maskId, maskName } from "@/lib/utils";
 import { SectionToolbar, StatusDot } from "@/components/shared/bits";
 
 export default function ProvidersPage() {
@@ -211,7 +216,7 @@ export default function ProvidersPage() {
                 <span>{provider.auth ? t("providers.session") : t(provider.keys.length === 1 ? "providers.keys" : "providers.keysPlural", { n: provider.keys.length })}</span>
                 {provider.account?.nickname && (
                   <span className="truncate text-primary" title={provider.account.uid}>
-                    {provider.account.nickname}
+                    {maskName(provider.account.nickname)}
                   </span>
                 )}
                 <span>{t("providers.models", { n: provider.models.length })}</span>
@@ -516,6 +521,11 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const [newName, setNewName] = useState("");
+  // The quota of every account, by slot: each one has its own.
+  const [quotas, setQuotas] = useState<Record<string, ProviderAccountQuota>>({});
+  const [pending, setPending] = useState<Record<string, boolean>>({});
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [refreshingAll, setRefreshingAll] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -528,7 +538,46 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
     }
   }, [provider.id]);
 
+  /** Ask the vendor for one account's quota and check-in state. */
+  const refreshOne = useCallback(
+    async (name: string) => {
+      setPending((all) => ({ ...all, [name]: true }));
+      setErrors((all) => {
+        const next = { ...all };
+        delete next[name];
+        return next;
+      });
+      try {
+        const response = await api<ProviderAccountQuota>(
+          `/api/providers/${encodeURIComponent(provider.id)}/accounts/${encodeURIComponent(name)}/quota`,
+        );
+        setQuotas((all) => ({ ...all, [name]: response }));
+      } catch (err) {
+        setErrors((all) => ({ ...all, [name]: (err as Error).message }));
+      } finally {
+        setPending((all) => ({ ...all, [name]: false }));
+      }
+    },
+    [provider.id],
+  );
+
+  /** Bring every account's quota and check-in state up to date. */
+  const refreshAll = useCallback(async () => {
+    if (!accounts.length) return;
+    setRefreshingAll(true);
+    await Promise.all(accounts.map((account) => refreshOne(account.name)));
+    setRefreshingAll(false);
+  }, [accounts, refreshOne]);
+
   useEffect(() => { load(); }, [load]);
+
+  // Every account's status is read when the pool shows up, so the check-in
+  // state of all of them is current without a click per account.
+  useEffect(() => {
+    if (provider.id === "trae-cn") return;
+    if (!accounts.length) return;
+    refreshAll();
+  }, [accounts, provider.id, refreshAll]);
 
   /** Sign in another account: the browser opens, the gateway finishes. */
   const add = async () => {
@@ -616,9 +665,20 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
     <div className="border-t border-border p-4">
       <div className="mb-2 flex items-center justify-between gap-3">
         <span className="eyebrow">{t("providers.accounts")}</span>
-        <Button variant="ghost" size="sm" onClick={() => setAdding((value) => !value)}>
-          <Plus /> {t("providers.addAccount")}
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            title={t("providers.quotaRefreshAll")}
+            onClick={refreshAll}
+            disabled={refreshingAll || !accounts.length || provider.id === "trae-cn"}
+          >
+            <RefreshCw className={refreshingAll ? "animate-spin" : ""} /> {t("providers.quotaRefreshAll")}
+          </Button>
+          <Button variant="ghost" size="sm" onClick={() => setAdding((value) => !value)}>
+            <Plus /> {t("providers.addAccount")}
+          </Button>
+        </div>
       </div>
       {adding && (
         <div className="mb-3 flex items-center gap-2">
@@ -641,37 +701,18 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
       {accounts.length ? (
         <div className="grid gap-1.5">
           {accounts.map((account) => (
-            <div
+            <AccountRow
               key={account.name}
-              className={cn(
-                "flex items-center gap-2 border px-2.5 py-2",
-                account.active ? "border-primary/30 bg-primary/5" : "border-border",
-              )}
-            >
-              <span className="min-w-0 flex-1">
-                <span className="block truncate text-[11px] text-foreground">
-                  {account.nickname || account.name}
-                </span>
-                <span className="block truncate font-mono text-[9px] text-muted-foreground">
-                  {account.name}{account.uid ? ` · ${account.uid}` : ""}
-                </span>
-              </span>
-              {account.active ? (
-                <Badge variant="primary">{t("providers.inUse")}</Badge>
-              ) : (
-                <Button variant="ghost" size="sm" onClick={() => use(account.name)}>
-                  {t("providers.use")}
-                </Button>
-              )}
-              <Button
-                variant="ghost"
-                size="sm"
-                title={t("providers.removeAccount")}
-                onClick={() => remove(account.name)}
-              >
-                <X />
-              </Button>
-            </div>
+              provider={provider}
+              account={account}
+              quota={quotas[account.name] ?? null}
+              loading={Boolean(pending[account.name])}
+              error={errors[account.name] ?? null}
+              onRefresh={refreshOne}
+              onUse={use}
+              onRemove={remove}
+              onChanged={onChanged}
+            />
           ))}
         </div>
       ) : (
@@ -679,6 +720,192 @@ function AccountPool({ provider, onChanged }: { provider: Provider; onChanged: (
           {t("providers.noAccounts")}
         </p>
       )}
+    </div>
+  );
+}
+
+/**
+ * One saved account: who it is, whether it is the one in use, and its own
+ * quota and check-in state. Every account has an independent quota, so the
+ * numbers are read per account and the refresh button asks the vendor again.
+ */
+function AccountRow({
+  provider,
+  account,
+  quota,
+  loading,
+  error,
+  onRefresh,
+  onUse,
+  onRemove,
+  onChanged,
+}: {
+  provider: Provider;
+  account: ProviderAccount;
+  quota: ProviderAccountQuota | null;
+  loading: boolean;
+  error: string | null;
+  onRefresh: (name: string) => Promise<void>;
+  onUse: (name: string) => Promise<void>;
+  onRemove: (name: string) => Promise<void>;
+  onChanged: () => Promise<void>;
+}) {
+  const { t } = useT();
+  const [checking, setChecking] = useState(false);
+
+  /** Claim today's check-in for this account. */
+  const checkIn = async () => {
+    setChecking(true);
+    try {
+      const result = await api<{ granted?: boolean; already?: boolean; credit?: number | null; message?: string }>(
+        `/api/providers/${encodeURIComponent(provider.id)}/accounts/${encodeURIComponent(account.name)}/checkin`,
+        { method: "POST", body: {} },
+      );
+      if (result.granted) toast.success(t("providers.checkedIn", { n: result.credit ?? 0 }));
+      else toast.success(result.message || t("providers.alreadyCheckedIn"));
+      await onRefresh(account.name);
+      await onChanged();
+    } catch (err) {
+      toast.error((err as Error).message);
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const credits = quota?.credits;
+  const qwen = quota?.quota;
+  const hasQuota = provider.id !== "trae-cn";
+
+  return (
+    <div
+      className={cn(
+        "grid gap-2 border px-2.5 py-2",
+        account.active ? "border-primary/30 bg-primary/5" : "border-border",
+      )}
+    >
+      <div className="flex items-center gap-2">
+        <span className="min-w-0 flex-1">
+          <span className="block truncate text-[11px] text-foreground">
+            {maskName(account.nickname) || account.name}
+          </span>
+          <span className="block truncate font-mono text-[9px] text-muted-foreground">
+            {account.name}{account.uid ? ` · ${maskId(account.uid)}` : ""}
+          </span>
+        </span>
+        {account.active ? (
+          <Badge variant="primary">{t("providers.inUse")}</Badge>
+        ) : (
+          <Button variant="ghost" size="sm" onClick={() => onUse(account.name)}>
+            {t("providers.use")}
+          </Button>
+        )}
+        <Button
+          variant="ghost"
+          size="sm"
+          title={t("providers.removeAccount")}
+          onClick={() => onRemove(account.name)}
+        >
+          <X />
+        </Button>
+      </div>
+
+      {hasQuota ? (
+        <div className="grid gap-2 border-t border-border/60 pt-2">
+          <div className="flex items-center gap-2">
+            <span className="eyebrow">{t("providers.quota")}</span>
+            {loading ? (
+              <span className="font-mono text-[9px] text-muted-foreground">…</span>
+            ) : credits ? (
+              <span className="font-mono text-[10px] text-foreground">
+                {t("providers.quotaLeft")}: {credits.remaining} / {credits.capacity}
+              </span>
+            ) : qwen ? (
+              <span className="font-mono text-[10px] text-foreground">
+                {t("providers.balance")}: {qwen.display || qwen.balance}
+              </span>
+            ) : null}
+            <Button
+              variant="ghost"
+              size="sm"
+              className="ml-auto"
+              title={t("providers.quotaRefresh")}
+              onClick={() => onRefresh(account.name)}
+              disabled={loading}
+            >
+              <RefreshCw className={loading ? "animate-spin" : ""} /> {t("providers.quotaRefresh")}
+            </Button>
+          </div>
+
+          {error ? (
+            <p className="font-mono text-[9px] text-destructive">{error}</p>
+          ) : null}
+
+          {credits?.packages.length ? (
+            <div className="grid gap-1">
+              {/* Only the packages that still have something in them — the
+                  empty ones are the same story repeated. */}
+              {credits.packages
+                .filter((item) => item.remaining > 0)
+                .slice(0, 4)
+                .map((item, index) => (
+                  <div
+                    key={`${item.package_name}-${index}`}
+                    className="grid grid-cols-[1fr_auto] items-center gap-2 font-mono text-[9px] text-muted-foreground"
+                  >
+                    <span className="truncate">{item.package_name}</span>
+                    <span>
+                      {item.remaining} / {item.capacity} {item.unit}
+                    </span>
+                  </div>
+                ))}
+              {credits.packages.filter((item) => item.remaining > 0).length > 4 ? (
+                <span className="font-mono text-[9px] text-muted-foreground/70">
+                  +{credits.packages.filter((item) => item.remaining > 0).length - 4} more
+                </span>
+              ) : null}
+            </div>
+          ) : null}
+
+          {qwen?.pools.length ? (
+            <div className="flex flex-wrap gap-1.5">
+              {qwen.pools.map((pool) => (
+                <Badge key={pool.name} variant="primary">
+                  {pool.name}: {pool.balance}
+                </Badge>
+              ))}
+            </div>
+          ) : null}
+
+          {provider.id === "workbuddy" ? (
+            <div className="flex items-center gap-2">
+              <span className="font-mono text-[9px] text-muted-foreground">
+                {t("providers.checkIn")}:{" "}
+                {credits
+                  ? credits.checkin?.checked_in_today
+                    ? t("providers.checkInDone")
+                    : t("providers.checkInPending")
+                  : "—"}
+                {credits?.checkin?.streak_days
+                  ? ` · ${credits.checkin.streak_days}d`
+                  : ""}
+              </span>
+              <Button
+                variant="secondary"
+                size="sm"
+                className="ml-auto"
+                onClick={checkIn}
+                disabled={checking || credits?.checkin?.checked_in_today === true}
+              >
+                {checking
+                  ? "…"
+                  : credits?.checkin?.checked_in_today
+                    ? t("providers.checkInDone")
+                    : t("providers.checkInClaim")}
+              </Button>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

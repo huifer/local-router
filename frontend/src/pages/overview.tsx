@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useRouteLoaderData } from "react-router";
-import { Terminal } from "lucide-react";
+import { RefreshCw, Terminal } from "lucide-react";
+import { toast } from "sonner";
 import {
   Badge,
+  Button,
   Card,
   CardContent,
   CardDescription,
@@ -13,8 +15,9 @@ import {
 import { formatTime } from "@/components/shared/bits";
 import type { AppData } from "@/App";
 import type { UsageData, WorkBuddyStatus } from "@/types";
-import { getUsage, getWorkBuddy } from "@/api";
+import { api, getUsage, getWorkBuddy } from "@/api";
 import { useT } from "@/i18n";
+import { maskName } from "@/lib/utils";
 
 export default function OverviewPage() {
   const { t } = useT();
@@ -23,12 +26,15 @@ export default function OverviewPage() {
   const [usage, setUsage] = useState<UsageData | null>(null);
   const [workbuddy, setWorkbuddy] = useState<WorkBuddyStatus | null>(null);
 
+  const loadWorkBuddy = () =>
+    getWorkBuddy().then(setWorkbuddy).catch(() => setWorkbuddy(null));
+
   useEffect(() => {
     getUsage().then(setUsage).catch(() => {});
   }, []);
 
   useEffect(() => {
-    getWorkBuddy().then(setWorkbuddy).catch(() => setWorkbuddy(null));
+    loadWorkBuddy();
   }, []);
 
   const settings = data.status.settings;
@@ -177,7 +183,7 @@ export default function OverviewPage() {
           <CardDescription className="eyebrow">{t("overview.account")}</CardDescription>
           <CardTitle>{t("overview.workbuddySession")}</CardTitle>
         </CardHeader>
-        <WorkBuddySection status={workbuddy} />
+        <WorkBuddySection status={workbuddy} onReload={loadWorkBuddy} />
       </Card>
     </div>
   );
@@ -212,8 +218,15 @@ function RequestRow({ record }: { record: UsageData["recent"][number] }) {
   );
 }
 
-function WorkBuddySection({ status }: { status: WorkBuddyStatus | null }) {
+function WorkBuddySection({
+  status,
+  onReload,
+}: {
+  status: WorkBuddyStatus | null;
+  onReload: () => Promise<void>;
+}) {
   const { t } = useT();
+  const [busy, setBusy] = useState(false);
   if (!status) {
     return <EmptyState title={t("overview.readingSession")} detail={t("overview.readingSessionDetail")} />;
   }
@@ -227,13 +240,39 @@ function WorkBuddySection({ status }: { status: WorkBuddyStatus | null }) {
   }
   const credits = status.credits;
   const checkin = credits?.checkin;
+  // The account the console acts on: the one in use.
+  const slot = status.account_name || "default";
+
+  /** Claim today's check-in for the account in use. */
+  const claim = async () => {
+    setBusy(true);
+    try {
+      const result = await api<{
+        granted?: boolean;
+        already?: boolean;
+        credit?: number | null;
+        message?: string;
+      }>(`/api/providers/workbuddy/accounts/${encodeURIComponent(slot)}/checkin`, {
+        method: "POST",
+        body: {},
+      });
+      if (result.granted) toast.success(t("providers.checkedIn", { n: result.credit ?? 0 }));
+      else toast.success(result.message || t("providers.alreadyCheckedIn"));
+      await onReload();
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="grid gap-4 p-5">
       <div className="grid grid-cols-4 gap-3 max-[900px]:grid-cols-2">
         <div className="signal-card min-h-28">
           <span className="eyebrow">{t("overview.accountLabel")}</span>
           <div>
-            <strong className="metric-value text-2xl">{status.account?.nickname || "signed in"}</strong>
+            <strong className="metric-value text-2xl">{maskName(status.account?.nickname) || "signed in"}</strong>
             <span className="metric-detail mt-1.5 block">{status.account?.type || "personal"}</span>
           </div>
         </div>
@@ -249,6 +288,23 @@ function WorkBuddySection({ status }: { status: WorkBuddyStatus | null }) {
           <div>
             <strong className="metric-value text-2xl">{checkin ? (checkin.checked_in_today ? "DONE" : "TODO") : "--"}</strong>
             <span className="metric-detail mt-1.5 block">{checkin ? `streak ${checkin.streak_days} days` : "unknown"}</span>
+          </div>
+          <div className="mt-3 flex items-center gap-2">
+            <Button
+              variant="default"
+              size="sm"
+              onClick={claim}
+              disabled={busy || checkin?.checked_in_today === true}
+            >
+              {busy
+                ? "…"
+                : checkin?.checked_in_today
+                  ? t("providers.checkInDone")
+                  : t("providers.checkInClaim")}
+            </Button>
+            <Button variant="ghost" size="sm" onClick={() => onReload()}>
+              <RefreshCw /> {t("providers.quotaRefresh")}
+            </Button>
           </div>
         </div>
         <div className="signal-card min-h-28">

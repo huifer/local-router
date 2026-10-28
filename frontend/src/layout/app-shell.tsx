@@ -10,7 +10,6 @@ import {
   RefreshCw,
   Router as RouterIcon,
   Settings2,
-  UserRound,
 } from "lucide-react";
 import type { AppData } from "@/App";
 import { Button } from "@/components/ui";
@@ -24,7 +23,6 @@ const nav = [
   { to: "/models", key: "nav.models", icon: Layers },
   { to: "/groups", key: "nav.groups", icon: AudioLines },
   { to: "/usage", key: "nav.usage", icon: KeyRound },
-  { to: "/accounts", key: "nav.accounts", icon: UserRound },
   { to: "/settings", key: "nav.settings", icon: Settings2 },
 ] as const;
 
@@ -34,7 +32,6 @@ const titleKeys: Record<string, string> = {
   "/models": "nav.models",
   "/groups": "nav.groups",
   "/usage": "nav.usage",
-  "/accounts": "nav.accounts",
   "/settings": "nav.settings",
 };
 

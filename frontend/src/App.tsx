@@ -11,7 +11,6 @@ import ModelsPage from "@/pages/models";
 import GroupsPage from "@/pages/groups";
 import UsagePage from "@/pages/usage";
 import SettingsPage from "@/pages/settings";
-import AccountsPage from "@/pages/accounts";
 
 export interface AppData {
   status: Status;
@@ -101,7 +100,6 @@ function AppInner() {
         { path: "groups", element: <GroupsPage /> },
         { path: "usage", element: <UsagePage /> },
         { path: "settings", element: <SettingsPage /> },
-        { path: "accounts", element: <AccountsPage /> },
         { path: "*", element: <Navigate to="/overview" replace /> },
       ],
     },

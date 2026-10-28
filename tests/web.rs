@@ -78,6 +78,74 @@ async fn the_console_is_open_on_loopback() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// The per-account quota and check-in endpoints act on one saved account,
+/// and refuse the providers that have neither.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_account_quota_and_checkin_are_per_account() {
+    // The session pools live in the config dir: point it at a temp home so
+    // this test never reads the user's own accounts.
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = std::env::temp_dir().join(format!(
+        "local-router-web-acct-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var("LOCAL_ROUTER_HOME", &home);
+    let state = state_at("127.0.0.1").await;
+
+    // Trae CN has no quota of its own: the endpoint says so instead of
+    // guessing.
+    let (status, body) = get(
+        state.clone(),
+        "/api/providers/trae-cn/accounts/default/quota",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("trae-cn"), "{body}");
+
+    // A provider that keeps no session has no per-account quota.
+    let (status, body) = get(
+        state.clone(),
+        "/api/providers/openai/accounts/default/quota",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("per-account quota"), "{body}");
+
+    // The daily check-in belongs to WorkBuddy only.
+    let response = console(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/providers/qwenwork/accounts/default/checkin")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // WorkBuddy itself: with no such account saved, the answer is a clear
+    // error rather than a silent success.
+    let response = console(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/providers/workbuddy/accounts/nobody/checkin")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    std::env::remove_var("LOCAL_ROUTER_HOME");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A stored key is readable on the machine the console runs on, so it can be
 /// shown and copied — but never from another machine, even with the
 /// gateway's own key.
