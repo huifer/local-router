@@ -49,7 +49,7 @@ aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 rsa = { version = "0.9", default-features = false, features = ["std"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
-md-5 = "0.10"
+md-5 = "0.11"
 hex = "0.4"
 
 [dev-dependencies]
