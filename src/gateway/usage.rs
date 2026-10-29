@@ -22,6 +22,11 @@ pub struct UsageRecord {
     pub key_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_label: Option<String>,
+    /// The local gateway key that authorized the caller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_key_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_key_label: Option<String>,
     /// The group the request went through.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -105,6 +110,8 @@ impl UsageRecord {
             provider: String::new(),
             key_id: None,
             key_label: None,
+            caller_key_id: None,
+            caller_key_label: None,
             group: None,
             protocol: protocol.to_string(),
             input_tokens: 0,

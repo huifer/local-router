@@ -249,6 +249,8 @@ function UsageOverview({ usage }: { usage: UsageData }) {
                   <strong className="block truncate font-mono text-[11px]" title={record.error}>{record.model}</strong>
                   <span className="block truncate font-mono text-[10px] text-muted-foreground">
                     {record.provider} / {record.protocol}
+                    {record.key_label || record.key_id ? ` · key:${record.key_label || record.key_id}` : ""}
+                    {record.caller_key_label || record.caller_key_id ? ` · caller:${record.caller_key_label || record.caller_key_id}` : ""}
                     {record.agent ? ` · ${record.agent}` : ""}
                   </span>
                   <span className="block truncate font-mono text-[9px] text-muted-foreground/60 sm:hidden">
@@ -721,15 +723,38 @@ function QuotaPanel({ usage }: { usage: UsageData }) {
 function BillsPanel({ usage }: { usage: UsageData }) {
   const { t } = useT();
   return (
-    <div className="grid grid-cols-[1.2fr_0.8fr] gap-5 max-[1100px]:grid-cols-1">
+    <div className="grid grid-cols-2 gap-5 max-[1100px]:grid-cols-1">
       <Card>
         <CardHeader>
-          <CardDescription className="eyebrow">{t("usage.billsKey")}</CardDescription>
+          <CardDescription className="eyebrow">{t("usage.billsProviderKey")}</CardDescription>
+          <CardTitle>{t("usage.perProviderKey")}</CardTitle>
+        </CardHeader>
+        <div className="px-5 py-2">
+          {(usage.by_provider_key ?? usage.by_key).length ? (
+            (usage.by_provider_key ?? usage.by_key).map(([name, value]) => (
+              <div key={name} className="flex items-center justify-between border-b border-border py-3.5 last:border-b-0">
+                <div>
+                  <strong className="block font-mono text-[11px]">{name}</strong>
+                  <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
+                    {t("usage.requestsCount", { n: value.requests })} · {formatTokens(value.input_tokens + value.output_tokens)} tokens
+                  </span>
+                </div>
+                <span className="usage-number text-[15px]">${value.cost_usd.toFixed(4)}</span>
+              </div>
+            ))
+          ) : (
+            <EmptyState title={t("usage.noKeys")} detail={t("usage.noKeysDetail")} />
+          )}
+        </div>
+      </Card>
+      <Card>
+        <CardHeader>
+          <CardDescription className="eyebrow">{t("usage.billsCallerKey")}</CardDescription>
           <CardTitle>{t("usage.perCallerKey")}</CardTitle>
         </CardHeader>
         <div className="px-5 py-2">
-          {usage.by_key.length ? (
-            usage.by_key.map(([name, value]) => (
+          {usage.by_caller_key.length ? (
+            usage.by_caller_key.map(([name, value]) => (
               <div key={name} className="flex items-center justify-between border-b border-border py-3.5 last:border-b-0">
                 <div>
                   <strong className="block font-mono text-[11px]">{name}</strong>

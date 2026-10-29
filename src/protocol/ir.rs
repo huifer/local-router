@@ -285,6 +285,9 @@ pub struct ChatRequest {
     /// The working directory the caller ran from, when it reported one.
     /// The key the Usage page groups projects by.
     pub project: Option<String>,
+    /// Internal caller-key attribution; never forwarded upstream.
+    pub caller_key_id: Option<String>,
+    pub caller_key_label: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

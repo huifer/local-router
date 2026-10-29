@@ -2265,10 +2265,20 @@ async fn api_usage(
     });
     let by_project = usage::group_by(&records, |r| r.project.clone().unwrap_or_default());
     let by_key = usage::group_by(&records, |r| {
-        r.key_label
+        format!(
+            "{} / {}",
+            r.provider,
+            r.key_label
+                .clone()
+                .or_else(|| r.key_id.clone())
+                .unwrap_or_else(|| "default".into())
+        )
+    });
+    let by_caller_key = usage::group_by(&records, |r| {
+        r.caller_key_label
             .clone()
-            .or_else(|| r.key_id.clone())
-            .unwrap_or_else(|| "default".into())
+            .or_else(|| r.caller_key_id.clone())
+            .unwrap_or_else(|| "unknown".into())
     });
 
     // Per-hour request counts for the Requests timeline (line/bar toggle).
@@ -2388,7 +2398,9 @@ async fn api_usage(
     let by_model_json = map_to_array(by_model);
     let by_provider_json = map_to_array(by_provider);
     let by_agent_json = map_to_array(by_agent);
-    let by_key_json = map_to_array(by_key);
+    let by_key_json = map_to_array(by_key.clone());
+    let by_provider_key_json = by_key_json.clone();
+    let by_caller_key_json = map_to_array(by_caller_key);
     let by_project_json = map_to_array(by_project);
     let by_day_json = by_day
         .into_iter()
@@ -2416,6 +2428,8 @@ async fn api_usage(
         "by_provider_costs": by_provider_costs,
         "by_agent": by_agent_json,
         "by_key": by_key_json,
+        "by_provider_key": by_provider_key_json,
+        "by_caller_key": by_caller_key_json,
         "by_project": by_project_json,
         "by_day": by_day_json,
         "by_session": by_session_json,

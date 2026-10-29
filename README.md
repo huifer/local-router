@@ -184,8 +184,18 @@ curl -H "Authorization: Bearer <key>" \
 # → cost_usd / credits / unpriced 汇总 + per_provider[] 每个平台的账单
 ```
 
-控制台 Usage 页有「BY PLATFORM」面板：每个平台一段时期的请求数、token、
+控制台 Usage → Bills 现在分别提供：
+
+- **按上游 Provider API Key**：`provider / key_label`（没有 label 时显示 `key_id`）的请求数、失败数、输入/输出 token、缓存/推理 token、成本和 credits；
+- **按调用方 API Key**：哪个 agent 或客户端使用了 local-router 的哪把 caller key；
+- **按 agent**：从 User-Agent 识别的调用方。
+
+`/api/usage` 返回 `by_provider_key`、`by_caller_key` 和 `recent` 明细；命令行
+`local-router usage` 和 `--csv` 也包含这两个 API Key 维度。上游 Provider Key 与调用方
+Key 是两套不同的凭据，控制台会分开统计。控制台 Usage 页有「BY PLATFORM」面板：每个平台一段时期的请求数、token、
 美元成本、credits 消耗一目了然。可视化图表：
+
+
 
 - **按天柱状图**（近 14 天）：请求数 + 成本双维度；
 - **每平台成本横条**：美元与 credits 双条，谁是花钱大头一眼可见；
@@ -605,8 +615,22 @@ Requests can be recorded in JSONL and SQLite. The console and HTTP API expose
 request counts, input/output/cache/reasoning tokens, estimated USD cost, and
 subscription credits. Set `LOCAL_ROUTER_DISABLE_SQLITE=1` to use JSONL only.
 
+The Bills view and usage APIs separate two credential dimensions:
+
+- **Provider API keys**: `provider / key_label` (or `key_id`) with requests,
+  failures, input/output/cache/reasoning tokens, cost, and credits.
+- **Caller API keys**: the local-router key used by an agent or client to enter
+  the gateway, with the same token and cost totals.
+- **Agents**: grouped from the caller User-Agent.
+
+`/api/usage` returns `by_provider_key`, `by_caller_key`, and key fields in
+`recent`. `local-router usage` and its CSV output include both dimensions.
+Provider keys and caller keys are different credentials and are intentionally
+reported separately.
+
 The quota view shows per-account windows for session-backed providers. Account
 names and IDs are masked in the console and quota responses.
+
 
 ### 429 cooldown
 

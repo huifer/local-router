@@ -143,6 +143,8 @@ export interface UsageRecord {
   provider: string;
   key_id?: string;
   key_label?: string;
+  caller_key_id?: string;
+  caller_key_label?: string;
   group?: string;
   protocol: string;
   input_tokens: number;
@@ -242,6 +244,8 @@ export interface UsageData {
   by_day: [string, UsageTotals][];
   by_agent: [string, UsageTotals][];
   by_key: [string, UsageTotals][];
+  by_provider_key: [string, UsageTotals][];
+  by_caller_key: [string, UsageTotals][];
   by_project: [string, UsageTotals][];
   by_session: SessionRow[];
   requests_timeline: TimelinePoint[];

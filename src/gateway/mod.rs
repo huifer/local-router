@@ -468,6 +468,22 @@ async fn usage_summary(
     let by_model = usage::group_by(&recent, |r| r.model.clone());
     let by_provider = usage::group_by(&recent, |r| r.provider.clone());
     let by_day = usage::by_day(&recent);
+    let by_provider_key = usage::group_by(&recent, |r| {
+        format!(
+            "{} / {}",
+            r.provider,
+            r.key_label
+                .clone()
+                .or_else(|| r.key_id.clone())
+                .unwrap_or_else(|| "default".into())
+        )
+    });
+    let by_caller_key = usage::group_by(&recent, |r| {
+        r.caller_key_label
+            .clone()
+            .or_else(|| r.caller_key_id.clone())
+            .unwrap_or_else(|| "unknown".into())
+    });
     // The per-platform money view: what each provider cost, this period.
     let per_provider: Vec<Value> = by_provider
         .iter()
@@ -500,6 +516,8 @@ async fn usage_summary(
         "per_provider": per_provider,
         "by_model": by_model,
         "by_provider": by_provider,
+        "by_provider_key": by_provider_key,
+        "by_caller_key": by_caller_key,
         "by_day": by_day,
     }))
     .into_response()
@@ -571,6 +589,12 @@ pub(crate) fn allowed_keys(state: &AppState) -> Vec<String> {
     keys
 }
 
+#[derive(Debug, Clone)]
+struct CallerIdentity {
+    id: String,
+    label: String,
+}
+
 /// The key a caller presented, over any of the header styles agents use.
 pub(crate) fn presented_key(headers: &HeaderMap) -> Option<String> {
     if let Some(v) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
@@ -596,24 +620,53 @@ pub(crate) fn presented_key(headers: &HeaderMap) -> Option<String> {
 /// provider added by hand (or by the CLI) takes effect on the very next
 /// request — on any endpoint, not just the chat ones.
 async fn authorize(g: &Gateway, headers: &HeaderMap) -> Result<(), ApiError> {
-    g.state.sync().await;
-    check_auth(g, headers)
+    authorized_caller(g, headers).await.map(|_| ())
 }
 
-fn check_auth(g: &Gateway, headers: &HeaderMap) -> Result<(), ApiError> {
+async fn authorized_caller(g: &Gateway, headers: &HeaderMap) -> Result<CallerIdentity, ApiError> {
+    g.state.sync().await;
+    check_auth_identity(g, headers)
+}
+
+fn check_auth_identity(g: &Gateway, headers: &HeaderMap) -> Result<CallerIdentity, ApiError> {
     let Some(presented) = presented_key(headers) else {
         return Err(ApiError::Unauthorized(
             "this request has no key; send Authorization: Bearer <key>".into(),
         ));
     };
-    let keys = allowed_keys(&g.state);
-    if keys.is_empty() || keys.contains(&presented) {
-        Ok(())
-    } else {
-        Err(ApiError::Unauthorized("that key is not accepted".into()))
+    let Ok(config) = g.state.config.try_read() else {
+        return Err(ApiError::Internal("the configuration is busy".into()));
+    };
+    let env_match = std::env::var("LOCAL_ROUTER_DEFAULT_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty())
+        .is_some_and(|key| key.trim() == presented);
+    if env_match {
+        return Ok(CallerIdentity {
+            id: "env-default".into(),
+            label: "env-default".into(),
+        });
     }
+    if !config.settings.default_caller_key.is_empty()
+        && config.settings.default_caller_key == presented
+    {
+        return Ok(CallerIdentity {
+            id: "default".into(),
+            label: "default".into(),
+        });
+    }
+    if let Some(key) = config
+        .caller_keys
+        .iter()
+        .find(|k| k.enabled && k.key == presented)
+    {
+        return Ok(CallerIdentity {
+            id: key.id.clone(),
+            label: key.name.clone(),
+        });
+    }
+    Err(ApiError::Unauthorized("that key is not accepted".into()))
 }
-
 // -------------------------------------------------------------- handlers --
 
 async fn chat_completions(
@@ -1247,9 +1300,10 @@ async fn handle(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    if let Err(e) = authorize(&g, &headers).await {
-        return error_response(&e);
-    }
+    let caller = match authorized_caller(&g, &headers).await {
+        Ok(caller) => caller,
+        Err(e) => return error_response(&e),
+    };
     // The CLI or the web page may have changed the file.
     g.state.sync().await;
     let value: Value = match serde_json::from_slice(&body) {
@@ -1281,6 +1335,8 @@ async fn handle(
             )))
         }
     };
+    request.caller_key_id = Some(caller.id);
+    request.caller_key_label = Some(caller.label);
 
     // The agent's own session id, when it sent one: in the body like
     // Anthropic does, or a header like every other tool does.
@@ -1662,6 +1718,8 @@ async fn trae_attempt(
     rec.provider = "trae-cn".to_string();
     rec.key_id = Some(account_name.clone());
     rec.key_label = Some(session.account.nickname.clone());
+    rec.caller_key_id = request.caller_key_id.clone();
+    rec.caller_key_label = request.caller_key_label.clone();
     rec.group = plan.group_id.clone();
     rec.session_id = request.session_id.clone();
     rec.project = request.project.clone();
@@ -1762,6 +1820,8 @@ async fn qwen_attempt(
     rec.provider = "qwenwork".to_string();
     rec.key_id = Some(target.key_id.clone());
     rec.key_label = target.key_label.clone();
+    rec.caller_key_id = request.caller_key_id.clone();
+    rec.caller_key_label = request.caller_key_label.clone();
     rec.group = plan.group_id.clone();
     rec.session_id = request.session_id.clone();
     rec.project = request.project.clone();
@@ -2043,6 +2103,8 @@ async fn whole_attempt(
     rec.provider = target.provider_id.clone();
     rec.key_id = Some(target.key_id.clone());
     rec.key_label = target.key_label.clone();
+    rec.caller_key_id = request.caller_key_id.clone();
+    rec.caller_key_label = request.caller_key_label.clone();
     rec.group = plan.group_id.clone();
     rec.session_id = request.session_id.clone();
     rec.project = request.project.clone();
@@ -2161,6 +2223,8 @@ async fn stream_attempt(
     rec.provider = target.provider_id.clone();
     rec.key_id = Some(target.key_id.clone());
     rec.key_label = target.key_label.clone();
+    rec.caller_key_id = request.caller_key_id.clone();
+    rec.caller_key_label = request.caller_key_label.clone();
     rec.group = plan.group_id.clone();
     rec.session_id = request.session_id.clone();
     rec.project = request.project.clone();

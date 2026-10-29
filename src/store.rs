@@ -86,17 +86,19 @@ impl Store {
         };
         let result = conn.execute(
             "INSERT INTO usage_records
-             (time, model, provider, key_id, key_label, group_id, protocol,
+             (time, model, provider, key_id, key_label, caller_key_id, caller_key_label, group_id, protocol,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               reasoning_tokens, latency_ms, status, ok, error, agent, session_id,
               context, project, cost_usd, credits, priced)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
             rusqlite::params![
                 rec.time,
                 rec.model,
                 rec.provider,
                 rec.key_id,
                 rec.key_label,
+                rec.caller_key_id,
+                rec.caller_key_label,
                 rec.group,
                 rec.protocol,
                 rec.input_tokens,
@@ -294,10 +296,12 @@ pub struct AggregateRow {
 
 /// The columns the newest code writes. A database created by an older
 /// release may lack the later ones; each is added on open.
-const COLUMNS: [(&str, &str); 17] = [
+const COLUMNS: [(&str, &str); 19] = [
     ("provider", "TEXT NOT NULL DEFAULT ''"),
     ("key_id", "TEXT"),
     ("key_label", "TEXT"),
+    ("caller_key_id", "TEXT"),
+    ("caller_key_label", "TEXT"),
     ("group_id", "TEXT"),
     ("cache_read_tokens", "INTEGER NOT NULL DEFAULT 0"),
     ("cache_write_tokens", "INTEGER NOT NULL DEFAULT 0"),
@@ -328,6 +332,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             provider TEXT NOT NULL DEFAULT '',
             key_id TEXT,
             key_label TEXT,
+            caller_key_id TEXT,
+            caller_key_label TEXT,
             group_id TEXT,
             protocol TEXT NOT NULL DEFAULT '',
             input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -378,6 +384,8 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
             .unwrap_or_default(),
         key_id: row.get("key_id")?,
         key_label: row.get("key_label")?,
+        caller_key_id: row.get("caller_key_id")?,
+        caller_key_label: row.get("caller_key_label")?,
         group: row.get("group_id")?,
         protocol: row
             .get::<_, Option<String>>("protocol")?
@@ -426,6 +434,8 @@ mod tests {
         rec.session_id = Some("s-1".into());
         rec.project = Some("/tmp/work".into());
         rec.agent = Some("claude-code".into());
+        rec.caller_key_id = Some("caller-1".into());
+        rec.caller_key_label = Some("laptop".into());
         rec
     }
 
@@ -456,6 +466,8 @@ mod tests {
         assert_eq!(back.credits, Some(1.5));
         assert_eq!(back.session_id.as_deref(), Some("s-1"));
         assert_eq!(back.agent.as_deref(), Some("claude-code"));
+        assert_eq!(back.caller_key_id.as_deref(), Some("caller-1"));
+        assert_eq!(back.caller_key_label.as_deref(), Some("laptop"));
         let ctx = back.context.as_ref().unwrap();
         assert_eq!(ctx.window_tokens, 1000);
         assert_eq!(ctx.prompt_tokens, 100);

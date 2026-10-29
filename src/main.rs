@@ -2138,14 +2138,18 @@ async fn usage(args: UsageArgs) -> anyhow::Result<()> {
 
     if args.csv {
         println!(
-            "time,model,provider,input_tokens,output_tokens,cache_read,cache_write,latency_ms,ok,cost_usd,credits"
+            "time,model,provider,provider_key_id,provider_key_label,caller_key_id,caller_key_label,input_tokens,output_tokens,cache_read,cache_write,latency_ms,ok,cost_usd,credits"
         );
         for r in &recent {
             println!(
-                "{},{},{},{},{},{},{},{},{},{},{}",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
                 r.time,
                 r.model,
                 r.provider,
+                r.key_id.clone().unwrap_or_default(),
+                r.key_label.clone().unwrap_or_default(),
+                r.caller_key_id.clone().unwrap_or_default(),
+                r.caller_key_label.clone().unwrap_or_default(),
                 r.input_tokens,
                 r.output_tokens,
                 r.cache_read_tokens,
@@ -2177,6 +2181,36 @@ async fn usage(args: UsageArgs) -> anyhow::Result<()> {
         println!(
             "  {:<16} {:>5} req  {:>9} in  {:>8} out  ${:<8.4} {:>9.1} credits",
             provider, t.requests, t.input_tokens, t.output_tokens, t.cost_usd, t.credits
+        );
+    }
+    println!();
+    println!("by provider API key:");
+    for (key, t) in gateway::usage::group_by(&recent, |r| {
+        format!(
+            "{} / {}",
+            r.provider,
+            r.key_label
+                .clone()
+                .or_else(|| r.key_id.clone())
+                .unwrap_or_else(|| "default".into())
+        )
+    }) {
+        println!(
+            "  {:<32} {:>5} requests  {:>9} in  {:>8} out  ${:.4}",
+            key, t.requests, t.input_tokens, t.output_tokens, t.cost_usd
+        );
+    }
+    println!();
+    println!("by caller API key:");
+    for (key, t) in gateway::usage::group_by(&recent, |r| {
+        r.caller_key_label
+            .clone()
+            .or_else(|| r.caller_key_id.clone())
+            .unwrap_or_else(|| "unknown".into())
+    }) {
+        println!(
+            "  {:<24} {:>5} requests  {:>9} in  {:>8} out  ${:.4}",
+            key, t.requests, t.input_tokens, t.output_tokens, t.cost_usd
         );
     }
     println!();
