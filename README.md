@@ -1,5 +1,8 @@
 # local-router
 
+[中文](#中文) · [English](#english)
+
+## 中文
 一个本地 AI 网关：把你的所有模型服务商收进一个进程，给每个编码 agent
 （Claude Code / Codex / Gemini CLI / OpenCode / 任何吃 base URL 的工具）
 提供统一、可路由、可观测的模型接口。
@@ -78,6 +81,29 @@ local-router claude|codex|gemini|opencode <model>
 local-router workbuddy status|credits|login|checkin|models   # WorkBuddy 登录态
 local-router qwen status|credits|login|models                # QwenWork 设备流
 ```
+
+### 直接测试对话与 429 冷却
+
+控制台 Provider 详情抽屉里的「测试对话」和命令行使用同一条最小真实对话测试链路：
+
+```sh
+local-router provider test <provider-id>
+```
+
+如果 daemon 正在运行，CLI 会调用后台测试接口，因此和控制台共享冷却状态；QwenWork
+和 Trae CN 会使用各自的专用协议，不会被当作普通 OpenAI 上游。没有 daemon 时，CLI
+才会回退为直连测试。
+
+上游返回 HTTP 429 后，网关会让该 provider 默认安静 60 秒；连续 429 会指数退避，最长
+10 分钟。冷却期间网关在真正发送请求前跳过该 provider，路由组会尝试下一个成员，
+控制台和 CLI 测试也不会绕过冷却。查看状态：
+
+```sh
+curl http://127.0.0.1:3435/api/cooldowns
+```
+
+可以用 `LOCAL_ROUTER_COOLDOWN_SECS` 和 `LOCAL_ROUTER_COOLDOWN_MAX_SECS`（单位：秒）
+调整默认冷却时间。
 
 ## 配置
 
@@ -460,3 +486,191 @@ QwenWork 企业版（VPC / PAT）。
 ## License
 
 MIT
+
+---
+
+## English
+
+local-router is a local AI gateway that puts multiple model providers behind one
+process and gives coding agents (Claude Code, Codex, Gemini CLI, OpenCode, and
+any client that accepts a base URL) one routed, observable API.
+
+### Highlights
+
+- **One Rust binary**: gateway, React console, and CLI.
+- **Protocol translation**: OpenAI Chat, OpenAI Responses, Anthropic Messages,
+  and Gemini, including streaming, tools, reasoning blocks, and token usage.
+- **Routing groups**: ordered failover, rotation, usage-aware, smart, and weighted
+  routing, with sticky sessions, nested groups, and multiple keys.
+- **Session-backed providers**: WorkBuddy and QwenWork without API keys, with
+  account pools, renewal, quota visibility, and check-in support.
+- **Console**: provider, model, route, usage, session, project, context, quota,
+  billing, and settings views.
+- **Direct chat tests**: test a provider from the console or with
+  `local-router provider test <provider-id>`.
+- **429 cooldown**: after an upstream returns HTTP 429, local-router temporarily
+  stops sending requests to that provider and tries the next route target.
+- **Docker support**: multi-stage image with `/data` persistence.
+
+This project is an independent web and CLI implementation. It does not provide
+a desktop client.
+
+> For a five-minute setup, daily commands, troubleshooting, and common scenarios,
+> see [USAGE.md](USAGE.md).
+
+### Quick start
+
+Requirements: Rust 1.80+ and Node.js 24+ for building the console.
+
+```sh
+npm install && npm run build --prefix frontend
+cargo build --release
+./target/release/local-router
+```
+
+The gateway and console share `http://127.0.0.1:3435`.
+
+Docker:
+
+```sh
+docker compose up -d
+# or
+docker build -t local-router .
+docker run -p 3435:3435 -v lr-data:/data local-router
+```
+
+### Configure an agent
+
+```sh
+local-router provider add deepseek --key sk-xxx
+local-router claude deepseek/deepseek-chat
+local-router codex kimi/kimi-k2
+local-router gemini glm/glm-4.6
+local-router opencode deepseek/deepseek-chat
+```
+
+Or use environment variables:
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:3435/v1
+export OPENAI_API_KEY=local-router
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3435
+export ANTHROPIC_API_KEY=local-router
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3435
+export GEMINI_API_KEY=local-router
+```
+
+### CLI essentials
+
+```sh
+local-router serve [--port N] [--addr A] [--lan] [--no-console]
+local-router daemon start|stop|status|logs
+local-router provider list
+local-router provider test <provider-id>
+local-router models
+local-router usage --period today
+local-router doctor
+local-router dashboard
+local-router workbuddy status|credits|login|checkin|models
+local-router qwen status|credits|login|models
+```
+
+`provider test` sends a minimal real `ping` request and prints the latency and
+upstream response. When the daemon is running, the CLI uses the same console
+endpoint as the web button, so it shares the daemon's cooldown state. QwenWork
+and Trae CN use their dedicated protocols rather than a generic OpenAI request.
+
+### Configuration and local data
+
+By default, local-router stores its data in `~/.config/local-router/`; Docker
+uses `/data`. Set `LOCAL_ROUTER_HOME` to change it. Runtime credentials, session
+files, usage databases, and logs are local data and are intentionally excluded
+from this repository.
+
+Important files include:
+
+- `config.json`: providers, groups, settings, and caller keys.
+- `usage.jsonl` and `usage.db`: request usage and billing records.
+- `sessions.json` and `projects.json`: local observability metadata.
+- `workbuddy-session.json` and `qwen-session.json`: local login sessions.
+- `prices.json`: optional pricing overrides.
+
+Do not commit any of these runtime files. Use `.env` only through your local
+environment or a secret manager; never place real provider keys in source,
+issues, examples, or pull requests.
+
+### Usage, quotas, and billing
+
+Requests can be recorded in JSONL and SQLite. The console and HTTP API expose
+request counts, input/output/cache/reasoning tokens, estimated USD cost, and
+subscription credits. Set `LOCAL_ROUTER_DISABLE_SQLITE=1` to use JSONL only.
+
+The quota view shows per-account windows for session-backed providers. Account
+names and IDs are masked in the console and quota responses.
+
+### 429 cooldown
+
+When an upstream returns HTTP 429, local-router puts that provider into a cooldown:
+
+- first cooldown: 60 seconds;
+- repeated 429 responses: exponential backoff;
+- maximum cooldown: 10 minutes;
+- while cooling down, the gateway skips the provider before sending a request;
+- routing groups can continue with another member;
+- the console and CLI test do not bypass the cooldown.
+
+Inspect the current state:
+
+```sh
+curl http://127.0.0.1:3435/api/cooldowns
+```
+
+Adjust the defaults in seconds if needed:
+
+```sh
+LOCAL_ROUTER_COOLDOWN_SECS=30 \
+LOCAL_ROUTER_COOLDOWN_MAX_SECS=300 \
+local-router serve
+```
+
+### API endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI Chat, streaming or non-streaming |
+| `POST /v1/responses` | OpenAI Responses |
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1beta/models/{model}:generateContent` | Gemini |
+| `GET /v1/models` | Model catalog |
+| `GET /health` | Health check |
+| `POST /api/providers/{id}/test` | Direct provider chat test |
+| `GET /api/cooldowns` | Current 429 cooldowns |
+
+### Security and privacy
+
+- The gateway is local-first and binds to loopback by default.
+- Remote console/API access requires a configured caller key.
+- Console write requests validate the browser origin.
+- Provider keys are masked in the console and are not returned by normal provider APIs.
+- Prompt secret masking can redact API-key-like text and secret-shaped tool arguments.
+- Runtime sessions, tokens, usage data, and personal account data stay outside the repository.
+
+Read [SECURITY.md](SECURITY.md) before exposing the service with `--lan` or a
+container port mapping. Please report security vulnerabilities privately using
+the channel documented there; do not open a public issue for a vulnerability.
+
+### Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+cd frontend && npm run build
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
+[docs/CONFIG.md](docs/CONFIG.md) for configuration details.
+
+### License
+
+MIT License. See [LICENSE](LICENSE).
