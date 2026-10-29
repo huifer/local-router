@@ -61,5 +61,5 @@ lto = "thin"
 strip = true
 
 [dependencies.rusqlite]
-version = "0.32"
+version = "0.41"
 features = ["bundled"]
