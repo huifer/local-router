@@ -529,6 +529,19 @@ function KeyList({ provider }: { provider: Provider }) {
     }
   };
 
+  const setLimit = async (key: ProviderKey, raw: string) => {
+    const limit = raw.trim() ? Math.max(0, Number.parseInt(raw, 10) || 0) : 0;
+    try {
+      await api(`/api/providers/${encodeURIComponent(provider.id)}/keys/${encodeURIComponent(key.id)}`, {
+        method: "PATCH",
+        body: { max_concurrency: limit },
+      });
+      toast.success(t("providers.concurrencySaved"));
+    } catch (error) {
+      toast.error((error as Error).message);
+    }
+  };
+
   if (!provider.keys.length) {
     return (
       <div className="border-t border-border p-4">
@@ -553,6 +566,16 @@ function KeyList({ provider }: { provider: Provider }) {
               <Button variant="ghost" size="sm" onClick={() => reveal(key)} disabled={busy === key.id}>
                 {shown ? t("providers.keyHide") : t("providers.keyShow")}
               </Button>
+              <input
+                aria-label={t("providers.maxConcurrency")}
+                title={t("providers.maxConcurrencyHint")}
+                type="number"
+                min="0"
+                placeholder="∞"
+                defaultValue={key.max_concurrency ?? ""}
+                onBlur={(event) => void setLimit(key, event.currentTarget.value)}
+                className="h-7 w-14 border border-input bg-background px-1.5 text-center font-mono text-[10px]"
+              />
               <Button variant="ghost" size="sm" onClick={() => copy(key)}>
                 <Copy /> {t("providers.keyCopy")}
               </Button>

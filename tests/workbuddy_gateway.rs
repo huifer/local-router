@@ -230,6 +230,7 @@ async fn world_with(hold_when_exhausted: bool) -> (String, Seen, String) {
         chat_path: Some("/v2/chat/completions".into()),
         stream_only: true,
         hold_when_exhausted,
+        max_concurrency: None,
         media_models: Vec::new(),
         media_paths: None,
     });

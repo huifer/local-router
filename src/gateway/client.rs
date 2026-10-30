@@ -103,6 +103,8 @@ pub struct Target {
     pub provider_name: String,
     pub key_id: String,
     pub key_label: Option<String>,
+    /// Maximum in-flight requests for this target. None means unlimited.
+    pub max_concurrency: Option<usize>,
     pub secret: String,
     /// The model id the vendor knows.
     pub model: String,

@@ -78,6 +78,10 @@ pub struct ProviderKey {
     /// A friendly name, e.g. which team card this is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Maximum number of in-flight requests for this upstream API key.
+    /// None or zero means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
 }
 
 /// Where a provider's credential comes from.
@@ -111,6 +115,7 @@ impl ProviderKey {
             key: key.into(),
             enabled: true,
             label: None,
+            max_concurrency: None,
         }
     }
 }
@@ -201,6 +206,10 @@ pub struct Provider {
     /// window, and holding them would break working requests.
     #[serde(default)]
     pub hold_when_exhausted: bool,
+    /// Maximum in-flight requests for this provider. Stored API keys can
+    /// override it individually; session providers use it per account.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<usize>,
     /// The models this provider offers for image and video work.
     #[serde(default)]
     pub media_models: Vec<String>,
@@ -238,6 +247,7 @@ impl Default for Provider {
             chat_path: None,
             stream_only: false,
             hold_when_exhausted: false,
+            max_concurrency: None,
             media_models: Vec::new(),
             media_paths: None,
         }
@@ -889,6 +899,8 @@ pub struct AppState {
     pub sqlite: Option<crate::store::Store>,
     /// The in-process 429 cooldowns shared by gateway and console.
     pub cooldowns: crate::gateway::cooldown::Registry,
+    /// Per-provider/API-key concurrency gates shared by gateway and console.
+    pub concurrency: crate::gateway::concurrency::Registry,
     pub started: chrono::DateTime<chrono::Utc>,
     /// The address the web page actually listens on. Startup overlays the
     /// environment and the command line on the file; handlers that care —
@@ -909,6 +921,7 @@ impl AppState {
             store,
             sqlite: crate::store::Store::shared(),
             cooldowns: crate::gateway::cooldown::Registry::default(),
+            concurrency: crate::gateway::concurrency::Registry::default(),
             started: chrono::Utc::now(),
             web_bind: Arc::new(tokio::sync::RwLock::new(web_bind)),
             mtime: Arc::new(tokio::sync::Mutex::new(mtime)),
@@ -983,6 +996,7 @@ mod config_surface_tests {
                 key: "sk-1".into(),
                 enabled: true,
                 label: Some("l".into()),
+                max_concurrency: None,
             }],
             models: vec!["m".into()],
             auto_include: vec!["m-*".into()],
@@ -999,6 +1013,7 @@ mod config_surface_tests {
             chat_path: Some("/v2/chat".into()),
             stream_only: true,
             hold_when_exhausted: true,
+            max_concurrency: Some(3),
             media_models: vec!["img".into()],
             media_paths: None,
         });

@@ -88,11 +88,16 @@ local-router qwen status|credits|login|models                # QwenWork 设备�
 
 ```sh
 local-router provider test <provider-id>
+local-router provider concurrency <provider-id> <key-id|session> <limit>
 ```
 
 如果 daemon 正在运行，CLI 会调用后台测试接口，因此和控制台共享冷却状态；QwenWork
 和 Trae CN 会使用各自的专用协议，不会被当作普通 OpenAI 上游。没有 daemon 时，CLI
 才会回退为直连测试。
+
+`provider concurrency` 为单个上游 API Key 设置最大同时进行的请求数，超过限制的请求会排队；
+传入 `0` 取消限制。会话型 provider 使用 `session` 作为每个账号的 provider 级兜底限制，
+普通 Provider API Key 使用自己的 key id，并可覆盖 provider 级限制。
 
 上游返回 HTTP 429 后，网关会让该 provider 默认安静 60 秒；连续 429 会指数退避，最长
 10 分钟。冷却期间网关在真正发送请求前跳过该 provider，路由组会尝试下一个成员，
@@ -518,6 +523,9 @@ any client that accepts a base URL) one routed, observable API.
   billing, and settings views.
 - **Direct chat tests**: test a provider from the console or with
   `local-router provider test <provider-id>`.
+- **Per-key concurrency**: configure a queueing in-flight limit with
+  `local-router provider concurrency <provider-id> <key-id|session> <limit>`;
+  use `0` to remove the limit.
 - **429 cooldown**: after an upstream returns HTTP 429, local-router temporarily
   stops sending requests to that provider and tries the next route target.
 - **Docker support**: multi-stage image with `/data` persistence.
@@ -577,6 +585,7 @@ local-router serve [--port N] [--addr A] [--lan] [--no-console]
 local-router daemon start|stop|status|logs
 local-router provider list
 local-router provider test <provider-id>
+local-router provider concurrency <provider-id> <key-id|session> <limit>
 local-router models
 local-router usage --period today
 local-router doctor
@@ -589,6 +598,11 @@ local-router qwen status|credits|login|models
 upstream response. When the daemon is running, the CLI uses the same console
 endpoint as the web button, so it shares the daemon's cooldown state. QwenWork
 and Trae CN use their dedicated protocols rather than a generic OpenAI request.
+
+`provider concurrency` sets the maximum number of in-flight requests for one
+upstream API key. Requests beyond the limit wait in a queue; use `0` to remove
+the limit. For session-backed providers, `session` sets the provider-level
+fallback used per account; a stored API key can override the provider limit.
 
 ### Configuration and local data
 

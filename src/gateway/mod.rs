@@ -1,6 +1,7 @@
 //! The gateway: the HTTP surface every agent talks to.
 
 pub mod client;
+pub mod concurrency;
 pub mod cooldown;
 pub mod route;
 pub mod usage;
@@ -151,6 +152,8 @@ pub struct Gateway {
     media_tasks: Arc<Mutex<HashMap<String, MediaTask>>>,
     /// The SQLite store, when it is on.
     pub sqlite: Option<store::Store>,
+    /// Shared per-key in-flight request limits.
+    pub concurrency: concurrency::Registry,
     /// Shared with the console so a manual test cannot bypass a 429 gate.
     pub cooldowns: cooldown::Registry,
 }
@@ -158,12 +161,14 @@ pub struct Gateway {
 impl Gateway {
     pub fn new(state: AppState) -> Self {
         let cooldowns = state.cooldowns.clone();
+        let concurrency = state.concurrency.clone();
         Gateway {
             state,
             router: Arc::new(Router::new()),
             clients: Arc::new(Mutex::new(HashMap::new())),
             media_tasks: Arc::new(Mutex::new(HashMap::new())),
             cooldowns,
+            concurrency,
             sqlite: store::Store::shared(),
         }
     }
@@ -891,11 +896,17 @@ async fn media_target(g: &Gateway, requested: &str) -> Result<Target, ApiError> 
         .next()
         .map(|k| k.id.clone())
         .unwrap_or_else(|| "session".to_string());
+    let max_concurrency = provider
+        .enabled_keys()
+        .next()
+        .and_then(|k| k.max_concurrency)
+        .or(provider.max_concurrency);
     Ok(Target {
         provider_id: provider.id.clone(),
         provider_name: provider.name.clone(),
         key_id,
         key_label: None,
+        max_concurrency,
         secret,
         model,
         protocol: provider.protocol,
@@ -1712,6 +1723,10 @@ async fn trae_attempt(
         Some(target) => target.clone(),
         None => return error_response(&ApiError::Upstream("no Trae CN target".into())),
     };
+    let _concurrency_permit = g
+        .concurrency
+        .acquire(&format!("trae-cn:{}", account_name), target.max_concurrency)
+        .await;
     let mut trae_request = request.clone();
     trae_request.model = target.model.clone();
     let mut rec = usage::UsageRecord::new(&request.model, "trae-cn");
@@ -1814,6 +1829,13 @@ async fn qwen_attempt(
         None => return error_response(&ApiError::Upstream("no QwenWork target".into())),
     };
     let model = target.model.clone();
+    let _concurrency_permit = g
+        .concurrency
+        .acquire(
+            &format!("qwenwork:{}", account_name),
+            target.max_concurrency,
+        )
+        .await;
     let body = build_qwen_body(request, &model);
 
     let mut rec = usage::UsageRecord::new(&request.model, "qwenwork");
@@ -2111,6 +2133,13 @@ async fn whole_attempt(
     rec.agent = agent_user_agent.and_then(agent_from_user_agent);
     rec.context = Some(context.clone());
 
+    let _concurrency_permit = g
+        .concurrency
+        .acquire(
+            &format!("{}:{}", target.provider_id, target.key_id),
+            target.max_concurrency,
+        )
+        .await;
     let mut body = upstream_body(request, target.protocol, &target.model);
     // A vendor that only answers streaming requests is asked for a stream
     // even when the caller wants one whole reply.
@@ -2231,6 +2260,13 @@ async fn stream_attempt(
     rec.agent = agent_user_agent.and_then(agent_from_user_agent);
     rec.context = Some(context.clone());
 
+    let concurrency_permit = g
+        .concurrency
+        .acquire(
+            &format!("{}:{}", target.provider_id, target.key_id),
+            target.max_concurrency,
+        )
+        .await;
     let mut body = upstream_body(request, target.protocol, &target.model);
     if provider.stream_only {
         body["stream"] = json!(true);
@@ -2282,6 +2318,7 @@ async fn stream_attempt(
                 record_usage,
                 started,
                 g.sqlite.clone(),
+                concurrency_permit,
             ))
         }
         UpstreamReply::Whole { status, body } => {
@@ -2513,9 +2550,11 @@ fn build_stream(
     record_usage: bool,
     started: Instant,
     sqlite: Option<store::Store>,
+    concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let body_stream = async_stream::stream! {
+        let _concurrency_permit = concurrency_permit;
         let mut guard = UsageGuard {
             rec,
             path: usage_path,

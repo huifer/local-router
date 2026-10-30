@@ -194,6 +194,9 @@ const en: Dict = {
   "providers.keyCopy": "Copy",
   "providers.keyCopied": "Key copied: {name}",
   "providers.keyCopyFailed": "The key could not be copied",
+  "providers.maxConcurrency": "Max in-flight requests",
+  "providers.maxConcurrencyHint": "0 or empty means unlimited",
+  "providers.concurrencySaved": "Concurrency limit saved",
   "providers.noKeys": "No key stored for this provider.",
   "providers.signIn": "Sign in",
 
@@ -604,6 +607,9 @@ const zh: Dict = {
   "providers.keyCopy": "复制",
   "providers.keyCopied": "已复制密钥：{name}",
   "providers.keyCopyFailed": "密钥复制失败",
+  "providers.maxConcurrency": "最大并发请求数",
+  "providers.maxConcurrencyHint": "0 或留空表示不限制",
+  "providers.concurrencySaved": "并发限制已保存",
   "providers.noKeys": "该供应商还没有保存密钥。",
   "providers.signIn": "登录",
 

@@ -165,6 +165,7 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         chat_path: None,
         stream_only: false,
         hold_when_exhausted: false,
+        max_concurrency: None,
         media_models: Vec::new(),
         media_paths: None,
     }

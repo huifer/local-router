@@ -162,6 +162,7 @@ async fn a_stored_key_is_readable_on_loopback_only() {
         key: "sk-secret-value-123456".to_string(),
         enabled: true,
         label: Some("primary".to_string()),
+        max_concurrency: None,
     }];
     let _ = state
         .update(|config| {
@@ -194,6 +195,7 @@ async fn a_stored_key_is_readable_on_loopback_only() {
         key: "sk-secret-value-123456".to_string(),
         enabled: true,
         label: Some("primary".to_string()),
+        max_concurrency: None,
     }];
     remote
         .update(|config| {

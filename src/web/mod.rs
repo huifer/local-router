@@ -50,7 +50,10 @@ pub fn router(state: AppState) -> Router {
             patch(api_update_provider).delete(api_delete_provider),
         )
         .route("/api/providers/{id}/keys", post(api_add_key))
-        .route("/api/providers/{id}/keys/{key_id}", delete(api_delete_key))
+        .route(
+            "/api/providers/{id}/keys/{key_id}",
+            delete(api_delete_key).patch(api_update_key),
+        )
         .route(
             "/api/providers/{id}/keys/{key_id}/secret",
             get(api_provider_key_secret),
@@ -324,6 +327,7 @@ fn redact(provider: &Provider) -> Value {
             key: mask(&k.key),
             enabled: k.enabled,
             label: k.label.clone(),
+            max_concurrency: k.max_concurrency,
         })
         .collect();
     serde_json::to_value(p).unwrap_or(json!({}))
@@ -684,6 +688,8 @@ struct AddKey {
     key: String,
     #[serde(default)]
     label: Option<String>,
+    #[serde(default)]
+    max_concurrency: Option<usize>,
 }
 
 async fn api_add_key(
@@ -707,7 +713,47 @@ async fn api_add_key(
                 key: input.key,
                 enabled: true,
                 label: input.label,
+                max_concurrency: input.max_concurrency,
             });
+            Ok(())
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+        })?
+        .map_err(|e| (StatusCode::NOT_FOUND, Json(json!({"error": e}))))?;
+    Ok(Json(json!({"ok": true})))
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateKey {
+    #[serde(default)]
+    max_concurrency: Option<usize>,
+}
+
+async fn api_update_key(
+    State(state): State<AppState>,
+    Path((id, key_id)): Path<(String, String)>,
+    body: Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let input: UpdateKey = serde_json::from_slice(&body).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": e.to_string()})),
+        )
+    })?;
+    state
+        .update(|config| {
+            let Some(provider) = config.provider_mut(&id) else {
+                return Err("there is no provider with that id".to_string());
+            };
+            let Some(key) = provider.keys.iter_mut().find(|key| key.id == key_id) else {
+                return Err("there is no such key".to_string());
+            };
+            key.max_concurrency = input.max_concurrency.filter(|limit| *limit > 0);
             Ok(())
         })
         .await
@@ -1709,6 +1755,17 @@ async fn api_test_provider(
             Json(json!({"error": "this provider is cooling down after a 429; try again shortly"})),
         ));
     }
+    let test_key = provider.enabled_keys().next();
+    let test_key_id = test_key
+        .map(|key| key.id.clone())
+        .unwrap_or_else(|| "session".into());
+    let test_limit = test_key
+        .and_then(|key| key.max_concurrency)
+        .or(provider.max_concurrency);
+    let _concurrency_permit = state
+        .concurrency
+        .acquire(&format!("{}:{}", id, test_key_id), test_limit)
+        .await;
     let cooldowns = state.cooldowns.clone();
     // Session vendors have a dedicated wire protocol. Use the same real
     // request path as the gateway rather than pretending their endpoint is

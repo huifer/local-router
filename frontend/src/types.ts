@@ -30,6 +30,7 @@ export interface ProviderKey {
   key: string;
   enabled: boolean;
   label?: string;
+  max_concurrency?: number | null;
 }
 
 export interface ProviderAccount {
@@ -73,6 +74,8 @@ export interface Provider {
   stream_only?: boolean;
   /** The upstream is held back while its quota window is empty. */
   hold_when_exhausted?: boolean;
+  /** Provider-level in-flight request limit; API keys can override it. */
+  max_concurrency?: number | null;
   /** The models this provider offers for image and video work. */
   media_models?: string[];
   /** For a session-backed provider: who is signed in. */

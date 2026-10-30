@@ -183,6 +183,7 @@ async fn the_workbuddy_provider_needs_no_key() {
         chat_path: Some("/v2/chat/completions".into()),
         stream_only: true,
         hold_when_exhausted: false,
+        max_concurrency: None,
         media_models: Vec::new(),
         media_paths: None,
     };

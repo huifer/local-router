@@ -117,6 +117,7 @@ pub fn to_provider(preset: &Preset, key: Option<&str>) -> Provider {
         chat_path: preset.chat_path.clone(),
         stream_only: preset.stream_only,
         hold_when_exhausted: false,
+        max_concurrency: None,
         media_models: preset.media_models.clone(),
         media_paths: preset.media_paths.clone(),
     }
@@ -161,6 +162,7 @@ pub fn custom_provider(
         chat_path: None,
         stream_only: false,
         hold_when_exhausted: false,
+        max_concurrency: None,
         media_models: Vec::new(),
         media_paths: None,
     }

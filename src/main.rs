@@ -251,6 +251,12 @@ enum ProviderCmd {
     Media { id: String, models: Vec<String> },
     /// Send a tiny request to a provider.
     Test { id: String },
+    /// Set the maximum in-flight requests for one upstream API key (0 disables the limit).
+    Concurrency {
+        id: String,
+        key_id: String,
+        limit: usize,
+    },
     /// Add a key to a provider.
     Key { id: String, key: String },
     /// Show a provider's header rules.
@@ -709,6 +715,27 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                     println!("{id} did not answer: {err}");
                 }
             }
+        }
+        ProviderCmd::Concurrency { id, key_id, limit } => {
+            let display = {
+                let provider = config
+                    .provider_mut(&id)
+                    .with_context(|| format!("there is no provider called {id}"))?;
+                let value = (limit > 0).then_some(limit);
+                if key_id == "session" {
+                    provider.max_concurrency = value;
+                } else {
+                    let key = provider
+                        .keys
+                        .iter_mut()
+                        .find(|key| key.id == key_id)
+                        .with_context(|| format!("there is no key {key_id} on provider {id}"))?;
+                    key.max_concurrency = value;
+                }
+                value.map_or_else(|| "unlimited".into(), |n| n.to_string())
+            };
+            save_config(&config)?;
+            println!("{id}/{key_id} max concurrency: {display}");
         }
         ProviderCmd::Key { id, key } => {
             let count = {
