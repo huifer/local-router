@@ -96,7 +96,7 @@ local-router provider concurrency <provider-id> <key-id|session> <limit>
 才会回退为直连测试。
 
 `provider concurrency` 为单个上游 API Key 设置最大同时进行的请求数，超过限制的请求会排队；
-传入 `0` 取消限制。会话型 provider 使用 `session` 作为每个账号的 provider 级兜底限制，
+传入 `0` 取消限制。会话型 provider 使用 `session` 作为 provider 级兜底限制，
 普通 Provider API Key 使用自己的 key id，并可覆盖 provider 级限制。
 
 上游返回 HTTP 429 后，网关会让该 provider 默认安静 60 秒；连续 429 会指数退避，最长
@@ -602,7 +602,7 @@ and Trae CN use their dedicated protocols rather than a generic OpenAI request.
 `provider concurrency` sets the maximum number of in-flight requests for one
 upstream API key. Requests beyond the limit wait in a queue; use `0` to remove
 the limit. For session-backed providers, `session` sets the provider-level
-fallback used per account; a stored API key can override the provider limit.
+fallback; a stored API key can override the provider limit.
 
 ### Configuration and local data
 

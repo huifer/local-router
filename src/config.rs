@@ -207,7 +207,8 @@ pub struct Provider {
     #[serde(default)]
     pub hold_when_exhausted: bool,
     /// Maximum in-flight requests for this provider. Stored API keys can
-    /// override it individually; session providers use it per account.
+    /// override it individually; session-backed providers use it as a
+    /// provider-level fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
     /// The models this provider offers for image and video work.

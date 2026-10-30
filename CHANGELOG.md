@@ -10,7 +10,7 @@
 
 - **直接测试对话**：控制台 provider 抽屉新增「测试对话」，会发送一条最小 ping 并显示耗时；命令行使用 `local-router provider test <provider-id>`，输出耗时与上游回复。QwenWork/Trae CN 会走各自专用协议，不再被错误地当成普通 OpenAI 上游。
 - **API Key 级用量统计**：Usage/HTTP API/CLI 现在分开统计上游 Provider API Key 与 local-router 调用方 API Key，包含请求数、失败数、输入/输出/缓存/推理 token、美元成本与 credits；CSV 和最近请求明细也带上 Key 标识。
-- **单 Key 最大并发**：Provider API Key 可配置最大同时进行的请求数，超过限制的请求排队；支持 `provider concurrency <provider> <key-id|session> <limit>`，`0` 取消限制。会话型 provider 的 `session` 限制按账号生效。
+- **单 Key 最大并发**：Provider API Key 可配置最大同时进行的请求数，超过限制的请求排队；支持 `provider concurrency <provider> <key-id|session> <limit>`，`0` 取消限制。会话型 provider 的 `session` 使用 provider 级兜底限制。
 - **429 全局冷却**：任何上游返回 HTTP 429 后，该 provider 默认冷却 60 秒；连续 429 会指数退避，最长 10 分钟。冷却期间网关在发送前跳过它并尝试下一个路由目标，控制台/CLI 的测试也不会绕过冷却。可用 `LOCAL_ROUTER_COOLDOWN_SECS` 与 `LOCAL_ROUTER_COOLDOWN_MAX_SECS` 调整。
 
 - **每个账号一份独立额度 + 一键签到**：会话型 provider 的账号池里，每个账号
