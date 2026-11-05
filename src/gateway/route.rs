@@ -3,6 +3,12 @@
 //! A request names a model: either `provider/model` or `group/id`. The
 //! router turns that name into an ordered list of *targets* — a provider, a
 //! key and a model — that the gateway tries in turn until one answers.
+//!
+//! A name that arrives bare (`claude-sonnet-4-5`, no prefix) is resolved
+//! too, when exactly one provider serves it. A gateway in front of us may
+//! have stripped the prefix before forwarding — a nested gateway, one
+//! local-router in front of another, does exactly that — and clients like
+//! Claude Code send bare names too.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -146,12 +152,11 @@ impl Router {
             return self.plan_group(config, group, session, has_history).await;
         }
 
-        let (provider_id, model) = Config::split_model(requested).ok_or_else(|| {
-            ApiError::BadRequest(format!(
-                "{requested} is not a model id; use provider/model or group/id"
-            ))
-        })?;
-        let provider = config.provider(provider_id).ok_or_else(|| {
+        let (provider_id, model) = match Config::split_model(requested) {
+            Some((provider_id, model)) => (provider_id.to_string(), model.to_string()),
+            None => Self::resolve_bare_model(config, requested)?,
+        };
+        let provider = config.provider(&provider_id).ok_or_else(|| {
             ApiError::NotFound(format!("there is no provider called {provider_id}"))
         })?;
         if !provider.enabled {
@@ -159,12 +164,12 @@ impl Router {
                 "the provider {provider_id} is turned off"
             )));
         }
-        if !provider.models.iter().any(|m| m == model) {
+        if !provider.models.iter().any(|m| m == &model) {
             return Err(ApiError::NotFound(format!(
                 "the provider {provider_id} does not serve {model}"
             )));
         }
-        let targets = targets_for(provider, model, requested);
+        let targets = targets_for(provider, &model, requested);
         if targets.is_empty() {
             return Err(ApiError::BadRequest(format!(
                 "the provider {provider_id} has no usable key"
@@ -178,6 +183,33 @@ impl Router {
             routing: None,
             reason,
         })
+    }
+
+    /// A model id that arrives without a provider prefix.
+    ///
+    /// When exactly one enabled provider serves that name, it is the one
+    /// meant. When several do, guessing would pick one at random, so the
+    /// caller is asked to be specific instead.
+    fn resolve_bare_model(config: &Config, id: &str) -> Result<(String, String), ApiError> {
+        let mut found: Option<&str> = None;
+        for provider in &config.providers {
+            if !provider.enabled || !provider.models.iter().any(|m| m == id) {
+                continue;
+            }
+            if let Some(previous) = found {
+                return Err(ApiError::BadRequest(format!(
+                    "{id} is served by both {previous} and {}; use provider/model or group/id",
+                    provider.id
+                )));
+            }
+            found = Some(provider.id.as_str());
+        }
+        match found {
+            Some(provider_id) => Ok((provider_id.to_string(), id.to_string())),
+            None => Err(ApiError::BadRequest(format!(
+                "{id} is not a model id; use provider/model or group/id"
+            ))),
+        }
     }
 
     async fn plan_group(

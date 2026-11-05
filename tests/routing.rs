@@ -80,6 +80,57 @@ fn split_model_needs_both_halves() {
 }
 
 #[tokio::test]
+async fn a_bare_model_id_resolves_to_the_only_provider_serving_it() {
+    // A gateway in front of us may strip the prefix before forwarding.
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],
+        vec![],
+    );
+    let router = Router::new();
+    let plan = router.plan(&config, "m2", None, true).await.unwrap();
+    assert_eq!(plan.targets.len(), 1);
+    assert_eq!(plan.targets[0].provider_id, "b");
+    assert_eq!(plan.targets[0].model, "m2");
+}
+
+#[tokio::test]
+async fn a_bare_model_id_served_twice_is_refused() {
+    // Two providers offer the same name: picking one would be a coin flip.
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m1"], 1)],
+        vec![],
+    );
+    let router = Router::new();
+    let err = router.plan(&config, "m1", None, true).await.unwrap_err();
+    assert!(err.to_string().contains("both a and b"));
+    // The prefixed form still works and picks the one that was asked for.
+    let plan = router.plan(&config, "b/m1", None, true).await.unwrap();
+    assert_eq!(plan.targets[0].provider_id, "b");
+}
+
+#[tokio::test]
+async fn a_bare_model_id_nobody_serves_is_an_error() {
+    let config = config_with(vec![provider("a", &["m1"], 1)], vec![]);
+    let router = Router::new();
+    let err = router.plan(&config, "nope", None, true).await.unwrap_err();
+    assert!(err.to_string().contains("not a model id"));
+}
+
+#[tokio::test]
+async fn a_nested_gateway_can_forward_bare_model_ids() {
+    // The inner gateway receives what the outer one forwarded: a bare name.
+    let inner = config_with(vec![provider("claude", &["claude-sonnet-4-5"], 1)], vec![]);
+    let router = Router::new();
+    let plan = router
+        .plan(&inner, "claude-sonnet-4-5", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets[0].provider_id, "claude");
+    // And what it sends upstream is the vendor's own id, not the prefix.
+    assert_eq!(plan.targets[0].model, "claude-sonnet-4-5");
+}
+
+#[tokio::test]
 async fn order_group_tries_members_in_order() {
     let config = config_with(
         vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],

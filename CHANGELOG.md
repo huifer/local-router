@@ -8,6 +8,28 @@
 
 ### Added
 
+- **多机级联（主网关 + 异地上游节点）**：想在美国的 IP 出到 Anthropic、而所有
+  agent 都连香港的网关，现在不用改代码也不用发明节点机制——**把另一台机器上的
+  local-router 当成一个普通上游加进来**就行：
+  ```sh
+  # 香港主网关
+  local-router provider add claude-us --url https://us.example.com \
+    --key <上游节点的 caller-key> --protocol anthropic
+  ```
+  跨机访问必须配 caller key（一把 key 都没有时网关拒绝一切请求），TLS 不内置、
+  公网暴露需自备 caddy/nginx 反代或 Cloudflare Tunnel/Tailscale；冷却是每台实例
+  独立的，trace id 逐层下传（两边的链路是同一条）。示例配置与一个不需要真实
+  API key 的本机验证脚本见 [examples/multi-machine](examples/multi-machine/README.md)。
+- **裸模型名也能路由**：模型名不带 `provider/` 前缀时，只要**有且仅有一个**上游
+  提供它就直接用它（两个都提供会报 `is served by both …` 并把两家列出来）。这让
+  Claude Code 这类发裸模型名的客户端不用改配置，也让级联的两台机器模型名保持
+  一致就能直接跑——主网关转发时剥掉自己的前缀，对面收到的正是裸名。
+- **`local-router provider add --protocol`**：自定义上游现在能直接指定协议
+  （`openai_chat` / `openai_responses` / `anthropic` / `gemini`），之前只有交互式
+  控制台支持这个参数，命令行会报 `unexpected argument '--protocol'`。
+
+### Added
+
 - **会话 ↔ 上游调用的链路追踪**：一个大任务被拆成很多次模型调用时，现在能
   回答「这次会话一共调了谁、调了几次、卡在哪一步」：
   - 每个请求开一个 **span**，每次上游尝试（成功、失败、降级都算）再开一个

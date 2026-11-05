@@ -1,0 +1,40 @@
+{
+  "providers": [
+    {
+      "id": "claude-us",
+      "name": "Claude via the US node",
+      "kind": "custom",
+      "enabled": true,
+      "protocol": "anthropic",
+      "base_url": "https://us.example.com",
+      "keys": [{ "id": "k1", "key": "us-caller-key", "enabled": true }],
+      "models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
+      "catalog": "claude"
+    }
+  ],
+  "groups": [
+    {
+      "id": "claude",
+      "name": "Claude (routed through the US node)",
+      "models": [
+        "claude-us/claude-opus-4-5",
+        "claude-us/claude-sonnet-4-5",
+        "claude-us/claude-haiku-4-5"
+      ],
+      "routing": "order",
+      "stays": "auto",
+      "listed": true
+    }
+  ],
+  "settings": {
+    "gateway_port": 3435,
+    "gateway_addr": "0.0.0.0",
+    "console": true,
+    "record_usage": true,
+    "default_caller_key": "",
+    "locale": "zh-CN"
+  },
+  "caller_keys": [
+    { "id": "k1", "name": "laptop", "key": "hk-caller-key", "enabled": true }
+  ]
+}

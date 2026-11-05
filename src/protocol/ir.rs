@@ -39,6 +39,21 @@ impl Protocol {
             Protocol::QwenWork => "qwenwork",
         }
     }
+
+    /// Read a protocol back from the name a config file or a command line
+    /// uses. `qwenwork` is not among them: it is a session-based provider
+    /// the local `qwen` module drives, not a generic HTTP endpoint.
+    pub fn parse(name: &str) -> Option<Protocol> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "openai_chat" | "openai-chat" | "openai" => Some(Protocol::OpenAiChat),
+            "openai_responses" | "openai-responses" | "responses" => {
+                Some(Protocol::OpenAiResponses)
+            }
+            "anthropic" | "claude" | "messages" => Some(Protocol::Anthropic),
+            "gemini" | "google" => Some(Protocol::Gemini),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -11,6 +11,8 @@
 - **四种协议互译**：OpenAI Chat / OpenAI Responses / Anthropic / Gemini，
   任意「入口 × 上游」组合（流式、工具调用、思考块、token 用量）
 - **路由组**：order / rotate / usage / smart / weight，故障转移、会话粘性、嵌套组、多 key
+- **多机级联**：上游在另一台机器上时，把它当普通上游加进来即可——异地出口、
+  统一路由、链路互通
 - **订阅登录态上游**：WorkBuddy、QwenWork（千问办公）免 key 接入，
   自动续期、自动签到
 - **控制台**：React + TypeScript + Vite 构建的服务商 / 模型 / 路由 / 用量 /
@@ -511,12 +513,35 @@ local-router claude group/backup
 - `hold_when_exhausted`：账户配额窗口空了就不再路由到该上游（默认关；
   实测 WorkBuddy 在额度为 0 时仍可服务，所以不要对它开）
 
+## 多机级联：上游在另一台机器上
+
+想在美国的 IP 出到 Anthropic、而所有 agent 都连香港的网关——**把另一台机器上
+的 local-router 当成一个普通上游加进来**就行，不用发明节点机制：
+
+```sh
+# 香港主网关
+local-router provider add claude-us \
+  --url https://us.example.com --key <上游节点的 caller-key> --protocol anthropic
+local-router provider expose claude-us claude-opus-4-5,claude-sonnet-4-5
+local-router group add claude --models claude-us/claude-sonnet-4-5 --routing order
+```
+
+- 跨机访问必须配 **caller key**（一把 key 都没有时网关拒绝一切请求）
+- **TLS 不内置**：公网暴露用 caddy/nginx 反代，或 Cloudflare Tunnel / Tailscale
+- **trace id 逐层下传**：两边的链路是同一条，在任意一边都能查全
+- 冷却是**每台实例独立**的；主网关对「上游节点」这个上游另有一份冷却
+- 每加一台节点要在主网关手动 `provider add` 一次，没有自动发现
+
+示例配置、可本机跑的验证脚本（不需要真实 API key）、以及「上游那台其实只
+需要跑个 nginx 反代」的更简形态，见
+[examples/multi-machine](examples/multi-machine/README.md)。
+
 ## 开发
 
 ```sh
 cargo fmt --all -- --check   # 格式
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                   # 228 个测试
+cargo test                   # 293 个测试
 #   src/ 内是 Rust 原生单元测试（#[cfg(test)]）：协议 IR 与四协议往返、
 #   COSY 信封、配置/价目/预设/会话/项目、用量聚合、上下文估算、
 #   URL 与帧解析、仪表盘渲染、控制台守卫源校验

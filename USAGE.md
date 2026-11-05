@@ -334,6 +334,23 @@ curl $BASE/v1/messages/count_tokens -H "x-api-key: $KEY" \
 `api-key`。key 取 `LOCAL_ROUTER_DEFAULT_KEY` → 设置里的默认 key → 任一
 caller key；一把都没有时**拒绝一切请求**。
 
+### 2.5.1 模型名怎么写
+
+网关认三种写法：
+
+| 写法 | 例子 | 什么时候用 |
+| --- | --- | --- |
+| `provider/model` | `deepseek/deepseek-chat` | 点名某家的某个模型 |
+| `group/id` | `group/backup` | 走路由组（用谁、怎么 failover 由组里定） |
+| 裸模型名 | `deepseek-chat` | **恰好一个**上游提供这个模型时，直接用它 |
+
+裸名的判定：**有且仅有一个**上游提供它就用它；两个都提供会报
+`is served by both a and b`（让你写清楚用 `provider/model`）；一个都没有
+照旧报 `not a model id`。
+
+裸名还有两个用处：一是 Claude Code 这类客户端发的是裸模型名；二是**级联**
+——上游在另一台机器上时，主网关转发的模型名会去掉自己的前缀，对面收到的
+就是裸名（见「场景 M」）。
 
 ### 2.6 开机自启（以后不用再手动启动）
 
@@ -584,6 +601,36 @@ curl http://127.0.0.1:3435/v1/chat/completions \
 
 `x-task-id` 是可选的子任务名：编排层知道自己的子 agent 边界时带上，
 链路里就能分出「第几步」。不带也能用，只是少一层。
+
+### 场景 M：上游在另一台机器上（异地出口）
+
+想让请求从美国的 IP 出到 Anthropic，而 agent 都连香港的网关——**级联**，
+不用改代码，也不用发明什么节点机制：**把另一台机器上的 local-router 当成
+一个普通上游加进来**。
+
+```sh
+# 美国那台：跑一个自己的 local-router，指向 Anthropic
+local-router provider add anthropic --key sk-ant-xxx
+# 并给它配一把 caller key（跨机访问必须配，一把 key 都没有时拒绝一切请求）
+
+# 香港这台：把美国那台当成一个普通上游
+local-router provider add claude-us \
+  --url https://us.example.com --key <美国那台的 caller-key> --protocol anthropic
+local-router provider expose claude-us claude-opus-4-5,claude-sonnet-4-5,claude-haiku-4-5
+local-router group add claude \
+  --models claude-us/claude-opus-4-5,claude-us/claude-sonnet-4-5,claude-us/claude-haiku-4-5 \
+  --routing order
+```
+
+两边都用 `provider/model` 命名；trace id 逐层下传，**两边的链路是同一条**，
+在任意一边都能查全。TLS 不内置，公网暴露用 caddy/nginx 反代或 Cloudflare
+Tunnel/Tailscale。
+
+完整配置、可本机跑的验证脚本（不需要真实 API key）、以及「美国那台其实只
+需要跑个 nginx 反代」的更简形态，见
+[examples/multi-machine](examples/multi-machine/README.md)。
+
+---
 
 ## 4. 配置与文件
 

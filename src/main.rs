@@ -272,6 +272,10 @@ enum ProviderCmd {
         /// The base url, for a custom provider.
         #[arg(long)]
         url: Option<String>,
+        /// The protocol the upstream speaks: openai_chat, openai_responses,
+        /// anthropic or gemini.
+        #[arg(long, value_parser = parse_protocol)]
+        protocol: Option<protocol::ir::Protocol>,
         /// The models to expose, comma separated.
         #[arg(long, value_delimiter = ',')]
         models: Vec<String>,
@@ -592,6 +596,13 @@ fn save_config(config: &Config) -> anyhow::Result<()> {
     Store::new().save(config)
 }
 
+/// Read a protocol name from the command line.
+fn parse_protocol(name: &str) -> Result<protocol::ir::Protocol, String> {
+    protocol::ir::Protocol::parse(name).ok_or_else(|| {
+        format!("unknown protocol {name}; use openai_chat, openai_responses, anthropic or gemini")
+    })
+}
+
 async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
     let mut config = load_config()?;
     match cmd {
@@ -600,6 +611,7 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
             key,
             name,
             url,
+            protocol,
             models,
         } => {
             let provider = match presets::get(&preset) {
@@ -611,6 +623,9 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                     if !models.is_empty() {
                         p.models = models;
                     }
+                    if let Some(protocol) = protocol {
+                        p.protocol = protocol;
+                    }
                     p
                 }
                 None => {
@@ -620,7 +635,7 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                         &name,
                         url.as_deref(),
                         None,
-                        protocol::ir::Protocol::OpenAiChat,
+                        protocol.unwrap_or(protocol::ir::Protocol::OpenAiChat),
                         key.as_deref(),
                         &models,
                     );

@@ -14,6 +14,7 @@ use std::io::Write;
 use anyhow::Context;
 
 use crate::config::{Config, Store};
+use crate::protocol::ir::Protocol;
 use crate::{gateway, presets};
 
 /// Commands the console understands. One keyword, mostly one argument.
@@ -264,27 +265,26 @@ async fn add(rest: &[&str]) -> anyhow::Result<()> {
         );
     };
     // 自定义上游（名字不在内置预设里）需要 --url 或 --name；协议可选。
-    let protocol_value = protocol.as_deref().map(clean_protocol);
+    let protocol_value = protocol
+        .as_deref()
+        .map(|raw| Protocol::parse(raw).unwrap_or(Protocol::OpenAiChat));
     if presets::get(&preset).is_none() && (url.is_some() || name.is_some()) {
         let name = name.clone().unwrap_or_else(|| preset.clone());
-        let id = slug(&name);
         super::provider_cmd(crate::ProviderCmd::Add {
             preset: "custom".into(),
             key,
             name: Some(name),
             url,
+            protocol: protocol_value,
             models,
         })
         .await?;
-        // 协议不是默认值时补一条设置（Add 没有 protocol 参数，用 update）。
-        if let Some(p) = protocol_value {
-            set_protocol(&id, p).await?;
-        }
         return Ok(());
     }
     if let Some(p) = protocol_value {
         anyhow::bail!(
-            "内置厂商的协议是预设好的（{preset}）。--protocol 只用于自定义上游：\n  add <名字> --url <地址> --protocol {p}"
+            "内置厂商的协议是预设好的（{preset}）。--protocol 只用于自定义上游：\n  add <名字> --url <地址> --protocol {}",
+            p.as_str()
         );
     }
     super::provider_cmd(crate::ProviderCmd::Add {
@@ -292,20 +292,10 @@ async fn add(rest: &[&str]) -> anyhow::Result<()> {
         key,
         name,
         url,
+        protocol: None,
         models,
     })
     .await
-}
-
-/// `openai` / `anthropic` / `claude` / `gemini` / `responses` / `chat` …
-/// 都收，归一成网关认的协议名。
-fn clean_protocol(raw: &str) -> String {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "anthropic" | "claude" | "messages" => "anthropic".into(),
-        "gemini" | "google" => "gemini".into(),
-        "responses" | "openai_responses" | "openai-responses" => "openai_responses".into(),
-        _ => "openai_chat".into(), // openai / chat / openai_chat / 其它一律按 OpenAI 兼容
-    }
 }
 
 /// 清洗用户粘贴的密钥：去掉中文引号、直引号与空白。
@@ -316,46 +306,6 @@ fn clean_key(raw: &str) -> String {
         .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”' || c == '‘' || c == '’')
         .trim()
         .to_string()
-}
-
-fn slug(name: &str) -> String {
-    let mut out = String::new();
-    for ch in name.trim().chars() {
-        // Unicode letters count too: a Chinese vendor name ("七牛云") must
-        // not collapse into an empty slug.
-        if ch.is_alphanumeric() {
-            out.extend(ch.to_lowercase());
-        } else if !out.is_empty() && !out.ends_with('-') {
-            out.push('-');
-        }
-    }
-    let out = out.trim_matches('-').to_string();
-    if out.is_empty() {
-        "custom".to_string()
-    } else {
-        out
-    }
-}
-
-/// 给刚建的自定义上游设置协议（Add 命令本身不带 protocol）。
-async fn set_protocol(id: &str, protocol: String) -> anyhow::Result<()> {
-    let parsed = match protocol.as_str() {
-        "anthropic" => crate::protocol::ir::Protocol::Anthropic,
-        "gemini" => crate::protocol::ir::Protocol::Gemini,
-        "openai_responses" => crate::protocol::ir::Protocol::OpenAiResponses,
-        _ => crate::protocol::ir::Protocol::OpenAiChat,
-    };
-    let config = load()?;
-    let mut config = config;
-    {
-        let Some(p) = config.provider_mut(id) else {
-            return Ok(()); // provider 刚建好，理论上不会缺
-        };
-        p.protocol = parsed;
-    }
-    Store::new().save(&config)?;
-    println!("  protocol    {protocol}");
-    Ok(())
 }
 
 /// WorkBuddy：login / status / credits / models / checkin / accounts / use。

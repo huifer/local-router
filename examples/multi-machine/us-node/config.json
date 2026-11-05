@@ -1,0 +1,27 @@
+{
+  "providers": [
+    {
+      "id": "claude",
+      "name": "Claude (reachable from the US node)",
+      "kind": "custom",
+      "enabled": true,
+      "protocol": "anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "keys": [{ "id": "ant", "key": "sk-ant-REPLACE_ME", "enabled": true }],
+      "models": ["claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"],
+      "catalog": "claude"
+    }
+  ],
+  "groups": [],
+  "settings": {
+    "gateway_port": 3445,
+    "gateway_addr": "0.0.0.0",
+    "console": false,
+    "record_usage": true,
+    "default_caller_key": "",
+    "locale": "zh-CN"
+  },
+  "caller_keys": [
+    { "id": "k1", "name": "hk-gateway", "key": "us-caller-key", "enabled": true }
+  ]
+}
