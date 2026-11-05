@@ -74,7 +74,7 @@ local-router web [--port N]
 local-router daemon start  [--port N] [--addr A] [--lan]
 local-router daemon status | stop | logs
 
-local-router provider add <preset|名字> --key sk-… [--url …] [--models a,b]
+local-router provider add <preset|名字> --key sk-… [--url …] [--protocol anthropic] [--models a,b]
 local-router provider list | rm | models | expose | media | test | key
 local-router models                            # 模型目录
 local-router group add <名字> --models a/m1,b/m2 --routing order | list | rm
@@ -528,6 +528,8 @@ local-router group add claude --models claude-us/claude-sonnet-4-5 --routing ord
 
 - 跨机访问必须配 **caller key**（一把 key 都没有时网关拒绝一切请求）
 - **TLS 不内置**：公网暴露用 caddy/nginx 反代，或 Cloudflare Tunnel / Tailscale
+- **模型名不用绕**：主网关转发时剥掉自己的前缀，裸模型名（有且仅有一个上游提供时）
+  直接在上游节点路由——两台机器模型名保持一致即可
 - **trace id 逐层下传**：两边的链路是同一条，在任意一边都能查全
 - 冷却是**每台实例独立**的；主网关对「上游节点」这个上游另有一份冷却
 - 每加一台节点要在主网关手动 `provider add` 一次，没有自动发现
@@ -592,6 +594,12 @@ any client that accepts a base URL) one routed, observable API.
   and Gemini, including streaming, tools, reasoning blocks, and token usage.
 - **Routing groups**: ordered failover, rotation, usage-aware, smart, and weighted
   routing, with sticky sessions, nested groups, and multiple keys.
+- **Multi-machine cascade**: point a provider at another local-router (or any
+  OpenAI/Anthropic/Gemini-compatible endpoint) to route through an overseas
+  egress — unified routing, failover, cooldowns, and one trace across hops.
+  Bare model ids resolve when exactly one provider serves them, so both
+  machines can keep the same model names. See
+  [examples/multi-machine](examples/multi-machine/README.md).
 - **Session-backed providers**: WorkBuddy and QwenWork without API keys, with
   account pools, renewal, quota visibility, and check-in support.
 - **Console**: provider, model, route, usage, session, project, context, quota,

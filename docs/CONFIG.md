@@ -108,7 +108,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `protocol` | 上游说哪种话 | `openai_chat` / `openai_responses` / `anthropic` / `gemini` / `qwenwork` |
 | `base_url` 等四个 | 同一家的不同协议各一个地址 | 留空则回落到 `base_url` |
 | `keys` | 这个家的多把 key | 故障时逐把试 |
-| `models` | **对外暴露的模型白名单** | 路由到没列出的模型会 404 |
+| `models` | **对外暴露的模型白名单**，也是**转发给上游的模型 id** | 路由到没列出的模型会 404；级联时外层可以直接写下游认识的 id（见 [examples/multi-machine](../examples/multi-machine/README.md)） |
 | `auto_include` | glob（只支持 `*`） | 刷新模型时匹配的自动并入 `models` |
 | `headers` | 每个请求都带的静态头 | 值里 `{version}`/`{platform}`/`{arch}` 会展开 |
 | `user_agent` | UA 模板 | 同样支持占位符；不设则按 `send_agent_user_agent` 透传 agent 的 |
@@ -252,6 +252,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | 遮蔽的密钥模式 | 前缀型（`sk-`/`ghp_`/`AKIA`/`AIza`/`xox`/JWT）+ 长 hex（≥24 且含字母数字） |
 | `auto_include` 的 glob 语法 | 只支持 `*`（任意位置），不支持 `?`/字符类/正则 |
 | 会话粘性的判定 | `stays: turn` 看请求里有没有 assistant/tool 轮次 |
+| 裸模型名的判定 | 不带 `provider/` 前缀时，有且仅有一个上游提供它就直接路由；两个都提供报 `is served by both a and b`，一个都没有报 `not a model id`。组名不参与裸名判定（组仍用 `group/<id>`） |
 | 用量估算口径 | 约 3.6 字符/token |
 | 安全模型 | 回环免鉴权、Origin 校验、`config.json` 0600 |
 

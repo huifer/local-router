@@ -75,6 +75,12 @@ local-router provider add workbuddy
 
 # ③ 有 QwenWork（千问办公）个人账号：免 key，浏览器登录一次
 local-router qwen login
+
+# ④ 自定义 / 中转上游：自己给地址和协议
+local-router provider add 我的中转 \
+  --url https://api.example.com/v1 --key sk-xxx --protocol anthropic
+#    --protocol 可选：openai_chat（默认）/ openai_responses / anthropic / gemini
+#    也可以指向另一台 local-router（级联，见「场景 M」）
 ```
 
 厂商 id 记不住？`local-router provider list` 看已配的，
@@ -239,6 +245,7 @@ local-router prices                  # 当前价目表
 
 # 上游
 local-router provider add <preset> --key sk-xxx
+local-router provider add <名字> --url https://… --key sk-xxx --protocol anthropic   # 自定义上游（协议默认 openai_chat）
 local-router provider list
 local-router provider expose deepseek deepseek-chat deepseek-reasoner   # 改暴露的模型
 local-router provider models deepseek          # 拉厂商自己的模型列表
@@ -723,6 +730,17 @@ A: `local-router provider test <id>` 单测一把 key；再 `local-router doctor
 
 **Q: 响应是流式但我想要整段**
 A: 调用方不传 `stream` 即可；上游只支持流式时，网关会收流再拼成整段。
+
+**Q: 报 "is not a model id; use provider/model or group/id"**
+A: 模型名必须是 `provider/model`、`group/id`，或**恰好只有一个上游提供**的裸名
+（见 2.5.1）。一个都没有时检查 `local-router models` 里有没有这个模型
+（provider 的 `models` 是白名单）。
+
+**Q: 报 "is served by both a and b"**
+A: 两个上游都提供同一个裸模型名，网关不猜。写清楚 `provider/model` 即可。
+
+**Q: 报 "there is no provider called X"**
+A: provider id 拼错；或它开了 `group_only`（只能通过路由组访问，不能直接点名）。
 
 ### 诊断命令
 
