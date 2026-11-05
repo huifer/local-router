@@ -58,6 +58,10 @@ pub struct UsageRecord {
     /// The caller's own session id, when it sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// The vendor's own id for the call, when it reported one. This is the
+    /// id that shows up in the vendor's log, and the way back from there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_id: Option<String>,
     /// The working directory the caller ran from, as a project key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
@@ -90,6 +94,12 @@ impl UsageRecord {
     /// up in the last events; without this the usage page would report
     /// zeroes for every agent that streams.
     pub fn note_usage(&mut self, event: &StreamEvent) {
+        // The vendor's own id for the call arrives with the first event.
+        if let StreamEvent::MessageStart { id, .. } = event {
+            if !id.is_empty() {
+                self.upstream_request_id = Some(id.clone());
+            }
+        }
         let usage = match event {
             StreamEvent::MessageStart { usage, .. } | StreamEvent::MessageDelta { usage, .. } => {
                 *usage
@@ -125,6 +135,7 @@ impl UsageRecord {
             error: None,
             agent: None,
             session_id: None,
+            upstream_request_id: None,
             project: None,
             context: None,
             cost_usd: None,

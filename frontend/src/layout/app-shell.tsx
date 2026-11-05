@@ -4,6 +4,7 @@ import {
   ArrowUpRight,
   AudioLines,
   Cpu,
+  GitBranch,
   KeyRound,
   LayoutGrid,
   Layers,
@@ -23,6 +24,7 @@ const nav = [
   { to: "/models", key: "nav.models", icon: Layers },
   { to: "/groups", key: "nav.groups", icon: AudioLines },
   { to: "/usage", key: "nav.usage", icon: KeyRound },
+  { to: "/traces", key: "nav.traces", icon: GitBranch },
   { to: "/settings", key: "nav.settings", icon: Settings2 },
 ] as const;
 
@@ -32,6 +34,7 @@ const titleKeys: Record<string, string> = {
   "/models": "nav.models",
   "/groups": "nav.groups",
   "/usage": "nav.usage",
+  "/traces": "nav.traces",
   "/settings": "nav.settings",
 };
 

@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rusqlite::Connection;
 
 use crate::gateway::usage::UsageRecord;
+use crate::trace::Span;
 
 /// The database file, next to the config.
 pub fn db_path() -> PathBuf {
@@ -122,6 +123,120 @@ impl Store {
         if let Err(err) = result {
             tracing::warn!("the usage record could not be written: {err}");
         }
+    }
+
+    /// Append one trace span.
+    ///
+    /// A session span is written again for every request of that session,
+    /// so the row is upserted: its counter grows and its clock moves on.
+    /// Every other span is written once.
+    pub fn record_span(&self, span: &Span) {
+        let Ok(guard) = self.conn.lock() else {
+            return;
+        };
+        let Some(conn) = guard.as_ref() else {
+            return;
+        };
+        let result = conn.execute(
+            "INSERT INTO trace_spans
+             (span_id, trace_id, parent_span_id, kind, name, session_id, task_id, agent, project,
+              caller_key_id, model, provider, provider_key_id, protocol, attempt, requests,
+              status, ok, skipped, error, latency_ms, input_tokens, output_tokens, cache_read_tokens,
+              cache_write_tokens, reasoning_tokens, cost_usd, credits, started_at, ended_at,
+              upstream_request_id, messages, preview)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33)
+             ON CONFLICT(span_id) DO UPDATE SET
+                ended_at = excluded.ended_at,
+                requests = trace_spans.requests + excluded.requests,
+                latency_ms = excluded.latency_ms",
+            rusqlite::params![
+                span.span_id,
+                span.trace_id,
+                span.parent_span_id,
+                span.kind.as_str(),
+                span.name,
+                span.session_id,
+                span.task_id,
+                span.agent,
+                span.project,
+                span.caller_key_id,
+                span.model,
+                span.provider,
+                span.provider_key_id,
+                span.protocol,
+                span.attempt,
+                span.requests,
+                span.status,
+                span.ok,
+                span.skipped,
+                span.error,
+                span.latency_ms,
+                span.input_tokens,
+                span.output_tokens,
+                span.cache_read_tokens,
+                span.cache_write_tokens,
+                span.reasoning_tokens,
+                span.cost_usd,
+                span.credits,
+                span.started_at,
+                span.ended_at,
+                span.upstream_request_id,
+                span.messages,
+                span.preview,
+            ],
+        );
+        if let Err(err) = result {
+            tracing::warn!("the trace span could not be written: {err}");
+        }
+    }
+
+    /// Every span since `since`, oldest first.
+    pub fn spans_since(&self, since: &str) -> Vec<Span> {
+        self.query_spans(
+            "SELECT * FROM trace_spans WHERE started_at >= ?1 ORDER BY started_at ASC",
+            [since],
+        )
+    }
+
+    /// The spans of one trace, oldest first.
+    pub fn trace(&self, trace_id: &str) -> Vec<Span> {
+        self.query_spans(
+            "SELECT * FROM trace_spans WHERE trace_id = ?1 ORDER BY started_at ASC",
+            [trace_id],
+        )
+    }
+
+    /// The spans of one session, oldest first.
+    pub fn session_trace(&self, session_id: &str) -> Vec<Span> {
+        self.query_spans(
+            "SELECT * FROM trace_spans WHERE session_id = ?1 ORDER BY started_at ASC",
+            [session_id],
+        )
+    }
+
+    /// The span that carries a vendor's own request id.
+    pub fn span_by_upstream_id(&self, upstream_request_id: &str) -> Vec<Span> {
+        self.query_spans(
+            "SELECT * FROM trace_spans WHERE upstream_request_id = ?1 ORDER BY started_at ASC",
+            [upstream_request_id],
+        )
+    }
+
+    /// Run a query and map every row to a span.
+    fn query_spans(&self, sql: &str, params: impl rusqlite::Params) -> Vec<Span> {
+        let Ok(guard) = self.conn.lock() else {
+            return Vec::new();
+        };
+        let Some(conn) = guard.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(mut statement) = conn.prepare(sql) else {
+            return Vec::new();
+        };
+        let Ok(rows) = statement.query_map(params, row_to_span) else {
+            return Vec::new();
+        };
+        rows.filter_map(|row| row.ok()).collect()
     }
 
     /// Every record, oldest first — the JSONL log's shape, for callers
@@ -296,7 +411,7 @@ pub struct AggregateRow {
 
 /// The columns the newest code writes. A database created by an older
 /// release may lack the later ones; each is added on open.
-const COLUMNS: [(&str, &str); 19] = [
+const COLUMNS: [(&str, &str); 20] = [
     ("provider", "TEXT NOT NULL DEFAULT ''"),
     ("key_id", "TEXT"),
     ("key_label", "TEXT"),
@@ -310,6 +425,7 @@ const COLUMNS: [(&str, &str); 19] = [
     ("error", "TEXT"),
     ("agent", "TEXT"),
     ("session_id", "TEXT"),
+    ("upstream_request_id", "TEXT"),
     ("context", "TEXT"),
     ("project", "TEXT"),
     ("cost_usd", "REAL"),
@@ -347,6 +463,7 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             error TEXT,
             agent TEXT,
             session_id TEXT,
+            upstream_request_id TEXT,
             context TEXT,
             project TEXT,
             cost_usd REAL,
@@ -371,7 +488,113 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
          CREATE INDEX IF NOT EXISTS idx_usage_provider ON usage_records(provider, time);
          CREATE INDEX IF NOT EXISTS idx_usage_model ON usage_records(model, time);",
     )?;
+    // The trace tree: one row per span, with the parent that ties it to the
+    // span above it.
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS trace_spans (
+            span_id TEXT PRIMARY KEY,
+            trace_id TEXT NOT NULL,
+            parent_span_id TEXT,
+            kind TEXT NOT NULL DEFAULT 'request',
+            name TEXT NOT NULL DEFAULT '',
+            session_id TEXT,
+            task_id TEXT,
+            agent TEXT,
+            project TEXT,
+            caller_key_id TEXT,
+            model TEXT NOT NULL DEFAULT '',
+            provider TEXT,
+            provider_key_id TEXT,
+            protocol TEXT,
+            attempt INTEGER,
+            requests INTEGER NOT NULL DEFAULT 0,
+            status INTEGER NOT NULL DEFAULT 0,
+            ok INTEGER NOT NULL DEFAULT 1,
+            skipped INTEGER NOT NULL DEFAULT 0,
+            error TEXT,
+            latency_ms INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+            reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+            cost_usd REAL,
+            credits REAL,
+            started_at TEXT NOT NULL,
+            ended_at TEXT,
+            upstream_request_id TEXT,
+            messages INTEGER NOT NULL DEFAULT 0,
+            preview TEXT
+        );",
+    )?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_trace_time ON trace_spans(started_at);
+         CREATE INDEX IF NOT EXISTS idx_trace_id ON trace_spans(trace_id);
+         CREATE INDEX IF NOT EXISTS idx_trace_session ON trace_spans(session_id);",
+    )?;
+    // A database written by an earlier build may lack the later columns.
+    let trace_present: std::collections::BTreeSet<String> = {
+        let mut statement = conn.prepare("PRAGMA table_info(trace_spans)")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    for (name, decl) in TRACE_COLUMNS {
+        if !trace_present.contains(name) {
+            conn.execute_batch(&format!(
+                "ALTER TABLE trace_spans ADD COLUMN {name} {decl};"
+            ))?;
+        }
+    }
     Ok(())
+}
+
+/// The columns the trace table gained after it was first written.
+const TRACE_COLUMNS: [(&str, &str); 1] = [("skipped", "INTEGER NOT NULL DEFAULT 0")];
+
+/// Read one row back into the canonical span.
+fn row_to_span(row: &rusqlite::Row<'_>) -> rusqlite::Result<Span> {
+    let kind = match row.get::<_, Option<String>>("kind")?.as_deref() {
+        Some("session") => crate::trace::SpanKind::Session,
+        Some("upstream") => crate::trace::SpanKind::Upstream,
+        _ => crate::trace::SpanKind::Request,
+    };
+    Ok(Span {
+        trace_id: row.get("trace_id")?,
+        span_id: row.get("span_id")?,
+        parent_span_id: row.get("parent_span_id")?,
+        kind,
+        name: row.get::<_, Option<String>>("name")?.unwrap_or_default(),
+        session_id: row.get("session_id")?,
+        task_id: row.get("task_id")?,
+        agent: row.get("agent")?,
+        project: row.get("project")?,
+        caller_key_id: row.get("caller_key_id")?,
+        model: row.get::<_, Option<String>>("model")?.unwrap_or_default(),
+        provider: row.get("provider")?,
+        provider_key_id: row.get("provider_key_id")?,
+        protocol: row.get("protocol")?,
+        attempt: row
+            .get::<_, Option<i64>>("attempt")?
+            .map(|a| a.max(0) as u32),
+        requests: row.get::<_, i64>("requests")?.max(0) as u64,
+        status: row.get::<_, i64>("status")?.max(0) as u16,
+        ok: row.get::<_, i64>("ok")? != 0,
+        skipped: row.get::<_, i64>("skipped")? != 0,
+        error: row.get("error")?,
+        latency_ms: row.get::<_, i64>("latency_ms")?.max(0) as u64,
+        input_tokens: row.get::<_, i64>("input_tokens")?.max(0) as u64,
+        output_tokens: row.get::<_, i64>("output_tokens")?.max(0) as u64,
+        cache_read_tokens: row.get::<_, i64>("cache_read_tokens")?.max(0) as u64,
+        cache_write_tokens: row.get::<_, i64>("cache_write_tokens")?.max(0) as u64,
+        reasoning_tokens: row.get::<_, i64>("reasoning_tokens")?.max(0) as u64,
+        cost_usd: row.get("cost_usd")?,
+        credits: row.get("credits")?,
+        started_at: row.get("started_at")?,
+        ended_at: row.get("ended_at")?,
+        upstream_request_id: row.get("upstream_request_id")?,
+        messages: row.get::<_, i64>("messages")?.max(0) as u32,
+        preview: row.get("preview")?,
+    })
 }
 
 /// Read one row back into the canonical record.
@@ -401,6 +624,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         error: row.get("error")?,
         agent: row.get("agent")?,
         session_id: row.get("session_id")?,
+        upstream_request_id: row.get("upstream_request_id")?,
         context: row
             .get::<_, Option<String>>("context")?
             .and_then(|s| serde_json::from_str(&s).ok()),
@@ -605,5 +829,51 @@ mod tests {
         // `enabled()` honours the env switch (cached per process); the tests
         // run with the default, so this only pins the parser contract.
         assert!(enabled());
+    }
+
+    #[test]
+    fn trace_spans_round_trip_and_the_session_counter_grows() {
+        let store = store_at("traces");
+        let mut session =
+            crate::trace::Span::start(crate::trace::SpanKind::Session, "trc_1", "ses_1");
+        session.session_id = Some("s-1".into());
+        session.agent = Some("claude-code".into());
+        session.requests = 1;
+        store.record_span(&session);
+
+        // The same session, seen again: the row grows, it does not double.
+        let mut again = session.clone();
+        again.requests = 1;
+        store.record_span(&again);
+
+        let mut request =
+            crate::trace::Span::start(crate::trace::SpanKind::Request, "trc_1", "req_1");
+        request.parent_span_id = Some("ses_1".into());
+        request.session_id = Some("s-1".into());
+        request.model = "mock/small".into();
+        store.record_span(&request);
+
+        let mut upstream =
+            crate::trace::Span::start(crate::trace::SpanKind::Upstream, "trc_1", "up_1");
+        upstream.parent_span_id = Some("req_1".into());
+        upstream.provider = Some("mock".into());
+        upstream.input_tokens = 12;
+        upstream.cost_usd = Some(0.5);
+        upstream.upstream_request_id = Some("chatcmpl-1".into());
+        store.record_span(&upstream);
+
+        let spans = store.spans_since("2000-01-01T00:00:00+00:00");
+        assert_eq!(spans.len(), 3);
+        let session = spans.iter().find(|s| s.span_id == "ses_1").unwrap();
+        assert_eq!(session.requests, 2);
+        assert_eq!(session.agent.as_deref(), Some("claude-code"));
+
+        // One trace, read back as a whole.
+        let trace = store.trace("trc_1");
+        assert_eq!(trace.len(), 3);
+        // And the vendor's own id finds the call.
+        let found = store.span_by_upstream_id("chatcmpl-1");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].span_id, "up_1");
     }
 }

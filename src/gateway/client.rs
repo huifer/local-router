@@ -141,6 +141,7 @@ pub fn auth_headers(
     key: &str,
     agent_user_agent: Option<&str>,
     caller_headers: Option<&reqwest::header::HeaderMap>,
+    trace: Option<&TraceHeaders>,
 ) -> BTreeMap<String, String> {
     let mut headers = BTreeMap::new();
     match protocol {
@@ -177,8 +178,55 @@ pub fn auth_headers(
         }
         None => {}
     }
+    // The trace travels with the request: the vendor (or the relay in front
+    // of it) can put the id in its own log, and the call can be found back
+    // here afterwards.
+    if let Some(trace) = trace {
+        headers.extend(trace.to_headers());
+    }
     apply_header_rules(&mut headers, provider, caller_headers);
     headers
+}
+
+/// The trace identifiers that travel with an upstream request.
+#[derive(Debug, Clone, Default)]
+pub struct TraceHeaders {
+    /// The trace the request belongs to.
+    pub trace_id: String,
+    /// The request's own span id.
+    pub span_id: String,
+    /// The caller's session, when it sent one.
+    pub session_id: Option<String>,
+    /// The caller's own id for this request.
+    pub request_id: Option<String>,
+    /// The caller's own name for the step.
+    pub task_id: Option<String>,
+}
+
+impl TraceHeaders {
+    /// The headers a vendor receives.
+    pub fn to_headers(&self) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        if !self.trace_id.is_empty() {
+            out.insert(
+                crate::trace::TRACE_HEADER.to_string(),
+                self.trace_id.clone(),
+            );
+        }
+        if !self.span_id.is_empty() {
+            out.insert(crate::trace::SPAN_HEADER.to_string(), self.span_id.clone());
+        }
+        if let Some(session) = &self.session_id {
+            out.insert(crate::trace::SESSION_HEADER.to_string(), session.clone());
+        }
+        if let Some(request) = &self.request_id {
+            out.insert(crate::trace::REQUEST_HEADER.to_string(), request.clone());
+        }
+        if let Some(task) = &self.task_id {
+            out.insert(crate::trace::TASK_HEADER.to_string(), task.clone());
+        }
+        out
+    }
 }
 
 /// Expand `{version}` / `{platform}` / `{arch}` placeholders in a header
@@ -250,6 +298,7 @@ pub fn session_headers(
     protocol: Protocol,
     provider: &Provider,
     session: &crate::workbuddy::Session,
+    trace: Option<&TraceHeaders>,
 ) -> BTreeMap<String, String> {
     let mut headers = session.auth_headers();
     // A session provider speaks OpenAI's Chat shape, so the bearer token
@@ -262,6 +311,9 @@ pub fn session_headers(
     }
     for (name, value) in &provider.headers {
         headers.insert(name.to_lowercase(), value.clone());
+    }
+    if let Some(trace) = trace {
+        headers.extend(trace.to_headers());
     }
     apply_header_rules(&mut headers, provider, None);
     headers
@@ -560,7 +612,7 @@ mod header_rewrite_tests {
     fn forward_headers_copy_the_callers_values_verbatim() {
         let p = provider(&[], &["x-opencode-session", "x-request-id"], &[], &[]);
         let incoming = caller(&[("x-opencode-session", "sess-42"), ("x-request-id", "req-9")]);
-        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&incoming));
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&incoming), None);
         assert_eq!(
             out.get("x-opencode-session").map(String::as_str),
             Some("sess-42")
@@ -568,7 +620,7 @@ mod header_rewrite_tests {
         assert_eq!(out.get("x-request-id").map(String::as_str), Some("req-9"));
         // 没发送的转发头不会凭空出现。
         let empty = HeaderMap::new();
-        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&empty));
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&empty), None);
         assert!(!out.contains_key("x-opencode-session"));
     }
 
@@ -581,12 +633,12 @@ mod header_rewrite_tests {
             &["authorization", "x-static"],
             &[],
         );
-        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, None);
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, None, None);
         assert!(!out.contains_key("authorization"));
         assert!(!out.contains_key("x-static"));
         // 鉴权头还在的默认行为不受影响。
         let plain = Provider::default();
-        let out = auth_headers(Protocol::OpenAiChat, &plain, "sk", None, None);
+        let out = auth_headers(Protocol::OpenAiChat, &plain, "sk", None, None, None);
         assert_eq!(
             out.get("authorization").map(String::as_str),
             Some("Bearer sk")
@@ -598,7 +650,7 @@ mod header_rewrite_tests {
     fn remove_runs_after_forward() {
         let p = provider(&[], &["x-session"], &["x-session"], &[]);
         let incoming = caller(&[("x-session", "s")]);
-        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&incoming));
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, Some(&incoming), None);
         assert!(!out.contains_key("x-session"));
     }
 
@@ -606,7 +658,7 @@ mod header_rewrite_tests {
     #[test]
     fn header_order_puts_listed_headers_first() {
         let p = provider(&[], &[], &[], &["user-agent", "authorization"]);
-        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", Some("agent-ua"), None);
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", Some("agent-ua"), None, None);
         let ordered = ordered_headers(
             out,
             &["user-agent".to_string(), "authorization".to_string()],
@@ -632,7 +684,7 @@ mod header_rewrite_tests {
             &[],
             &[],
         );
-        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, None);
+        let out = auth_headers(Protocol::OpenAiChat, &p, "sk", None, None, None);
         let ua = out.get("user-agent").unwrap();
         assert!(ua.contains(env!("CARGO_PKG_VERSION")), "ua {ua}");
         assert!(ua.contains(std::env::consts::ARCH), "ua {ua}");

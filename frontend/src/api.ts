@@ -7,6 +7,10 @@ import type {
   Provider,
   Settings,
   Status,
+  TraceDetail,
+  TraceSessionDetail,
+  TraceSessionsData,
+  TracesData,
   UsageData,
   WorkBuddyStatus,
 } from "./types";
@@ -79,6 +83,36 @@ export const getGroups = () => api<{ groups: Group[] }>("/api/groups");
 export const getModels = () => api<{ models: ModelItem[] }>("/api/models");
 export const getPresets = () => api<{ presets: PresetGroup[] }>("/api/presets");
 export const getUsage = (period = "7d") => api<UsageData>(`/api/usage?period=${period}`);
+export const getTraces = (period = "7d") => api<TracesData>(`/api/traces?period=${period}`);
+export const getTrace = (id: string) =>
+  api<TraceDetail>(`/api/traces/${encodeURIComponent(id)}`);
+/** Every session the gateway has seen, with the whole chain of each. */
+export const getTraceSessions = (period = "7d") =>
+  api<TraceSessionsData>(`/api/traces/sessions?period=${period}`);
+/** One session, with every request and every vendor call it produced. */
+export const getTraceSession = (id: string) =>
+  api<TraceSessionDetail>(`/api/traces/sessions/${encodeURIComponent(id)}`);
+/** The trace log as a file: csv for a spreadsheet, jsonl for a script. */
+export async function downloadTraces(format: "csv" | "jsonl", period = "7d") {
+  const response = await fetch(
+    `/api/traces/export?format=${format}&period=${period}`,
+    {
+      headers: getWebKey() ? { authorization: `Bearer ${getWebKey()}` } : {},
+    },
+  );
+  if (!response.ok) {
+    throw new Error(`the export failed (${response.status})`);
+  }
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = format === "jsonl" ? "traces.jsonl" : "traces.csv";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
 export const getProjects = (period = "7d") => api<{ projects: ProjectRow[] }>(`/api/projects?period=${period}`);
 export const updateProject = (id: string, patch: { name?: string; color?: string; budget_tokens?: number | null; budget_cost?: number | null }) =>
   api<{ ok: boolean; projects: ProjectRow[] }>(`/api/projects?id=${encodeURIComponent(id)}`, { method: "PATCH", body: patch });

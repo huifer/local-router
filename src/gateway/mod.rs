@@ -26,6 +26,7 @@ use crate::gateway::usage::UsageRecord;
 use crate::protocol::ir::*;
 use crate::protocol::{anthropic, gemini, openai_chat, openai_responses, sse};
 use crate::store;
+use crate::trace;
 
 use client::{Target, UpstreamReply};
 
@@ -140,6 +141,23 @@ struct MediaTask {
     body: Value,
 }
 use route::{RoutePlan, Router};
+
+/// The trace a request carries into its attempts.
+///
+/// Every attempt at a vendor hangs under the request's own span, and the
+/// request hangs under the session — so one session's calls can always be
+/// walked back from the vendor's side.
+#[derive(Clone, Debug)]
+struct TraceLink {
+    context: trace::TraceContext,
+    /// The request span the upstream spans hang under.
+    request_span_id: String,
+    /// Which attempt this is: 1 is the first try.
+    attempt: u32,
+    /// The model the vendor is asked for, which may differ from the model
+    /// the caller asked for (a group picks one).
+    upstream_model: String,
+}
 
 /// Everything a gateway handler needs.
 #[derive(Clone)]
@@ -993,7 +1011,7 @@ async fn send_media_json_raw(
         .provider(&target.provider_id)
         .cloned()
         .ok_or_else(|| ApiError::NotFound("the provider disappeared".into()))?;
-    let headers = target_headers(&provider, target, None, false, None).await?;
+    let headers = target_headers(&provider, target, None, false, None, None).await?;
     let url = media_url(&provider, target, kind, None)?;
     tracing::debug!("media request to {url}");
     let http = g
@@ -1026,7 +1044,7 @@ async fn send_media_multipart(
         .provider(&target.provider_id)
         .cloned()
         .ok_or_else(|| ApiError::NotFound("the provider disappeared".into()))?;
-    let headers = target_headers(&provider, target, None, false, None).await?;
+    let headers = target_headers(&provider, target, None, false, None, None).await?;
     let url = media_url(&provider, target, kind, None)?;
     let http = g
         .client_for(&target.provider_id, &provider)
@@ -1132,7 +1150,7 @@ async fn media_task_request(
         Ok(url) => url,
         Err(e) => return error_response(&e),
     };
-    let auth = match target_headers(&task.provider, &task.target, None, false, None).await {
+    let auth = match target_headers(&task.provider, &task.target, None, false, None, None).await {
         Ok(headers) => headers,
         Err(e) => return error_response(&e),
     };
@@ -1163,7 +1181,7 @@ async fn download_media_result(g: &Gateway, task: &MediaTask, id: &str) -> Respo
             "the video {id} has no download url yet"
         )));
     };
-    let auth = match target_headers(&task.provider, &task.target, None, false, None).await {
+    let auth = match target_headers(&task.provider, &task.target, None, false, None, None).await {
         Ok(headers) => headers,
         Err(e) => return error_response(&e),
     };
@@ -1317,6 +1335,9 @@ async fn handle(
     };
     // The CLI or the web page may have changed the file.
     g.state.sync().await;
+    // Whether the gateway keeps a record of every request. The trace is
+    // part of that record: no record, no trace.
+    let recording = g.state.config.read().await.settings.record_usage;
     let value: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
         Err(err) => {
@@ -1365,6 +1386,20 @@ async fn handle(
         .map(|s| s.to_string());
     request.session_id = session.clone();
 
+    // The agent's own User-Agent, which names the agent in every record.
+    let agent_user_agent = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
+    let agent = agent_user_agent.as_deref().and_then(agent_from_user_agent);
+
+    // The trace: the thread that ties this request to the vendor calls it
+    // makes. The caller's own trace id wins — an orchestrator that keeps a
+    // trace can hand it down and the gateway joins its tree. Without one,
+    // the session is the trace: every request of a session belongs to the
+    // same task, which is what a session is.
+    let trace_ctx = trace::TraceContext::resolve(&value, &headers, session.as_deref());
+
     // The context breakdown: how full this request's window is, by source.
     // Captured once here from the already-parsed request, then copied into
     // every usage record the request produces (success or each failure).
@@ -1397,6 +1432,48 @@ async fn handle(
         crate::projects::note(dir);
     }
 
+    // The session span: the top of the tree, written again for every
+    // request of the session so its counter and clock stay true.
+    if let (Some(session_id), Some(session_span_id)) = (
+        trace_ctx.session_id.as_ref(),
+        trace_ctx.session_span_id.as_ref(),
+    ) {
+        let mut span = trace::Span::start(
+            trace::SpanKind::Session,
+            &trace_ctx.trace_id,
+            session_span_id,
+        );
+        span.name = crate::sessions::title_of(session_id)
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| session_id.clone());
+        span.session_id = Some(session_id.clone());
+        span.agent = agent.clone();
+        span.project = project_dir.clone();
+        span.caller_key_id = request.caller_key_id.clone();
+        span.requests = 1;
+        span.ended_at = Some(trace::now());
+        if recording {
+            persist_span(&g.state, &g.sqlite, &span);
+        }
+    }
+
+    // The request span: one agent request, the parent of every vendor call
+    // it makes.
+    let request_started = Instant::now();
+    let mut request_span = trace::Span::start(
+        trace::SpanKind::Request,
+        &trace_ctx.trace_id,
+        &trace_ctx.span_id,
+    );
+    request_span.parent_span_id = trace_ctx.parent_span_id();
+    request_span.session_id = trace_ctx.session_id.clone();
+    request_span.task_id = trace_ctx.task_id.clone();
+    request_span.agent = agent.clone();
+    request_span.project = project_dir.clone();
+    request_span.caller_key_id = request.caller_key_id.clone();
+    request_span.model = request.model.clone();
+    request_span.messages = request.messages.len() as u32;
+
     // Whether the request continues an exchange: any assistant or tool turn
     // means it does, and a turn-scoped affinity stays bound.
     let has_history = request.messages.iter().any(|m| {
@@ -1426,42 +1503,130 @@ async fn handle(
     if masking {
         mask_request_secrets(&mut request);
     }
+    // The preview is taken after the masking, so a secret quoted in the
+    // prompt never reaches the trace log.
+    request_span.preview = request
+        .messages
+        .iter()
+        .find(|m| matches!(m.role, crate::protocol::ir::Role::User))
+        .and_then(|m| m.text().lines().next().map(|line| line.to_string()))
+        .map(|line| line.trim().chars().take(160).collect::<String>())
+        .filter(|line| !line.is_empty());
 
     let asked = request.model.clone();
     let stream = request.stream;
-    let agent_user_agent = headers
-        .get("user-agent")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string());
 
     // A QwenWork (千问办公) request is built and COSY-signed by the local
     // `qwen` module; it never travels the generic OpenAI path. Route it the
     // moment a QwenWork provider is in the plan, before the generic loop.
     if plan.targets.iter().any(|t| t.provider_id == "qwenwork") {
-        return qwen_attempt(
+        let link = TraceLink {
+            context: trace_ctx.clone(),
+            request_span_id: request_span.span_id.clone(),
+            attempt: 1,
+            upstream_model: plan
+                .targets
+                .iter()
+                .find(|t| t.provider_id == "qwenwork")
+                .map(|t| t.model.clone())
+                .unwrap_or_default(),
+        };
+        return match qwen_attempt(
             &g,
             protocol,
             &request,
             &plan,
             agent_user_agent.as_deref(),
             &context,
+            Some(&link),
         )
-        .await;
+        .await
+        {
+            Ok(response) => {
+                close_request_span(
+                    &g,
+                    &request_span,
+                    request_started,
+                    true,
+                    200,
+                    None,
+                    recording,
+                );
+                response
+            }
+            Err(err) => {
+                close_request_span(
+                    &g,
+                    &request_span,
+                    request_started,
+                    false,
+                    err.status(),
+                    Some(err.to_string()),
+                    recording,
+                );
+                error_response(&err)
+            }
+        };
     }
     if plan.targets.iter().any(|t| t.provider_id == "trae-cn") {
-        return trae_attempt(
+        let link = TraceLink {
+            context: trace_ctx.clone(),
+            request_span_id: request_span.span_id.clone(),
+            attempt: 1,
+            upstream_model: plan
+                .targets
+                .iter()
+                .find(|t| t.provider_id == "trae-cn")
+                .map(|t| t.model.clone())
+                .unwrap_or_default(),
+        };
+        return match trae_attempt(
             &g,
             protocol,
             &request,
             &plan,
             agent_user_agent.as_deref(),
             &context,
+            Some(&link),
         )
-        .await;
+        .await
+        {
+            Ok(response) => {
+                close_request_span(
+                    &g,
+                    &request_span,
+                    request_started,
+                    true,
+                    200,
+                    None,
+                    recording,
+                );
+                response
+            }
+            Err(err) => {
+                close_request_span(
+                    &g,
+                    &request_span,
+                    request_started,
+                    false,
+                    err.status(),
+                    Some(err.to_string()),
+                    recording,
+                );
+                error_response(&err)
+            }
+        };
     }
 
     let mut last_error: ApiError = ApiError::Upstream("no target could answer".into());
-    for target in plan.targets.clone() {
+    for (index, target) in plan.targets.clone().into_iter().enumerate() {
+        // Every attempt at a vendor hangs under this request's span.
+        let link = TraceLink {
+            context: trace_ctx.clone(),
+            request_span_id: request_span.span_id.clone(),
+            attempt: index as u32 + 1,
+            upstream_model: target.model.clone(),
+        };
         let provider = match g.state.config.read().await.provider(&target.provider_id) {
             Some(p) => p.clone(),
             None => continue,
@@ -1475,6 +1640,7 @@ async fn handle(
                         "the provider {} is out of quota",
                         target.provider_id
                     ));
+                    note_skipped(&g, &link, &target, "the provider is out of quota");
                     continue;
                 }
                 Ok(false) => {}
@@ -1494,6 +1660,12 @@ async fn handle(
                 "the provider {} is cooling down after a 429; try again shortly",
                 target.provider_id
             ));
+            note_skipped(
+                &g,
+                &link,
+                &target,
+                "the provider is cooling down after a 429",
+            );
             continue;
         }
         let started = Instant::now();
@@ -1509,6 +1681,7 @@ async fn handle(
                 send_agent_ua,
                 &headers,
                 &context,
+                Some(&link),
             )
             .await
         } else {
@@ -1523,6 +1696,7 @@ async fn handle(
                 send_agent_ua,
                 &headers,
                 &context,
+                Some(&link),
             )
             .await
         };
@@ -1548,6 +1722,15 @@ async fn handle(
                     )
                     .await;
                 }
+                close_request_span(
+                    &g,
+                    &request_span,
+                    request_started,
+                    true,
+                    200,
+                    None,
+                    recording,
+                );
                 return response;
             }
             Err((err, mut rec)) => {
@@ -1559,6 +1742,9 @@ async fn handle(
                 if record {
                     crate::pricing::price_record(&mut rec);
                     persist_usage(&g.state, &g.sqlite, &rec);
+                    // The failed attempt is part of the trace too: it says
+                    // which vendor refused, and why the request moved on.
+                    persist_span(&g.state, &g.sqlite, &upstream_span(&link, &rec));
                 }
                 // A rate limit puts the provider into a global cooldown:
                 // nothing is sent its way until it is over, so an agent's
@@ -1581,7 +1767,85 @@ async fn handle(
     if let Some(session) = &session {
         note_route_trace(&g, session, &plan, &asked, None).await;
     }
+    close_request_span(
+        &g,
+        &request_span,
+        request_started,
+        false,
+        last_error.status(),
+        Some(last_error.to_string()),
+        recording,
+    );
     error_response(&last_error)
+}
+
+/// Close the request span: the gateway has its answer, one way or another.
+fn close_request_span(
+    g: &Gateway,
+    span: &trace::Span,
+    started: Instant,
+    ok: bool,
+    status: u16,
+    error: Option<String>,
+    recording: bool,
+) {
+    if !recording {
+        return;
+    }
+    let mut span = span.clone();
+    span.finish(started.elapsed().as_millis() as u64, ok, status, error);
+    persist_span(&g.state, &g.sqlite, &span);
+}
+
+/// The trace identifiers that travel with an upstream request.
+fn trace_headers(link: &TraceLink) -> client::TraceHeaders {
+    client::TraceHeaders {
+        trace_id: link.context.trace_id.clone(),
+        span_id: link.context.span_id.clone(),
+        session_id: link.context.session_id.clone(),
+        request_id: link.context.request_id.clone(),
+        task_id: link.context.task_id.clone(),
+    }
+}
+
+/// The trace span of one attempt at one vendor.
+fn upstream_span(link: &TraceLink, rec: &usage::UsageRecord) -> trace::Span {
+    let mut span = trace::Span::start(
+        trace::SpanKind::Upstream,
+        &link.context.trace_id,
+        &format!("up_{}", trace::random_hex()),
+    );
+    span.parent_span_id = Some(link.request_span_id.clone());
+    span.session_id = rec.session_id.clone();
+    span.task_id = link.context.task_id.clone();
+    span.agent = rec.agent.clone();
+    span.project = rec.project.clone();
+    span.caller_key_id = rec.caller_key_id.clone();
+    span.model = if link.upstream_model.is_empty() {
+        rec.model.clone()
+    } else {
+        link.upstream_model.clone()
+    };
+    span.provider = Some(rec.provider.clone());
+    span.provider_key_id = rec.key_id.clone();
+    span.protocol = Some(rec.protocol.clone());
+    span.attempt = Some(link.attempt);
+    span.name = format!("{} · {}", rec.provider, span.model);
+    span.status = rec.status;
+    span.ok = rec.ok;
+    span.error = rec.error.clone();
+    span.latency_ms = rec.latency_ms;
+    span.input_tokens = rec.input_tokens;
+    span.output_tokens = rec.output_tokens;
+    span.cache_read_tokens = rec.cache_read_tokens;
+    span.cache_write_tokens = rec.cache_write_tokens;
+    span.reasoning_tokens = rec.reasoning_tokens;
+    span.cost_usd = rec.cost_usd;
+    span.credits = rec.credits;
+    span.upstream_request_id = rec.upstream_request_id.clone();
+    span.started_at = rec.time.clone();
+    span.ended_at = Some(trace::now());
+    span
 }
 
 /// Write down the route a session took, for the routing view.
@@ -1623,6 +1887,45 @@ fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::U
     usage::record(&state.usage_path(), rec);
 }
 
+/// Record an attempt that was never sent: the provider was skipped, so the
+/// request carried on without it. The trace says why the request moved on.
+fn note_skipped(g: &Gateway, link: &TraceLink, target: &Target, reason: &str) {
+    let mut span = trace::Span::start(
+        trace::SpanKind::Upstream,
+        &link.context.trace_id,
+        &format!("up_{}", trace::random_hex()),
+    );
+    span.parent_span_id = Some(link.request_span_id.clone());
+    span.session_id = link.context.session_id.clone();
+    span.task_id = link.context.task_id.clone();
+    span.model = target.model.clone();
+    span.provider = Some(target.provider_id.clone());
+    span.provider_key_id = Some(target.key_id.clone());
+    span.attempt = Some(link.attempt);
+    span.name = format!("{} · {}", target.provider_id, target.model);
+    span.skipped = true;
+    span.error = Some(reason.to_string());
+    span.ended_at = Some(trace::now());
+    persist_span(&g.state, &g.sqlite, &span);
+}
+
+/// Write one trace span to its sinks: SQLite when it is on, and the JSONL
+/// log for anyone tailing it.
+fn persist_span(state: &AppState, sqlite: &Option<store::Store>, span: &trace::Span) {
+    if let Some(store) = sqlite {
+        store.record_span(span);
+    }
+    trace::record(&state.trace_path(), span);
+}
+
+/// The trace log that belongs to a usage log.
+fn trace_path_of(usage_path: &std::path::Path) -> PathBuf {
+    usage_path
+        .parent()
+        .map(|dir| dir.join("traces.jsonl"))
+        .unwrap_or_else(|| PathBuf::from("traces.jsonl"))
+}
+
 /// The headers to send to a target, and the secret behind them.
 ///
 /// A provider that authenticates with a local app's session has no stored
@@ -1634,6 +1937,7 @@ async fn target_headers(
     agent_user_agent: Option<&str>,
     send_agent_ua: bool,
     caller_headers: Option<&reqwest::header::HeaderMap>,
+    trace: Option<&client::TraceHeaders>,
 ) -> Result<BTreeMap<String, String>, ApiError> {
     if provider.uses_session() {
         // Several WorkBuddy accounts can live side by side; the requests
@@ -1648,7 +1952,12 @@ async fn target_headers(
                     .map_err(|_| ApiError::Unauthorized(err.to_string()))?
             }
         };
-        return Ok(client::session_headers(target.protocol, provider, &session));
+        return Ok(client::session_headers(
+            target.protocol,
+            provider,
+            &session,
+            trace,
+        ));
     }
     Ok(client::auth_headers(
         target.protocol,
@@ -1660,18 +1969,44 @@ async fn target_headers(
             None
         },
         caller_headers,
+        trace,
     ))
 }
 
 /// The request body in the protocol a vendor speaks.
-fn upstream_body(request: &ChatRequest, protocol: Protocol, model: &str) -> Value {
-    match protocol {
+fn upstream_body(
+    request: &ChatRequest,
+    protocol: Protocol,
+    model: &str,
+    trace: Option<&client::TraceHeaders>,
+    trace_metadata: bool,
+) -> Value {
+    let mut body = match protocol {
         Protocol::OpenAiChat => openai_chat::format_request(request, model),
         Protocol::OpenAiResponses => openai_responses::format_request(request, model),
         Protocol::Anthropic => anthropic::format_request(request, model),
         Protocol::Gemini => gemini::format_request(request, model),
         Protocol::QwenWork => openai_chat::format_request(request, model),
+    };
+    // The Responses protocol keeps business metadata with the request, so a
+    // vendor that records it can be read back into ours.
+    if trace_metadata {
+        if let Some(trace) = trace {
+            if protocol == Protocol::OpenAiResponses {
+                let mut metadata = serde_json::Map::new();
+                metadata.insert("trace_id".into(), json!(trace.trace_id));
+                metadata.insert("span_id".into(), json!(trace.span_id));
+                if let Some(session) = &trace.session_id {
+                    metadata.insert("session_id".into(), json!(session));
+                }
+                if let Some(task) = &trace.task_id {
+                    metadata.insert("task_id".into(), json!(task));
+                }
+                body["metadata"] = Value::Object(metadata);
+            }
+        }
     }
+    body
 }
 
 /// The reply of a vendor in the canonical shape.
@@ -1705,23 +2040,24 @@ async fn trae_attempt(
     plan: &RoutePlan,
     agent_user_agent: Option<&str>,
     context: &usage::ContextBreakdown,
-) -> Response {
+    link: Option<&TraceLink>,
+) -> Result<Response, ApiError> {
     let (account_name, session) = match crate::trae::session_rotating().await {
         Ok(pair) => pair,
-        Err(err) => return error_response(&ApiError::Unauthorized(err.to_string())),
+        Err(err) => return Err(ApiError::Unauthorized(err.to_string())),
     };
     // A vendor that answered 429 is left alone until its cooldown is over.
     if g.cooldowns
         .account_is_cooling("trae-cn", &account_name)
         .await
     {
-        return error_response(&ApiError::RateLimited(
+        return Err(ApiError::RateLimited(
             "trae-cn is cooling down after a 429; try again shortly".into(),
         ));
     }
     let target = match plan.targets.iter().find(|t| t.provider_id == "trae-cn") {
         Some(target) => target.clone(),
-        None => return error_response(&ApiError::Upstream("no Trae CN target".into())),
+        None => return Err(ApiError::Upstream("no Trae CN target".into())),
     };
     let _concurrency_permit = g
         .concurrency
@@ -1760,15 +2096,18 @@ async fn trae_attempt(
             if record {
                 crate::pricing::price_record(&mut rec);
                 persist_usage(&g.state, &g.sqlite, &rec);
+                if let Some(link) = link {
+                    persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
+                }
             }
-            return error_response(&ApiError::Upstream(err.to_string()));
+            return Err(ApiError::Upstream(err.to_string()));
         }
     };
     for event in &events {
         rec.note_usage(event);
     }
     if request.stream {
-        events_to_stream(
+        Ok(events_to_stream(
             events,
             caller_protocol,
             request.model.clone(),
@@ -1777,15 +2116,21 @@ async fn trae_attempt(
             record,
             started,
             sqlite,
-        )
+            link.cloned(),
+        ))
     } else {
         let parsed = ChatResponse::from_events(&events);
-        Json(downstream_response(
+        if record {
+            if let Some(link) = link {
+                persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
+            }
+        }
+        Ok(Json(downstream_response(
             caller_protocol,
             &parsed,
             &request.model,
         ))
-        .into_response()
+        .into_response())
     }
 }
 
@@ -1802,7 +2147,8 @@ async fn qwen_attempt(
     plan: &RoutePlan,
     agent_user_agent: Option<&str>,
     context: &usage::ContextBreakdown,
-) -> Response {
+    link: Option<&TraceLink>,
+) -> Result<Response, ApiError> {
     // Several QwenWork accounts can live side by side; the requests take
     // turns so the load is shared instead of one account taking all of it.
     let (account_name, session) = match crate::qwen::login::session_rotating().await {
@@ -1811,7 +2157,7 @@ async fn qwen_attempt(
             // A pool of one (or none) falls back to the plain reader.
             match crate::qwen::login::session().await {
                 Ok(session) => (String::new(), session),
-                Err(_) => return error_response(&ApiError::Unauthorized(err.to_string())),
+                Err(_) => return Err(ApiError::Unauthorized(err.to_string())),
             }
         }
     };
@@ -1820,13 +2166,13 @@ async fn qwen_attempt(
         .account_is_cooling("qwenwork", &account_name)
         .await
     {
-        return error_response(&ApiError::RateLimited(
+        return Err(ApiError::RateLimited(
             "qwenwork is cooling down after a 429; try again shortly".into(),
         ));
     }
     let target = match plan.targets.iter().find(|t| t.provider_id == "qwenwork") {
         Some(t) => t.clone(),
-        None => return error_response(&ApiError::Upstream("no QwenWork target".into())),
+        None => return Err(ApiError::Upstream("no QwenWork target".into())),
     };
     let model = target.model.clone();
     let _concurrency_permit = g
@@ -1874,8 +2220,11 @@ async fn qwen_attempt(
                     store.record(&rec);
                 }
                 usage::record(&usage_path, &rec);
+                if let Some(link) = link {
+                    persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
+                }
             }
-            return error_response(&ApiError::Upstream(err.to_string()));
+            return Err(ApiError::Upstream(err.to_string()));
         }
     };
 
@@ -1885,7 +2234,7 @@ async fn qwen_attempt(
     }
 
     if request.stream {
-        events_to_stream(
+        Ok(events_to_stream(
             events,
             caller_protocol,
             request.model.clone(),
@@ -1894,16 +2243,22 @@ async fn qwen_attempt(
             record,
             started,
             sqlite,
-        )
+            link.cloned(),
+        ))
     } else {
         let parsed = ChatResponse::from_events(&events);
         g.router.note_used(&request.model).await;
-        Json(downstream_response(
+        if record {
+            if let Some(link) = link {
+                persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
+            }
+        }
+        Ok(Json(downstream_response(
             caller_protocol,
             &parsed,
             &request.model,
         ))
-        .into_response()
+        .into_response())
     }
 }
 
@@ -2120,6 +2475,7 @@ async fn whole_attempt(
     send_agent_ua: bool,
     caller_headers: &reqwest::header::HeaderMap,
     context: &usage::ContextBreakdown,
+    link: Option<&TraceLink>,
 ) -> Result<Response, (ApiError, usage::UsageRecord)> {
     let mut rec = usage::UsageRecord::new(&request.model, target.protocol.as_str());
     rec.provider = target.provider_id.clone();
@@ -2140,7 +2496,15 @@ async fn whole_attempt(
             target.max_concurrency,
         )
         .await;
-    let mut body = upstream_body(request, target.protocol, &target.model);
+    let trace_meta = link.map(trace_headers);
+    let trace_metadata = g.state.config.read().await.settings.trace_metadata;
+    let mut body = upstream_body(
+        request,
+        target.protocol,
+        &target.model,
+        trace_meta.as_ref(),
+        trace_metadata,
+    );
     // A vendor that only answers streaming requests is asked for a stream
     // even when the caller wants one whole reply.
     let stream_only = provider.stream_only;
@@ -2154,6 +2518,7 @@ async fn whole_attempt(
         agent_user_agent,
         send_agent_ua,
         Some(caller_headers),
+        link.map(trace_headers).as_ref(),
     )
     .await
     {
@@ -2185,6 +2550,7 @@ async fn whole_attempt(
             rec.cache_read_tokens = parsed.usage.cache_read_tokens;
             rec.cache_write_tokens = parsed.usage.cache_write_tokens;
             rec.reasoning_tokens = parsed.usage.reasoning_tokens;
+            rec.upstream_request_id = Some(parsed.id.clone());
             rec.latency_ms = started.elapsed().as_millis() as u64;
             rec.status = status;
             crate::pricing::price_record(&mut rec);
@@ -2192,6 +2558,9 @@ async fn whole_attempt(
             let record = g.state.config.read().await.settings.record_usage;
             if record {
                 persist_usage(&g.state, &g.sqlite, &rec);
+                if let Some(link) = link {
+                    persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
+                }
             }
             return Ok(Json(outbound).into_response());
         }
@@ -2224,12 +2593,16 @@ async fn whole_attempt(
     rec.reasoning_tokens = parsed.usage.reasoning_tokens;
     rec.latency_ms = started.elapsed().as_millis() as u64;
     rec.status = status;
+    rec.upstream_request_id = Some(parsed.id.clone());
 
     let outbound = downstream_response(caller_protocol, &parsed, &request.model);
 
     let record = g.state.config.read().await.settings.record_usage;
     if record {
         persist_usage(&g.state, &g.sqlite, &rec);
+        if let Some(link) = link {
+            persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
+        }
     }
     Ok(Json(outbound).into_response())
 }
@@ -2247,6 +2620,7 @@ async fn stream_attempt(
     send_agent_ua: bool,
     caller_headers: &reqwest::header::HeaderMap,
     context: &usage::ContextBreakdown,
+    link: Option<&TraceLink>,
 ) -> Result<Response, (ApiError, usage::UsageRecord)> {
     let mut rec = usage::UsageRecord::new(&request.model, target.protocol.as_str());
     rec.provider = target.provider_id.clone();
@@ -2267,7 +2641,15 @@ async fn stream_attempt(
             target.max_concurrency,
         )
         .await;
-    let mut body = upstream_body(request, target.protocol, &target.model);
+    let trace_meta = link.map(trace_headers);
+    let trace_metadata = g.state.config.read().await.settings.trace_metadata;
+    let mut body = upstream_body(
+        request,
+        target.protocol,
+        &target.model,
+        trace_meta.as_ref(),
+        trace_metadata,
+    );
     if provider.stream_only {
         body["stream"] = json!(true);
         body["stream_options"] = json!({"include_usage": true});
@@ -2278,6 +2660,7 @@ async fn stream_attempt(
         agent_user_agent,
         send_agent_ua,
         Some(caller_headers),
+        link.map(trace_headers).as_ref(),
     )
     .await
     {
@@ -2319,6 +2702,7 @@ async fn stream_attempt(
                 started,
                 g.sqlite.clone(),
                 concurrency_permit,
+                link.cloned(),
             ))
         }
         UpstreamReply::Whole { status, body } => {
@@ -2345,6 +2729,7 @@ async fn stream_attempt(
             rec.reasoning_tokens = parsed.usage.reasoning_tokens;
             rec.latency_ms = started.elapsed().as_millis() as u64;
             rec.status = status;
+            rec.upstream_request_id = Some(parsed.id.clone());
             crate::pricing::price_record(&mut rec);
 
             let mut events = vec![StreamEvent::MessageStart {
@@ -2430,6 +2815,7 @@ async fn stream_attempt(
                 record_usage,
                 started,
                 g.sqlite.clone(),
+                link.cloned(),
             ))
         }
     }
@@ -2470,6 +2856,11 @@ struct UsageGuard {
     started: Instant,
     done: bool,
     sqlite: Option<store::Store>,
+    /// Where the trace log lives, so the span of this attempt can be
+    /// written next to the usage record.
+    trace_path: PathBuf,
+    /// The trace this attempt belongs to.
+    link: Option<TraceLink>,
 }
 
 impl UsageGuard {
@@ -2487,6 +2878,15 @@ impl UsageGuard {
                 store.record(&self.rec);
             }
             usage::record(&self.path, &self.rec);
+            // The stream is over, so the attempt is over: the span says
+            // which vendor answered, what it cost and how long it took.
+            if let Some(link) = &self.link {
+                let span = upstream_span(link, &self.rec);
+                if let Some(store) = &self.sqlite {
+                    store.record_span(&span);
+                }
+                trace::record(&self.trace_path, &span);
+            }
         }
     }
 }
@@ -2508,8 +2908,10 @@ fn events_to_stream(
     record_usage: bool,
     started: Instant,
     sqlite: Option<store::Store>,
+    link: Option<TraceLink>,
 ) -> Response {
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let trace_path = trace_path_of(&usage_path);
     let body_stream = async_stream::stream! {
         let mut guard = UsageGuard {
             rec,
@@ -2518,6 +2920,8 @@ fn events_to_stream(
             started,
             done: false,
             sqlite,
+            trace_path,
+            link,
         };
         let mut renderer = make_renderer(caller_protocol, id.clone(), asked_model.clone());
         for ev in &events {
@@ -2551,8 +2955,10 @@ fn build_stream(
     started: Instant,
     sqlite: Option<store::Store>,
     concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    link: Option<TraceLink>,
 ) -> Response {
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let trace_path = trace_path_of(&usage_path);
     let body_stream = async_stream::stream! {
         let _concurrency_permit = concurrency_permit;
         let mut guard = UsageGuard {
@@ -2562,6 +2968,8 @@ fn build_stream(
             started,
             done: false,
             sqlite,
+            trace_path,
+            link,
         };
         let mut collector: Box<dyn client::StreamCollector> = match upstream_protocol {
             Protocol::OpenAiChat => Box::new(openai_chat::Collector::new()),

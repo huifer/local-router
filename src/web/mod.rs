@@ -21,6 +21,7 @@ use crate::config::{AppState, Group, Provider, ProviderKey, Routing, Settings, S
 use crate::gateway::client;
 use crate::gateway::usage;
 use crate::presets;
+use crate::trace;
 
 const INDEX_HTML: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -101,6 +102,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/caller-keys/{id}", delete(api_delete_caller_key))
         .route("/api/usage", get(api_usage))
+        .route("/api/traces", get(api_traces))
+        .route("/api/traces/export", get(api_traces_export))
+        .route("/api/traces/sessions", get(api_trace_sessions))
+        .route("/api/traces/sessions/{id}", get(api_trace_session))
+        .route("/api/traces/{id}", get(api_trace))
         .route("/api/projects", get(api_projects).patch(api_update_project))
         .route("/api/projects/merge", post(api_merge_projects))
         // SPA deep links: everything that is not an API path or a known
@@ -1879,7 +1885,7 @@ async fn api_test_provider(
                 Json(json!({"error": e.to_string()})),
             )
         })?;
-        client::session_headers(provider.protocol, &provider, &session)
+        client::session_headers(provider.protocol, &provider, &session, None)
     } else {
         let Some(key) = provider.enabled_keys().next().cloned() else {
             return Err((
@@ -1887,7 +1893,7 @@ async fn api_test_provider(
                 Json(json!({"error": "the provider has no key"})),
             ));
         };
-        client::auth_headers(provider.protocol, &provider, &key.key, None, None)
+        client::auth_headers(provider.protocol, &provider, &key.key, None, None, None)
     };
     let base = provider.base_url.clone().ok_or_else(|| {
         (
@@ -2282,6 +2288,163 @@ fn usage_query(query: &BTreeMap<String, String>) -> UsageWindow {
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_else(|| "usd".to_string());
     (days, currency)
+}
+
+/// The trace list: one row per trace, newest first.
+///
+/// A trace is a task: the caller's own trace id when it sent one, the
+/// session otherwise. Each row says how many requests it holds, how many
+/// vendor calls those took, and what they cost.
+async fn api_traces(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let (days, _) = usage_query(&query);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let spans = trace_spans_since(&state, &cutoff);
+    let filtered = filter_spans(spans, &query);
+    let traces = trace::summarize(&filtered);
+    Json(json!({
+        "traces": traces,
+        "spans": filtered.len(),
+        "cutoff": cutoff,
+    }))
+}
+
+/// One trace, with the tree of spans under it.
+async fn api_trace(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    let id = urlencoding_decode(&id);
+    let spans = match &state.sqlite {
+        Some(store) => store.trace(&id),
+        None => trace::trace_spans(&trace::read_all(&state.trace_path()), &id),
+    };
+    Json(json!({
+        "trace_id": id,
+        "spans": spans,
+        "tree": trace::tree(&spans),
+        "summary": trace::summarize(&spans),
+    }))
+}
+
+/// The sessions the gateway has seen, with the whole chain of each.
+///
+/// A session is the unit a person thinks in: one conversation, every
+/// request it made, every vendor call those took — even when the requests
+/// were filed under different trace ids.
+async fn api_trace_sessions(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Json<Value> {
+    let (days, _) = usage_query(&query);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let spans = filter_spans(trace_spans_since(&state, &cutoff), &query);
+    let sessions: Vec<trace::SessionSummary> = trace::summarize_sessions(&spans)
+        .into_iter()
+        .map(|mut session| {
+            session.title = crate::sessions::title_of(&session.session_id)
+                .filter(|title| !title.trim().is_empty());
+            session
+        })
+        .collect();
+    Json(json!({ "sessions": sessions, "spans": spans.len() }))
+}
+
+/// One session, with its whole chain: every request and every vendor call,
+/// gathered from every trace id they were filed under.
+async fn api_trace_session(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
+    let id = urlencoding_decode(&id);
+    let spans = match &state.sqlite {
+        Some(store) => store.session_trace(&id),
+        None => trace::session_spans(&trace::read_all(&state.trace_path()), &id),
+    };
+    let tree = trace::session_view(&spans, &id);
+    let mut summary = trace::summarize_sessions(&spans);
+    if let Some(first) = summary.first_mut() {
+        first.title = crate::sessions::title_of(&id).filter(|title| !title.trim().is_empty());
+    }
+    Json(json!({
+        "session_id": id,
+        "title": crate::sessions::title_of(&id),
+        "spans": spans,
+        "tree": tree,
+        "summary": summary,
+    }))
+}
+
+/// The trace log, as a file an auditor can take away.
+async fn api_traces_export(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Response {
+    let (days, _) = usage_query(&query);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let spans = filter_spans(trace_spans_since(&state, &cutoff), &query);
+    let format = query
+        .get("format")
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_else(|| "csv".to_string());
+    let (body, content_type, name) = if format == "jsonl" {
+        let mut out = String::new();
+        for span in &spans {
+            if let Ok(line) = serde_json::to_string(span) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        (out, "application/x-ndjson", "traces.jsonl")
+    } else {
+        (trace::to_csv(&spans), "text/csv", "traces.csv")
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header(
+            "content-disposition",
+            format!("attachment; filename=\"{name}\""),
+        )
+        .body(axum::body::Body::from(body))
+        .unwrap()
+}
+
+/// Every span since the cutoff, from whichever store is on.
+fn trace_spans_since(state: &AppState, cutoff: &str) -> Vec<trace::Span> {
+    if let Some(store) = &state.sqlite {
+        store.spans_since(cutoff)
+    } else {
+        trace::read_all(&state.trace_path())
+            .into_iter()
+            .filter(|s| s.started_at.as_str() >= cutoff)
+            .collect()
+    }
+}
+
+/// Keep only the spans the filters ask for.
+fn filter_spans(spans: Vec<trace::Span>, query: &BTreeMap<String, String>) -> Vec<trace::Span> {
+    let wanted = |key: &str| -> Option<String> {
+        query
+            .get(key)
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    };
+    let session = wanted("session");
+    let provider = wanted("provider");
+    let agent = wanted("agent");
+    let project = wanted("project");
+    spans
+        .into_iter()
+        .filter(|span| {
+            let keep = |needle: &Option<String>, value: Option<&str>| match needle {
+                Some(needle) => value
+                    .map(|value| value.to_lowercase().contains(&needle.to_lowercase()))
+                    .unwrap_or(false),
+                None => true,
+            };
+            keep(&session, span.session_id.as_deref())
+                && keep(&provider, span.provider.as_deref())
+                && keep(&agent, span.agent.as_deref())
+                && keep(&project, span.project.as_deref())
+        })
+        .collect()
 }
 
 async fn api_usage(

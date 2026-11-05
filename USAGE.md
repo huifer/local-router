@@ -161,6 +161,7 @@ curl -H "Authorization: Bearer local-router" http://127.0.0.1:3435/v1/models
 | **Models** | 所有对外暴露的模型（`provider/model`）一览 |
 | **Groups** | 路由组：成员、策略、粘性、列出与否 |
 | **Usage** | 用量：Overview / Sessions / Projects / Context / Quota / Bills |
+| **Traces** | 链路追踪：一次任务 → 它的每次请求 → 每次上游调用 |
 | **Settings** | 端口、绑定地址、调用 key、遮蔽开关、caller key |
 
 **Usage 页的子页签**：
@@ -169,6 +170,29 @@ curl -H "Authorization: Bearer local-router" http://127.0.0.1:3435/v1/models
 - **Projects**：按工作目录分组，可改名/配色/设预算/合并
 - **Context**：上下文窗口拆解（系统提示 / 工具定义 / 附件 / 对话各占多少 token）
 - **Quota**：WorkBuddy、QwenWork 的额度窗口与重置时间
+
+**Traces 页**有两个视图：
+
+- **按会话**（默认）：一个会话 = 一条完整链路。列表里每行是一个会话
+  （标题、agent、涉及的上游、请求数、上游调用数、花费、跨了几条 trace），
+  点开是这个会话的完整树 —— 同一个会话的请求哪怕带着不同的 trace id
+  （编排层给子任务起的 id），也都收在这一棵树里：
+
+```
+session sess-demo-1   claude-code   demo   3 条链路  3 req  3 calls  $0.0000
+└─ 会话
+   ├─ request demo/demo-small  第一步  0.0s
+   │  └─ attempt 1  demo · demo-small  1ms  ok 200  in 11 out 7  id=chatcmpl-demo-1
+   ├─ request demo/demo-small  第二步  0.0s
+   │  └─ attempt 1  demo · demo-small  1ms  ok 200  in 11 out 7  id=chatcmpl-demo-1
+   └─ request demo/demo-small  第三步  0.0s
+      └─ attempt 1  demo · demo-small  1ms  ok 200  in 11 out 7  id=chatcmpl-demo-1
+```
+
+- **按任务**：一条 trace（调用方的 trace id，或会话派生的 id）自己的树。
+
+顶部的搜索框按 trace / 会话 / agent / 上游筛；CSV、JSONL 两个按钮把链路
+日志导出来（对账、审计用）。
 
 ### 2.2 交互模式（小白友好）
 
@@ -240,6 +264,13 @@ local-router usage                  # 近 7 天表格
 local-router usage --period today
 local-router usage --csv            # 机器可读
 
+# 链路追踪
+local-router traces                       # 最近的链路
+local-router traces --session sess-42     # 只看某个会话
+local-router traces --provider anthropic  # 只看碰过某厂商的链路
+local-router trace --session sess-42      # 一个会话的完整链路（树）
+local-router trace trc_16c1f6a3d4ba4a08   # 一条任务的树
+
 # 登录态上游
 local-router workbuddy status|credits|models|checkin
 local-router qwen status|credits|models
@@ -302,6 +333,7 @@ curl $BASE/v1/messages/count_tokens -H "x-api-key: $KEY" \
 鉴权头四种都收：`Authorization: Bearer <key>`、`x-api-key`、`x-goog-api-key`、
 `api-key`。key 取 `LOCAL_ROUTER_DEFAULT_KEY` → 设置里的默认 key → 任一
 caller key；一把都没有时**拒绝一切请求**。
+
 
 ### 2.6 开机自启（以后不用再手动启动）
 
@@ -523,7 +555,35 @@ EOF
 之后在控制台点「刷新模型」，新列出且匹配的模型会自动并入 provider 并
 落盘。
 
----
+### 场景 L：想知道一条会话到底花了多少上游调用
+
+控制台 **Traces** 页，或命令行：
+
+```sh
+local-router traces --session sess-42
+local-router trace trc_16c1f6a3d4ba4a08
+```
+
+每次请求、每次上游调用（含失败、降级、被跳过的）都是一个 span，串成
+session → 请求 → 上游调用的树。按会话看就是一条会话的完整链路：
+
+```sh
+local-router trace --session sess-42
+```
+
+如果 agent / 编排层自己有一套 trace id，直接带上，网关会沿用，
+两边的记录就是同一条：
+
+```sh
+curl http://127.0.0.1:3435/v1/chat/completions \
+  -H "authorization: Bearer local-router" \
+  -H "x-trace-id: task-42" \
+  -H "x-task-id: sub-agent-2" \
+  -d '{"model":"group/main","messages":[{"role":"user","content":"hi"}]}'
+```
+
+`x-task-id` 是可选的子任务名：编排层知道自己的子 agent 边界时带上，
+链路里就能分出「第几步」。不带也能用，只是少一层。
 
 ## 4. 配置与文件
 
@@ -536,6 +596,7 @@ EOF
 | `config.json` | providers、groups、settings、caller-keys（0600） |
 | `usage.jsonl` | 每请求一行：模型、provider、token、时延、状态、成本 |
 | `usage.db` | 同一份记录的 SQLite 视图（`LOCAL_ROUTER_DISABLE_SQLITE=1` 可关） |
+| `traces.jsonl` | 链路日志：每行一个 span（会话 / 请求 / 上游调用） |
 | `sessions.json` | 会话标题簿 |
 | `projects.json` | 项目注册表（名称 / 颜色 / 预算） |
 | `prices.json` | 可选：价目表覆盖 |
@@ -557,7 +618,8 @@ CLI 或控制台改了 `config.json`，网关在**下一个请求**自动重载�
 | `gateway_addr` / `web_addr` | 绑定地址 |
 | `lan` | 是否绑 0.0.0.0（局域网可用） |
 | `default_caller_key` | 调用方默认用的 key |
-| `record_usage` | 是否记录用量 |
+| `record_usage` | 是否记录用量（关掉时链路也不记） |
+| `trace_metadata` | 是否把 trace id 写进请求体（给会自己留档的厂商，如 OpenAI Responses）。请求头里始终带着 trace id |
 | `masking` | 是否在发往上游前遮蔽提示词里的密钥 |
 | `workbuddy_auto_checkin` | 是否自动领 WorkBuddy 每日签到（默认开） |
 | `send_agent_user_agent` | 是否把 agent 的 User-Agent 转发给上游 |
@@ -574,6 +636,7 @@ CLI 或控制台改了 `config.json`，网关在**下一个请求**自动重载�
 | `LOCAL_ROUTER_LAN` | `1` 等价于 `--lan` |
 | `LOCAL_ROUTER_LOG` | 日志过滤（如 `debug`） |
 | `LOCAL_ROUTER_USAGE_MAX_BYTES` | 用量日志翻页上限（默认 8 MB） |
+| `LOCAL_ROUTER_TRACE_MAX_BYTES` | 链路日志翻页上限（默认 8 MB） |
 | `LOCAL_ROUTER_DISABLE_SQLITE` | `1` 关掉 SQLite，只用 JSONL |
 | `LOCAL_ROUTER_WORKBUDDY_SESSION` / `_ENDPOINT` / `WORKBUDDY_HOME` | WorkBuddy 登录态与端点 |
 | `LOCAL_ROUTER_QWEN_SESSION` / `LOCAL_ROUTER_QWEN_ENDPOINT` | QwenWork 会话与端点 |

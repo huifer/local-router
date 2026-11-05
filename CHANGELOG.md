@@ -8,6 +8,34 @@
 
 ### Added
 
+- **会话 ↔ 上游调用的链路追踪**：一个大任务被拆成很多次模型调用时，现在能
+  回答「这次会话一共调了谁、调了几次、卡在哪一步」：
+  - 每个请求开一个 **span**，每次上游尝试（成功、失败、降级都算）再开一个
+    子 span，串成 `session → request → upstream` 的树；
+  - **会话是完整的链路**：控制台默认「按会话」看——同一会话的请求哪怕带着
+    不同的 trace id（编排层给子任务起的），也收在一棵树里；「按任务」看
+    的是单条 trace。命令行 `local-router trace --session <id>` 同样给整条
+    会话链路；
+  - **trace id 逐层下传**：请求头发给上游时带 `x-trace-id` / `x-span-id` /
+    `x-session-id` / `x-request-id` / `x-task-id`，厂商（或中转）自己的日志里
+    就有这个 id，可以反查回会话；调用方自带 `x-trace-id`（或
+    `metadata.trace_id`）时网关沿用它，编排层的 trace 与网关的 trace 是同一条；
+  - **厂商自己的 request id 也留着**（`chatcmpl-…` / `msg_…`），厂商账单或日志
+    里的一条记录能反查回是哪次会话的哪一步；
+  - 落盘在 `usage.db` 的 `trace_spans` 表与同目录的 `traces.jsonl`
+    （`LOCAL_ROUTER_TRACE_MAX_BYTES` 控制翻页大小）；
+  - 控制台新增 **Traces 页**：默认按会话（每行一个会话，点开是完整链路），
+    可切到按任务；按 trace / 会话 / agent / 上游筛选；导出 csv / jsonl；
+  - 命令行新增 `local-router traces`（列表，可按 `--session` / `--provider` /
+    `--agent` 过滤）与 `local-router trace <id>`（一棵树，
+    `--session <id>` 看整个会话）；
+  - 新增接口 `GET /api/traces`、`GET /api/traces/{id}`、
+    `GET /api/traces/sessions`、`GET /api/traces/sessions/{id}`、
+    `GET /api/traces/export`；
+  - 新增设置 `trace_metadata`（默认关）：把 trace id 也写进请求体的
+    `metadata`，给会自己留档的厂商用（OpenAI Responses）；请求头里始终带着
+    trace id。
+
 - **直接测试对话**：控制台 provider 抽屉新增「测试对话」，会发送一条最小 ping 并显示耗时；命令行使用 `local-router provider test <provider-id>`，输出耗时与上游回复。QwenWork/Trae CN 会走各自专用协议，不再被错误地当成普通 OpenAI 上游。
 - **API Key 级用量统计**：Usage/HTTP API/CLI 现在分开统计上游 Provider API Key 与 local-router 调用方 API Key，包含请求数、失败数、输入/输出/缓存/推理 token、美元成本与 credits；CSV 和最近请求明细也带上 Key 标识。
 - **单 Key 最大并发**：Provider API Key 可配置最大同时进行的请求数，超过限制的请求排队；支持 `provider concurrency <provider> <key-id|session> <limit>`，`0` 取消限制。会话型 provider 的 `session` 使用 provider 级兜底限制。

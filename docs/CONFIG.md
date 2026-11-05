@@ -25,6 +25,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `projects.json` | 项目登记簿（目录 → 名称/颜色/预算） | 网关 + 控制台 | JSON |
 | `usage.jsonl` | 每请求一行的用量账本 | 网关自动 | JSONL（>8 MB 翻页） |
 | `usage.db` | 同一份用量的 SQLite 视图 | 网关自动 | SQLite（可关） |
+| `traces.jsonl` | 链路日志：每行一个 span（会话 / 请求 / 上游调用） | 网关自动 | JSONL（>8 MB 翻页） |
 | `workbuddy-session.json` | WorkBuddy 登录态 token | 浏览器登录时 | JSON（0600） |
 | `qwen-session.json` | QwenWork 设备流 token | 设备流登录时 | JSON（0600） |
 | `daemon/daemon.log` | 守护进程日志 | 自动 | 文本 |
@@ -156,6 +157,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
   "send_agent_user_agent": false,
   "masking": false,
   "record_usage": true,
+  "trace_metadata": false,
   "locale": "zh-CN",
   "cors_origins": [],
   "workbuddy_auto_checkin": true
@@ -170,7 +172,8 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `default_caller_key` | 调用方没带 key 时用哪把 |
 | `send_agent_user_agent` | 把 agent 的 User-Agent 转给上游 |
 | `masking` | 遮蔽提示词里的密钥再发出去 |
-| `record_usage` | 是否记账 |
+| `record_usage` | 是否记账（关掉时链路也不记） |
+| `trace_metadata` | 是否把 trace id 写进请求体的 `metadata`（给会自己留档的厂商，如 OpenAI Responses）。请求头里始终带着 trace id |
 | `locale` | 控制台语言 |
 | `cors_origins` | 允许哪些浏览器源跨域调网关（默认空 = 不允许） |
 | `workbuddy_auto_checkin` | 是否自动领 WorkBuddy 每日签到 |

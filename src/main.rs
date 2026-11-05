@@ -7,7 +7,7 @@
 pub(crate) mod console;
 
 use local_router::{
-    config, gateway, presets, pricing, protocol, qwen, server, store, trae, web, workbuddy,
+    config, gateway, presets, pricing, protocol, qwen, server, store, trace, trae, web, workbuddy,
 };
 
 use std::collections::BTreeMap;
@@ -52,6 +52,10 @@ enum Command {
     Ls,
     /// Show the recorded usage.
     Usage(UsageArgs),
+    /// Show the traces: one task, and the vendor calls it made.
+    Traces(TracesArgs),
+    /// Show one trace, as a tree.
+    Trace(TraceArgs),
     /// Point Claude Code at a model.
     Claude(AgentModelArgs),
     /// Point Codex at a model.
@@ -215,6 +219,39 @@ struct UsageArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct TracesArgs {
+    /// Print csv instead of a table.
+    #[arg(long)]
+    csv: bool,
+    /// How far back to look: today, 7d, 30d or all.
+    #[arg(long, default_value = "7d")]
+    period: String,
+    /// Only the traces of this session.
+    #[arg(long)]
+    session: Option<String>,
+    /// Only the traces that touched this provider.
+    #[arg(long)]
+    provider: Option<String>,
+    /// Only the traces from this agent.
+    #[arg(long)]
+    agent: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+struct TraceArgs {
+    /// The trace id.
+    #[arg(required_unless_present = "session")]
+    id: Option<String>,
+    /// Show a whole session instead: every request it made and every vendor
+    /// call those took, gathered from every trace id.
+    #[arg(long)]
+    session: Option<String>,
+    /// How far back to look: today, 7d, 30d or all.
+    #[arg(long, default_value = "all")]
+    period: String,
+}
+
+#[derive(Args, Debug, Clone)]
 struct AgentModelArgs {
     /// The model, as `provider/model` or `group/id`.
     model: String,
@@ -347,6 +384,8 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Group(cmd)) => group_cmd(cmd).await,
         Some(Command::Ls) => ls().await,
         Some(Command::Usage(args)) => usage(args).await,
+        Some(Command::Traces(args)) => traces(args),
+        Some(Command::Trace(args)) => trace(args),
         Some(Command::Claude(args)) => set_agent("claude", args).await,
         Some(Command::Codex(args)) => set_agent("codex", args).await,
         Some(Command::Gemini(args)) => set_agent("gemini", args).await,
@@ -1059,7 +1098,7 @@ async fn test_provider(
     // when the request goes out.
     let (headers, _token) = if provider.uses_session() {
         let session = workbuddy::session().await?;
-        let headers = gateway::client::session_headers(provider.protocol, provider, &session);
+        let headers = gateway::client::session_headers(provider.protocol, provider, &session, None);
         (headers, session.access_token.clone())
     } else {
         let key = provider
@@ -1067,7 +1106,7 @@ async fn test_provider(
             .next()
             .context("the provider has no key")?;
         (
-            gateway::client::auth_headers(provider.protocol, provider, &key.key, None, None),
+            gateway::client::auth_headers(provider.protocol, provider, &key.key, None, None, None),
             key.key.clone(),
         )
     };
@@ -2143,6 +2182,247 @@ async fn ls() -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+// ------------------------------------------------------------- the trace --
+
+/// How many days back a period reaches.
+fn period_days(period: &str) -> i64 {
+    match period {
+        "today" | "24h" => 1,
+        "7d" => 7,
+        "30d" => 30,
+        _ => 3650,
+    }
+}
+
+/// Every span the trace log holds, from whichever store is on.
+fn load_spans(period: &str) -> Vec<trace::Span> {
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(period_days(period))).to_rfc3339();
+    match store::Store::shared() {
+        Some(store) => store.spans_since(&cutoff),
+        None => trace::read_all(&Store::new().trace_path())
+            .into_iter()
+            .filter(|s| s.started_at.as_str() >= cutoff.as_str())
+            .collect(),
+    }
+}
+
+/// The trace list: one row per task.
+fn traces(args: TracesArgs) -> anyhow::Result<()> {
+    let spans = load_spans(&args.period);
+    let spans: Vec<trace::Span> = spans
+        .into_iter()
+        .filter(|span| {
+            let keep = |needle: &Option<String>, value: Option<&str>| match needle {
+                Some(needle) => value
+                    .map(|value| value.to_lowercase().contains(&needle.to_lowercase()))
+                    .unwrap_or(false),
+                None => true,
+            };
+            keep(&args.session, span.session_id.as_deref())
+                && keep(&args.provider, span.provider.as_deref())
+                && keep(&args.agent, span.agent.as_deref())
+        })
+        .collect();
+    let summaries = trace::summarize(&spans);
+
+    if args.csv {
+        println!("trace_id,sessions,agents,requests,upstream_calls,failed,providers,cost_usd,credits,input_tokens,output_tokens,started_at");
+        for s in &summaries {
+            println!(
+                "{},{},{},{},{},{},{},{:.6},{:.4},{},{},{}",
+                s.trace_id,
+                s.sessions.join(";"),
+                s.agents.join(";"),
+                s.requests,
+                s.upstream_calls,
+                s.failed,
+                s.providers.join(";"),
+                s.cost_usd,
+                s.credits,
+                s.input_tokens,
+                s.output_tokens,
+                s.started_at,
+            );
+        }
+        return Ok(());
+    }
+
+    if summaries.is_empty() {
+        println!("no traces recorded yet.");
+        println!();
+        println!("The gateway writes a span for every request and every vendor call.");
+        println!("Send a request through it, or point an agent at it, and come back.");
+        return Ok(());
+    }
+
+    println!("{} traces, {} spans", summaries.len(), spans.len());
+    println!();
+    for s in &summaries {
+        let session = s.sessions.first().cloned().unwrap_or_else(|| "-".into());
+        let agent = s.agents.first().cloned().unwrap_or_else(|| "-".into());
+        println!(
+            "  {:<22} {:<24} {:<12} {:>3} req {:>3} calls  ${:<8.4} {}",
+            s.trace_id,
+            truncate(&session, 24),
+            truncate(&agent, 12),
+            s.requests,
+            s.upstream_calls,
+            s.cost_usd,
+            s.providers.join(", "),
+        );
+    }
+    println!();
+    println!("local-router trace <id>  — the tree of one task");
+    Ok(())
+}
+
+/// One trace, as a tree — or one whole session, as a tree.
+fn trace(args: TraceArgs) -> anyhow::Result<()> {
+    let spans = load_spans(&args.period);
+    if let Some(session) = args.session.as_deref() {
+        return session_tree(spans, session);
+    }
+    let Some(id) = args.id.as_deref() else {
+        println!("give a trace id, or --session <id>");
+        return Ok(());
+    };
+    let spans = trace::trace_spans(&spans, id);
+    if spans.is_empty() {
+        println!("no trace called {} was found.", id);
+        return Ok(());
+    }
+    let summaries = trace::summarize(&spans);
+    if let Some(s) = summaries.first() {
+        println!(
+            "{}  {} request(s), {} vendor call(s), ${:.4}, {} tokens in, {} tokens out",
+            s.trace_id, s.requests, s.upstream_calls, s.cost_usd, s.input_tokens, s.output_tokens,
+        );
+        if !s.sessions.is_empty() {
+            println!("session(s): {}", s.sessions.join(", "));
+        }
+        if !s.agents.is_empty() {
+            println!("agent(s):   {}", s.agents.join(", "));
+        }
+        println!();
+    }
+    let tree = trace::tree(&spans);
+    print_tree(&tree, "");
+    Ok(())
+}
+
+/// A whole session: every request it made, and every vendor call those
+/// took — the chain as one story, not one call at a time.
+fn session_tree(spans: Vec<trace::Span>, session_id: &str) -> anyhow::Result<()> {
+    let Some(node) = trace::session_view(&spans, session_id) else {
+        println!("no session called {} was found.", session_id);
+        return Ok(());
+    };
+    let summary = trace::summarize_sessions(&spans)
+        .into_iter()
+        .find(|s| s.session_id == session_id);
+    if let Some(s) = &summary {
+        println!(
+            "session {}  {} request(s), {} vendor call(s), ${:.4}, {} tokens in, {} tokens out",
+            s.session_id, s.requests, s.upstream_calls, s.cost_usd, s.input_tokens, s.output_tokens,
+        );
+        if !s.traces.is_empty() {
+            println!("trace(s):   {}", s.traces.join(", "));
+        }
+        if !s.agents.is_empty() {
+            println!("agent(s):   {}", s.agents.join(", "));
+        }
+        if !s.providers.is_empty() {
+            println!("provider(s): {}", s.providers.join(", "));
+        }
+        println!();
+    }
+    print_tree(std::slice::from_ref(&node), "");
+    Ok(())
+}
+
+/// Print a span tree with the pipes a person expects.
+fn print_tree(nodes: &[trace::TraceNode], prefix: &str) {
+    for (index, node) in nodes.iter().enumerate() {
+        let last = index + 1 == nodes.len();
+        let branch = if last { "└─ " } else { "├─ " };
+        println!("{}{}{}", prefix, branch, describe_span(&node.span));
+        let child_prefix = format!("{}{}", prefix, if last { "   " } else { "│  " });
+        print_tree(&node.children, &child_prefix);
+    }
+}
+
+/// One line about a span.
+fn describe_span(span: &trace::Span) -> String {
+    match span.kind {
+        trace::SpanKind::Session => format!(
+            "session {}  ({})",
+            truncate(span.session_id.as_deref().unwrap_or("-"), 40),
+            span.agent.as_deref().unwrap_or("unknown agent")
+        ),
+        trace::SpanKind::Request => {
+            let mut line = format!(
+                "request {}  {}  {:.1}s",
+                span.model,
+                truncate(span.preview.as_deref().unwrap_or(""), 40),
+                span.latency_ms as f64 / 1000.0
+            );
+            if let Some(task) = &span.task_id {
+                line.push_str(&format!("  [{}]", task));
+            }
+            if !span.ok {
+                line.push_str("  failed");
+            }
+            line
+        }
+        trace::SpanKind::Upstream => {
+            let mut line = format!(
+                "attempt {}  {} · {}  {:.0}ms  {}",
+                span.attempt.unwrap_or(1),
+                span.provider.as_deref().unwrap_or("-"),
+                truncate(&span.model, 28),
+                span.latency_ms as f64,
+                if span.skipped {
+                    "skipped"
+                } else if span.ok {
+                    "ok"
+                } else {
+                    "failed"
+                },
+            );
+            if span.status > 0 {
+                line.push_str(&format!(" {}", span.status));
+            }
+            if span.input_tokens > 0 || span.output_tokens > 0 {
+                line.push_str(&format!(
+                    "  in {} out {}",
+                    span.input_tokens, span.output_tokens
+                ));
+            }
+            if let Some(cost) = span.cost_usd {
+                line.push_str(&format!("  ${cost:.4}"));
+            }
+            if let Some(id) = &span.upstream_request_id {
+                line.push_str(&format!("  id={id}"));
+            }
+            if let Some(err) = &span.error {
+                line.push_str(&format!("  ({})", truncate(err, 60)));
+            }
+            line
+        }
+    }
+}
+
+/// Cut a string to a length, with an ellipsis when it was longer.
+fn truncate(value: &str, max: usize) -> String {
+    let value = value.trim();
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 async fn usage(args: UsageArgs) -> anyhow::Result<()> {

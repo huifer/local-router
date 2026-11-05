@@ -88,6 +88,9 @@ export default function SettingsPage() {
             <SettingRow label={t("settings.recordUsage")} detail={t("settings.recordUsageDetail")}>
               <Switch checked={form.record_usage} onCheckedChange={(checked) => setForm({ ...form, record_usage: checked })} />
             </SettingRow>
+            <SettingRow label={t("settings.traceMetadata")} detail={t("settings.traceMetadataDetail")}>
+              <Switch checked={form.trace_metadata} onCheckedChange={(checked) => setForm({ ...form, trace_metadata: checked })} />
+            </SettingRow>
             <SettingRow label={t("settings.maskSecrets")} detail={t("settings.maskSecretsDetail")}>
               <Switch checked={form.masking} onCheckedChange={(checked) => setForm({ ...form, masking: checked })} />
             </SettingRow>

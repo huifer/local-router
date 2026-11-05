@@ -10,6 +10,7 @@ import ProvidersPage from "@/pages/providers";
 import ModelsPage from "@/pages/models";
 import GroupsPage from "@/pages/groups";
 import UsagePage from "@/pages/usage";
+import TracesPage from "@/pages/traces";
 import SettingsPage from "@/pages/settings";
 
 export interface AppData {
@@ -99,6 +100,7 @@ function AppInner() {
         { path: "models", element: <ModelsPage /> },
         { path: "groups", element: <GroupsPage /> },
         { path: "usage", element: <UsagePage /> },
+        { path: "traces", element: <TracesPage /> },
         { path: "settings", element: <SettingsPage /> },
         { path: "*", element: <Navigate to="/overview" replace /> },
       ],

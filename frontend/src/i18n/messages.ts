@@ -39,6 +39,7 @@ const en: Dict = {
   "nav.models": "Models",
   "nav.groups": "Routing groups",
   "nav.usage": "Usage",
+  "nav.traces": "Traces",
   "nav.settings": "Settings",
 
   // ---- overview -----------------------------------------------------------
@@ -392,6 +393,29 @@ const en: Dict = {
   "usage.noAgentsDetail": "Agents are named from their User-Agent (claude-code, codex, pi…).",
   "usage.tokenBilled": "token-billed",
 
+  // ---- traces -------------------------------------------------------------
+  "traces.filter": "Filter by trace, session, agent…",
+  "traces.count": "{count} traces",
+  "traces.empty": "No traces yet",
+  "traces.emptyDetail":
+    "The gateway writes a span for every request and every vendor call. Send a request through it and it shows up here.",
+  "traces.refreshed": "Traces refreshed",
+  "traces.exportCsv": "Download the trace log as csv",
+  "traces.exportJsonl": "Download the trace log as jsonl",
+  "traces.session": "session",
+  "traces.requests": "Requests in this trace",
+  "traces.calls": "Vendor calls in this trace",
+  "traces.req": "req",
+  "traces.callsShort": "calls",
+  "traces.ok": "ok",
+  "traces.failed": "failed",
+  "traces.vendorId": "The vendor's own id for the call",
+  "traces.skipped": "skipped",
+  "traces.sessions": "By session",
+  "traces.traces": "By task",
+  "traces.sessionCount": "{count} sessions",
+  "traces.tracesCount": "{count} traces",
+
   // ---- settings -----------------------------------------------------------
   "settings.eyebrow": "System / local configuration",
   "settings.detail": "These settings are stored on this machine and hot-reloaded by the gateway.",
@@ -408,6 +432,9 @@ const en: Dict = {
   "settings.sendUaDetail": "Some relays require the caller's own identity.",
   "settings.recordUsage": "Record usage telemetry",
   "settings.recordUsageDetail": "Every request lands in usage.jsonl and SQLite.",
+  "settings.traceMetadata": "Write trace ids into the request body",
+  "settings.traceMetadataDetail":
+    "For vendors that keep their own record of a call (OpenAI Responses). The trace headers travel either way.",
   "settings.maskSecrets": "Mask secrets in prompts",
   "settings.maskSecretsDetail": "sk-…, long hex and key-named tool fields are masked before leaving the machine.",
   "settings.autoCheckin": "WorkBuddy auto check-in",
@@ -454,6 +481,7 @@ const zh: Dict = {
   "nav.models": "模型",
   "nav.groups": "路由组",
   "nav.usage": "用量",
+  "nav.traces": "链路追踪",
   "nav.settings": "设置",
 
   "overview.systemStatus": "系统状态",
@@ -802,6 +830,28 @@ const zh: Dict = {
   "usage.noAgentsDetail": "agent 由 User-Agent 识别（claude-code、codex、pi…）。",
   "usage.tokenBilled": "按 token 计费",
 
+  "traces.filter": "按 trace、会话、agent 筛选…",
+  "traces.count": "{count} 条链路",
+  "traces.empty": "还没有链路",
+  "traces.emptyDetail":
+    "网关会为每次请求、每次上游调用各记一个 span。从网关发一次请求，这里就会出现。",
+  "traces.refreshed": "链路已刷新",
+  "traces.exportCsv": "导出 csv",
+  "traces.exportJsonl": "导出 jsonl",
+  "traces.session": "会话",
+  "traces.requests": "这条链路里的请求数",
+  "traces.calls": "这条链路里的上游调用数",
+  "traces.req": "请求",
+  "traces.callsShort": "调用",
+  "traces.ok": "成功",
+  "traces.failed": "失败",
+  "traces.vendorId": "厂商自己的请求 id",
+  "traces.skipped": "已跳过",
+  "traces.sessions": "按会话",
+  "traces.traces": "按任务",
+  "traces.sessionCount": "{count} 个会话",
+  "traces.tracesCount": "{count} 条链路",
+
   "settings.eyebrow": "系统 / 本机配置",
   "settings.detail": "这些设置保存在本机，网关会自动热重载。",
   "settings.save": "保存设置",
@@ -817,6 +867,8 @@ const zh: Dict = {
   "settings.sendUaDetail": "有些中转站要求带上调用方自己的身份。",
   "settings.recordUsage": "记录用量遥测",
   "settings.recordUsageDetail": "每个请求都会写入 usage.jsonl 与 SQLite。",
+  "settings.traceMetadata": "把 trace id 写入请求体",
+  "settings.traceMetadataDetail": "给会自己留档的厂商用（OpenAI Responses）。请求头里始终带着 trace id。",
   "settings.maskSecrets": "遮蔽提示词中的密钥",
   "settings.maskSecretsDetail": "sk-…、长十六进制串、以及名字含 key 的工具参数离开本机前会被遮蔽。",
   "settings.autoCheckin": "WorkBuddy 自动签到",

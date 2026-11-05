@@ -10,6 +10,8 @@ export interface Settings {
   send_agent_user_agent: boolean;
   masking: boolean;
   record_usage: boolean;
+  /** Write the trace ids into the request body, for vendors that keep it. */
+  trace_metadata: boolean;
   locale: string;
   /** Origins a browser may call the gateway from. Empty means none. */
   cors_origins: string[];
@@ -158,6 +160,8 @@ export interface UsageRecord {
   latency_ms: number;
   status: number;
   ok: boolean;
+  /** The attempt was never made: the provider was skipped. */
+  skipped?: boolean;
   error?: string;
   agent?: string;
   session_id?: string;
@@ -329,4 +333,121 @@ export interface ProviderAccountQuota {
   kind: "workbuddy" | "qwenwork" | "trae-cn";
   credits?: WorkBuddyCredits;
   quota?: QwenAccountQuota;
+}
+
+/** One trace: a task, and the vendor calls it made. */
+export interface TraceSummary {
+  trace_id: string;
+  sessions: string[];
+  agents: string[];
+  projects: string[];
+  models: string[];
+  providers: string[];
+  requests: number;
+  upstream_calls: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  credits: number;
+  latency_ms: number;
+  duration_ms: number;
+  started_at: string;
+  ended_at: string;
+  ok: boolean;
+}
+
+/** One node of the trace tree. */
+export interface TraceSpan {
+  trace_id: string;
+  span_id: string;
+  parent_span_id?: string;
+  kind: "session" | "request" | "upstream";
+  name: string;
+  session_id?: string;
+  task_id?: string;
+  agent?: string;
+  project?: string;
+  caller_key_id?: string;
+  model: string;
+  provider?: string;
+  provider_key_id?: string;
+  protocol?: string;
+  attempt?: number;
+  requests: number;
+  status: number;
+  ok: boolean;
+  /** The attempt was never made: the provider was skipped. */
+  skipped?: boolean;
+  error?: string;
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  cost_usd?: number;
+  credits?: number;
+  started_at: string;
+  ended_at?: string;
+  upstream_request_id?: string;
+  messages: number;
+  preview?: string;
+}
+
+/** A span and the spans under it. */
+export interface TraceNode {
+  span: TraceSpan;
+  children: TraceNode[];
+}
+
+export interface TracesData {
+  traces: TraceSummary[];
+  spans: number;
+  cutoff: string;
+}
+
+/** One session, with the whole chain of requests and vendor calls. */
+export interface SessionSummary {
+  session_id: string;
+  title?: string;
+  traces: string[];
+  agents: string[];
+  projects: string[];
+  models: string[];
+  providers: string[];
+  requests: number;
+  upstream_calls: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cost_usd: number;
+  credits: number;
+  latency_ms: number;
+  duration_ms: number;
+  started_at: string;
+  ended_at: string;
+  ok: boolean;
+}
+
+export interface TraceSessionsData {
+  sessions: SessionSummary[];
+  spans: number;
+}
+
+export interface TraceSessionDetail {
+  session_id: string;
+  title?: string;
+  spans: TraceSpan[];
+  tree: TraceNode | null;
+  summary: SessionSummary[];
+}
+
+export interface TraceDetail {
+  trace_id: string;
+  spans: TraceSpan[];
+  tree: TraceNode[];
+  summary: TraceSummary[];
 }

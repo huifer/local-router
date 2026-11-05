@@ -14,7 +14,9 @@
 - **订阅登录态上游**：WorkBuddy、QwenWork（千问办公）免 key 接入，
   自动续期、自动签到
 - **控制台**：React + TypeScript + Vite 构建的服务商 / 模型 / 路由 / 用量 /
-  会话 / 项目 / 上下文 / 额度 / 设置界面
+  会话 / 项目 / 上下文 / 额度 / 链路追踪 / 设置界面
+- **链路追踪**：每个会话与它的每次上游调用都记成 span 树，
+  session → 请求 → 上游调用，trace id 随请求下发到厂商
 - **Docker**：多阶段构建，`/data` 持久化，compose 一键起
 
 本项目为独立实现，只做网页模式 + CLI，不做桌面客户端。
@@ -75,6 +77,8 @@ local-router provider list | rm | models | expose | media | test | key
 local-router models                            # 模型目录
 local-router group add <名字> --models a/m1,b/m2 --routing order | list | rm
 local-router ls | usage [--csv] | doctor | prices
+local-router traces [--period 7d] [--session X] [--provider Y] [--csv]
+local-router trace <trace-id>
 local-router dashboard                        # 终端仪表盘（实时刷新，q 退出）
 local-router daemon start|stop|status|logs    # 后台守护进程
 local-router claude|codex|gemini|opencode <model>
@@ -381,6 +385,52 @@ Usage 页在 Overview 之外还有几个子标签，数据全部来自请求本�
 - **Quota**：登录态上游的额度窗口（WorkBuddy 资源包 / QwenWork 钱包），
   以及 `GET /v1/local-router/quotas` 的路由视角。
 
+## 链路追踪：会话 ↔ 上游调用
+
+一个大任务往往被拆成很多次模型调用，分布在多个厂商上。local-router 是
+唯一同时看到「agent 的请求」和「厂商的回答」的地方，所以它把两边的关联
+记下来：
+
+```
+session  ses_…          agent 的会话 —— 一次会话就是一条完整的链路
+ ├─ request  req_…       agent 发的一次请求
+ │   └─ upstream up_…    对某个厂商的一次尝试（含失败、降级、被跳过的）
+ └─ request  req_…
+     └─ upstream up_…
+```
+
+**按会话看，才是完整的链路。** 同一个会话的请求可能带着不同的 trace id
+（编排层给每个子任务起一个），会话视图会把它们收成一条树；按 trace 看
+则是一条任务自己的树。
+
+```
+trace  trc_…            一个任务（调用方自己的 trace id，或会话派生）
+ └─ session  ses_…      agent 的会话
+     └─ request  req_…  agent 发的一次请求
+         └─ upstream up_…  对某个厂商的一次尝试（含失败与降级）
+```
+
+- **trace id 逐层下传**：请求头里带 `x-trace-id` / `x-span-id` /
+  `x-session-id` / `x-request-id` / `x-task-id` 发给上游，厂商（或厂商前面
+  的中转）自己的日志里就有这个 id，可以反查回本地会话。调用方自己带
+  `x-trace-id`（或 body 里的 `metadata.trace_id`）时，网关沿用它，编排层
+  的 trace 与网关的 trace 就是同一条。
+- **厂商自己的 request id 也留着**：上游返回的 `chatcmpl-…` / `msg_…` 会写
+  进 span，厂商账单或日志里的一条记录，可以反查回是哪次会话的哪一步。
+- **控制台 Traces 页**：默认「按会话」——每个会话一行，点开是这个会话的
+  完整链路；切到「按任务」看单条 trace。可导出 csv / jsonl。
+- **命令行**：
+
+```sh
+local-router traces                       # 最近的链路
+local-router traces --session sess-42     # 只看某个会话
+local-router trace --session sess-42      # 一个会话的完整链路（树）
+local-router trace trc_16c1f6a3d4ba4a08   # 一条任务的树
+```
+
+- **落盘位置**：SQLite 的 `trace_spans` 表 + 同目录的 `traces.jsonl`；
+  `record_usage` 关掉时链路也不记。
+
 ## QwenWork（千问办公）：设备流登录当上游
 
 有 QwenWork 个人账号？不用 API key，走千问办公桌面客户端同款设备流登录，
@@ -520,7 +570,10 @@ any client that accepts a base URL) one routed, observable API.
 - **Session-backed providers**: WorkBuddy and QwenWork without API keys, with
   account pools, renewal, quota visibility, and check-in support.
 - **Console**: provider, model, route, usage, session, project, context, quota,
-  billing, and settings views.
+  billing, trace, and settings views.
+- **Session traceability**: every session and every upstream call it makes are
+  recorded as a span tree — session → request → vendor call — and the trace id
+  travels downstream with the request.
 - **Direct chat tests**: test a provider from the console or with
   `local-router provider test <provider-id>`.
 - **Per-key concurrency**: configure a queueing in-flight limit with
@@ -588,6 +641,8 @@ local-router provider test <provider-id>
 local-router provider concurrency <provider-id> <key-id|session> <limit>
 local-router models
 local-router usage --period today
+local-router traces --period 7d
+local-router trace <trace-id>
 local-router doctor
 local-router dashboard
 local-router workbuddy status|credits|login|checkin|models
@@ -615,6 +670,7 @@ Important files include:
 
 - `config.json`: providers, groups, settings, and caller keys.
 - `usage.jsonl` and `usage.db`: request usage and billing records.
+- `traces.jsonl`: the trace log — one line per span (session, request, vendor call).
 - `sessions.json` and `projects.json`: local observability metadata.
 - `workbuddy-session.json` and `qwen-session.json`: local login sessions.
 - `prices.json`: optional pricing overrides.
@@ -671,6 +727,49 @@ LOCAL_ROUTER_COOLDOWN_MAX_SECS=300 \
 local-router serve
 ```
 
+### Session traceability
+
+One large task is usually many model calls, spread over several vendors.
+local-router is the only place that sees both the agent's request and the
+vendor's answer, so it keeps the link between them:
+
+```text
+session  ses_…          the agent's session — one session is one whole chain
+ ├─ request  req_…       one request the agent made
+ │   └─ upstream up_…    one attempt at one vendor (failures included)
+ └─ request  req_…
+     └─ upstream up_…
+```
+
+**The session is the complete chain.** The requests of one session may carry
+different trace ids (an orchestrator names each of its sub-tasks), and the
+session view gathers them into one tree; the trace view is one task's tree.
+
+- **The trace id travels downstream**: every upstream request carries
+  `x-trace-id`, `x-span-id`, `x-session-id`, `x-request-id` and `x-task-id`,
+  so the vendor's own log (or the relay in front of it) can be read back into
+  the session that caused it. When the caller sends its own `x-trace-id` (or
+  `metadata.trace_id`), local-router keeps it, so an orchestrator's trace and
+  the gateway's trace are the same one.
+- **The vendor's own request id is kept**: the `chatcmpl-…` / `msg_…` a vendor
+  returns is written into the span, so a line on an invoice or in a vendor
+  log can be traced back to the session and the step that caused it.
+- **The console's Traces view** opens on "by session": one row per session,
+  and the whole chain of that session when it is expanded. Switch to "by
+  task" for a single trace. It exports csv and jsonl.
+- **From the shell**:
+
+```sh
+local-router traces                       # the recent traces
+local-router traces --session sess-42     # one session's traces
+local-router trace --session sess-42      # one session, whole chain, as a tree
+local-router trace trc_16c1f6a3d4ba4a08   # one trace, as a tree
+```
+
+Traces land in the `trace_spans` table of `usage.db` and in `traces.jsonl`
+next to it. With `record_usage` turned off, nothing is recorded — not the
+usage, not the trace.
+
 ### API endpoints
 
 | Endpoint | Purpose |
@@ -683,6 +782,11 @@ local-router serve
 | `GET /health` | Health check |
 | `POST /api/providers/{id}/test` | Direct provider chat test |
 | `GET /api/cooldowns` | Current 429 cooldowns |
+| `GET /api/traces` | The trace list (one row per task) |
+| `GET /api/traces/{id}` | One trace, with its span tree |
+| `GET /api/traces/sessions` | The session list (one row per session) |
+| `GET /api/traces/sessions/{id}` | One session, with its whole chain |
+| `GET /api/traces/export` | The trace log as csv or jsonl |
 
 ### Security and privacy
 

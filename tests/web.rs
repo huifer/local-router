@@ -621,3 +621,39 @@ async fn the_console_guard_does_not_leak_onto_the_model_api() {
         .unwrap();
     assert_ne!(gateway.status(), StatusCode::FORBIDDEN);
 }
+
+// ------------------------------------------------------------- the trace --
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_trace_list_answers_with_the_traces_it_has() {
+    let state = state_at("127.0.0.1").await;
+    // Nothing has been traced yet: the list is empty, not broken.
+    let (status, body) = get(state.clone(), "/api/traces").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["traces"].as_array().unwrap().len(), 0);
+
+    // The export answers too, with the same (empty) truth.
+    let (status, body) = get(state.clone(), "/api/traces/export?format=csv").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.starts_with("trace_id,span_id"));
+
+    // A trace nobody has heard of is an empty tree, not a 500.
+    let (status, body) = get(state.clone(), "/api/traces/trc_nope").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["spans"].as_array().unwrap().len(), 0);
+
+    // The session list answers too.
+    let (status, body) = get(state.clone(), "/api/traces/sessions").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["sessions"].as_array().unwrap().len(), 0);
+
+    // And one session's whole chain.
+    let (status, body) = get(state, "/api/traces/sessions/sess-nope").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(value["session_id"], "sess-nope");
+    assert!(value["tree"].is_null());
+}

@@ -460,6 +460,12 @@ pub struct Settings {
     pub masking: bool,
     /// Keep a record of every request.
     pub record_usage: bool,
+    /// Write the trace ids into the request body as well, for vendors that
+    /// keep their own record of a call (OpenAI's Responses protocol). Off
+    /// by default: a vendor that rejects unknown fields would break the
+    /// request. The trace headers travel either way.
+    #[serde(default)]
+    pub trace_metadata: bool,
     /// The user's locale for the web UI.
     pub locale: String,
     /// Origins a browser may call the gateway from. Empty means none:
@@ -486,6 +492,7 @@ impl Default for Settings {
             send_agent_user_agent: false,
             masking: false,
             record_usage: true,
+            trace_metadata: false,
             locale: "zh-CN".to_string(),
             cors_origins: Vec::new(),
             workbuddy_auto_checkin: true,
@@ -845,6 +852,14 @@ impl Store {
             .unwrap_or_else(|| config_dir().join("usage.jsonl"))
     }
 
+    /// Where the trace log lives: next to the usage log.
+    pub fn trace_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(|dir| dir.join("traces.jsonl"))
+            .unwrap_or_else(|| config_dir().join("traces.jsonl"))
+    }
+
     pub fn load(&self) -> anyhow::Result<Config> {
         if !self.path.exists() {
             return Ok(Config::default());
@@ -943,6 +958,11 @@ impl AppState {
     /// Where the usage log of this configuration is written.
     pub fn usage_path(&self) -> PathBuf {
         self.store.usage_path()
+    }
+
+    /// Where the trace log lives.
+    pub fn trace_path(&self) -> PathBuf {
+        self.store.trace_path()
     }
 
     /// Pick up changes another local-router made to the file.
