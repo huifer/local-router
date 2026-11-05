@@ -1,6 +1,275 @@
 # local-router
 
-[中文](#中文) · [English](#english)
+[English](#english) · [中文](#中文)
+
+## English
+
+local-router is a local AI gateway that puts multiple model providers behind one
+process and gives coding agents (Claude Code, Codex, Gemini CLI, OpenCode, and
+any client that accepts a base URL) one routed, observable API.
+
+### Highlights
+
+- **One Rust binary**: gateway, React console, and CLI.
+- **Protocol translation**: OpenAI Chat, OpenAI Responses, Anthropic Messages,
+  and Gemini, including streaming, tools, reasoning blocks, and token usage.
+- **Routing groups**: ordered failover, rotation, usage-aware, smart, and weighted
+  routing, with sticky sessions, nested groups, and multiple keys.
+- **Multi-machine cascade**: point a provider at another local-router (or any
+  OpenAI/Anthropic/Gemini-compatible endpoint) to route through an overseas
+  egress — unified routing, failover, cooldowns, and one trace across hops.
+  Bare model ids resolve when exactly one provider serves them, so both
+  machines can keep the same model names. See
+  [examples/multi-machine](examples/multi-machine/README.md).
+- **Session-backed providers**: WorkBuddy and QwenWork without API keys, with
+  account pools, renewal, quota visibility, and check-in support.
+- **Console**: provider, model, route, usage, session, project, context, quota,
+  billing, trace, and settings views.
+- **Session traceability**: every session and every upstream call it makes are
+  recorded as a span tree — session → request → vendor call — and the trace id
+  travels downstream with the request.
+- **Direct chat tests**: test a provider from the console or with
+  `local-router provider test <provider-id>`.
+- **Per-key concurrency**: configure a queueing in-flight limit with
+  `local-router provider concurrency <provider-id> <key-id|session> <limit>`;
+  use `0` to remove the limit.
+- **429 cooldown**: after an upstream returns HTTP 429, local-router temporarily
+  stops sending requests to that provider and tries the next route target.
+- **Docker support**: multi-stage image with `/data` persistence.
+
+This project is an independent web and CLI implementation. It does not provide
+a desktop client.
+
+> For a five-minute setup, daily commands, troubleshooting, and common scenarios,
+> see [USAGE.md](USAGE.md).
+
+### Quick start
+
+Requirements: Rust 1.80+ and Node.js 24+ for building the console.
+
+```sh
+npm install && npm run build --prefix frontend
+cargo build --release
+./target/release/local-router
+```
+
+The gateway and console share `http://127.0.0.1:3435`.
+
+Docker:
+
+```sh
+docker compose up -d
+# or
+docker build -t local-router .
+docker run -p 3435:3435 -v lr-data:/data local-router
+```
+
+### Configure an agent
+
+```sh
+local-router provider add deepseek --key sk-xxx
+local-router claude deepseek/deepseek-chat
+local-router codex kimi/kimi-k2
+local-router gemini glm/glm-4.6
+local-router opencode deepseek/deepseek-chat
+```
+
+Or use environment variables:
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:3435/v1
+export OPENAI_API_KEY=local-router
+export ANTHROPIC_BASE_URL=http://127.0.0.1:3435
+export ANTHROPIC_API_KEY=local-router
+export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3435
+export GEMINI_API_KEY=local-router
+```
+
+### CLI essentials
+
+```sh
+local-router serve [--port N] [--addr A] [--lan] [--no-console]
+local-router daemon start|stop|status|logs
+local-router provider list
+local-router provider test <provider-id>
+local-router provider concurrency <provider-id> <key-id|session> <limit>
+local-router models
+local-router usage --period today
+local-router traces --period 7d
+local-router trace <trace-id>
+local-router doctor
+local-router dashboard
+local-router workbuddy status|credits|login|checkin|models
+local-router qwen status|credits|login|models
+```
+
+`provider test` sends a minimal real `ping` request and prints the latency and
+upstream response. When the daemon is running, the CLI uses the same console
+endpoint as the web button, so it shares the daemon's cooldown state. QwenWork
+and Trae CN use their dedicated protocols rather than a generic OpenAI request.
+
+`provider concurrency` sets the maximum number of in-flight requests for one
+upstream API key. Requests beyond the limit wait in a queue; use `0` to remove
+the limit. For session-backed providers, `session` sets the provider-level
+fallback; a stored API key can override the provider limit.
+
+### Configuration and local data
+
+By default, local-router stores its data in `~/.config/local-router/`; Docker
+uses `/data`. Set `LOCAL_ROUTER_HOME` to change it. Runtime credentials, session
+files, usage databases, and logs are local data and are intentionally excluded
+from this repository.
+
+Important files include:
+
+- `config.json`: providers, groups, settings, and caller keys.
+- `usage.jsonl` and `usage.db`: request usage and billing records.
+- `traces.jsonl`: the trace log — one line per span (session, request, vendor call).
+- `sessions.json` and `projects.json`: local observability metadata.
+- `workbuddy-session.json` and `qwen-session.json`: local login sessions.
+- `prices.json`: optional pricing overrides.
+
+Do not commit any of these runtime files. Use `.env` only through your local
+environment or a secret manager; never place real provider keys in source,
+issues, examples, or pull requests.
+
+### Usage, quotas, and billing
+
+Requests can be recorded in JSONL and SQLite. The console and HTTP API expose
+request counts, input/output/cache/reasoning tokens, estimated USD cost, and
+subscription credits. Set `LOCAL_ROUTER_DISABLE_SQLITE=1` to use JSONL only.
+
+The Bills view and usage APIs separate two credential dimensions:
+
+- **Provider API keys**: `provider / key_label` (or `key_id`) with requests,
+  failures, input/output/cache/reasoning tokens, cost, and credits.
+- **Caller API keys**: the local-router key used by an agent or client to enter
+  the gateway, with the same token and cost totals.
+- **Agents**: grouped from the caller User-Agent.
+
+`/api/usage` returns `by_provider_key`, `by_caller_key`, and key fields in
+`recent`. `local-router usage` and its CSV output include both dimensions.
+Provider keys and caller keys are different credentials and are intentionally
+reported separately.
+
+The quota view shows per-account windows for session-backed providers. Account
+names and IDs are masked in the console and quota responses.
+
+
+### 429 cooldown
+
+When an upstream returns HTTP 429, local-router puts that provider into a cooldown:
+
+- first cooldown: 60 seconds;
+- repeated 429 responses: exponential backoff;
+- maximum cooldown: 10 minutes;
+- while cooling down, the gateway skips the provider before sending a request;
+- routing groups can continue with another member;
+- the console and CLI test do not bypass the cooldown.
+
+Inspect the current state:
+
+```sh
+curl http://127.0.0.1:3435/api/cooldowns
+```
+
+Adjust the defaults in seconds if needed:
+
+```sh
+LOCAL_ROUTER_COOLDOWN_SECS=30 \
+LOCAL_ROUTER_COOLDOWN_MAX_SECS=300 \
+local-router serve
+```
+
+### Session traceability
+
+One large task is usually many model calls, spread over several vendors.
+local-router is the only place that sees both the agent's request and the
+vendor's answer, so it keeps the link between them:
+
+```text
+session  ses_…          the agent's session — one session is one whole chain
+ ├─ request  req_…       one request the agent made
+ │   └─ upstream up_…    one attempt at one vendor (failures included)
+ └─ request  req_…
+     └─ upstream up_…
+```
+
+**The session is the complete chain.** The requests of one session may carry
+different trace ids (an orchestrator names each of its sub-tasks), and the
+session view gathers them into one tree; the trace view is one task's tree.
+
+- **The trace id travels downstream**: every upstream request carries
+  `x-trace-id`, `x-span-id`, `x-session-id`, `x-request-id` and `x-task-id`,
+  so the vendor's own log (or the relay in front of it) can be read back into
+  the session that caused it. When the caller sends its own `x-trace-id` (or
+  `metadata.trace_id`), local-router keeps it, so an orchestrator's trace and
+  the gateway's trace are the same one.
+- **The vendor's own request id is kept**: the `chatcmpl-…` / `msg_…` a vendor
+  returns is written into the span, so a line on an invoice or in a vendor
+  log can be traced back to the session and the step that caused it.
+- **The console's Traces view** opens on "by session": one row per session,
+  and the whole chain of that session when it is expanded. Switch to "by
+  task" for a single trace. It exports csv and jsonl.
+- **From the shell**:
+
+```sh
+local-router traces                       # the recent traces
+local-router traces --session sess-42     # one session's traces
+local-router trace --session sess-42      # one session, whole chain, as a tree
+local-router trace trc_16c1f6a3d4ba4a08   # one trace, as a tree
+```
+
+Traces land in the `trace_spans` table of `usage.db` and in `traces.jsonl`
+next to it. With `record_usage` turned off, nothing is recorded — not the
+usage, not the trace.
+
+### API endpoints
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/chat/completions` | OpenAI Chat, streaming or non-streaming |
+| `POST /v1/responses` | OpenAI Responses |
+| `POST /v1/messages` | Anthropic Messages |
+| `POST /v1beta/models/{model}:generateContent` | Gemini |
+| `GET /v1/models` | Model catalog |
+| `GET /health` | Health check |
+| `POST /api/providers/{id}/test` | Direct provider chat test |
+| `GET /api/cooldowns` | Current 429 cooldowns |
+| `GET /api/traces` | The trace list (one row per task) |
+| `GET /api/traces/{id}` | One trace, with its span tree |
+| `GET /api/traces/sessions` | The session list (one row per session) |
+| `GET /api/traces/sessions/{id}` | One session, with its whole chain |
+| `GET /api/traces/export` | The trace log as csv or jsonl |
+
+### Security and privacy
+
+- The gateway is local-first and binds to loopback by default.
+- Remote console/API access requires a configured caller key.
+- Console write requests validate the browser origin.
+- Provider keys are masked in the console and are not returned by normal provider APIs.
+- Prompt secret masking can redact API-key-like text and secret-shaped tool arguments.
+- Runtime sessions, tokens, usage data, and personal account data stay outside the repository.
+
+Read [SECURITY.md](SECURITY.md) before exposing the service with `--lan` or a
+container port mapping. Please report security vulnerabilities privately using
+the channel documented there; do not open a public issue for a vulnerability.
+
+### Development
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+cd frontend && npm run build
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
+[docs/CONFIG.md](docs/CONFIG.md) for configuration details.
+
+### License
+
+MIT License. See [LICENSE](LICENSE).
 
 ## 中文
 一个本地 AI 网关：把你的所有模型服务商收进一个进程，给每个编码 agent
@@ -581,271 +850,3 @@ MIT
 
 ---
 
-## English
-
-local-router is a local AI gateway that puts multiple model providers behind one
-process and gives coding agents (Claude Code, Codex, Gemini CLI, OpenCode, and
-any client that accepts a base URL) one routed, observable API.
-
-### Highlights
-
-- **One Rust binary**: gateway, React console, and CLI.
-- **Protocol translation**: OpenAI Chat, OpenAI Responses, Anthropic Messages,
-  and Gemini, including streaming, tools, reasoning blocks, and token usage.
-- **Routing groups**: ordered failover, rotation, usage-aware, smart, and weighted
-  routing, with sticky sessions, nested groups, and multiple keys.
-- **Multi-machine cascade**: point a provider at another local-router (or any
-  OpenAI/Anthropic/Gemini-compatible endpoint) to route through an overseas
-  egress — unified routing, failover, cooldowns, and one trace across hops.
-  Bare model ids resolve when exactly one provider serves them, so both
-  machines can keep the same model names. See
-  [examples/multi-machine](examples/multi-machine/README.md).
-- **Session-backed providers**: WorkBuddy and QwenWork without API keys, with
-  account pools, renewal, quota visibility, and check-in support.
-- **Console**: provider, model, route, usage, session, project, context, quota,
-  billing, trace, and settings views.
-- **Session traceability**: every session and every upstream call it makes are
-  recorded as a span tree — session → request → vendor call — and the trace id
-  travels downstream with the request.
-- **Direct chat tests**: test a provider from the console or with
-  `local-router provider test <provider-id>`.
-- **Per-key concurrency**: configure a queueing in-flight limit with
-  `local-router provider concurrency <provider-id> <key-id|session> <limit>`;
-  use `0` to remove the limit.
-- **429 cooldown**: after an upstream returns HTTP 429, local-router temporarily
-  stops sending requests to that provider and tries the next route target.
-- **Docker support**: multi-stage image with `/data` persistence.
-
-This project is an independent web and CLI implementation. It does not provide
-a desktop client.
-
-> For a five-minute setup, daily commands, troubleshooting, and common scenarios,
-> see [USAGE.md](USAGE.md).
-
-### Quick start
-
-Requirements: Rust 1.80+ and Node.js 24+ for building the console.
-
-```sh
-npm install && npm run build --prefix frontend
-cargo build --release
-./target/release/local-router
-```
-
-The gateway and console share `http://127.0.0.1:3435`.
-
-Docker:
-
-```sh
-docker compose up -d
-# or
-docker build -t local-router .
-docker run -p 3435:3435 -v lr-data:/data local-router
-```
-
-### Configure an agent
-
-```sh
-local-router provider add deepseek --key sk-xxx
-local-router claude deepseek/deepseek-chat
-local-router codex kimi/kimi-k2
-local-router gemini glm/glm-4.6
-local-router opencode deepseek/deepseek-chat
-```
-
-Or use environment variables:
-
-```sh
-export OPENAI_BASE_URL=http://127.0.0.1:3435/v1
-export OPENAI_API_KEY=local-router
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3435
-export ANTHROPIC_API_KEY=local-router
-export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3435
-export GEMINI_API_KEY=local-router
-```
-
-### CLI essentials
-
-```sh
-local-router serve [--port N] [--addr A] [--lan] [--no-console]
-local-router daemon start|stop|status|logs
-local-router provider list
-local-router provider test <provider-id>
-local-router provider concurrency <provider-id> <key-id|session> <limit>
-local-router models
-local-router usage --period today
-local-router traces --period 7d
-local-router trace <trace-id>
-local-router doctor
-local-router dashboard
-local-router workbuddy status|credits|login|checkin|models
-local-router qwen status|credits|login|models
-```
-
-`provider test` sends a minimal real `ping` request and prints the latency and
-upstream response. When the daemon is running, the CLI uses the same console
-endpoint as the web button, so it shares the daemon's cooldown state. QwenWork
-and Trae CN use their dedicated protocols rather than a generic OpenAI request.
-
-`provider concurrency` sets the maximum number of in-flight requests for one
-upstream API key. Requests beyond the limit wait in a queue; use `0` to remove
-the limit. For session-backed providers, `session` sets the provider-level
-fallback; a stored API key can override the provider limit.
-
-### Configuration and local data
-
-By default, local-router stores its data in `~/.config/local-router/`; Docker
-uses `/data`. Set `LOCAL_ROUTER_HOME` to change it. Runtime credentials, session
-files, usage databases, and logs are local data and are intentionally excluded
-from this repository.
-
-Important files include:
-
-- `config.json`: providers, groups, settings, and caller keys.
-- `usage.jsonl` and `usage.db`: request usage and billing records.
-- `traces.jsonl`: the trace log — one line per span (session, request, vendor call).
-- `sessions.json` and `projects.json`: local observability metadata.
-- `workbuddy-session.json` and `qwen-session.json`: local login sessions.
-- `prices.json`: optional pricing overrides.
-
-Do not commit any of these runtime files. Use `.env` only through your local
-environment or a secret manager; never place real provider keys in source,
-issues, examples, or pull requests.
-
-### Usage, quotas, and billing
-
-Requests can be recorded in JSONL and SQLite. The console and HTTP API expose
-request counts, input/output/cache/reasoning tokens, estimated USD cost, and
-subscription credits. Set `LOCAL_ROUTER_DISABLE_SQLITE=1` to use JSONL only.
-
-The Bills view and usage APIs separate two credential dimensions:
-
-- **Provider API keys**: `provider / key_label` (or `key_id`) with requests,
-  failures, input/output/cache/reasoning tokens, cost, and credits.
-- **Caller API keys**: the local-router key used by an agent or client to enter
-  the gateway, with the same token and cost totals.
-- **Agents**: grouped from the caller User-Agent.
-
-`/api/usage` returns `by_provider_key`, `by_caller_key`, and key fields in
-`recent`. `local-router usage` and its CSV output include both dimensions.
-Provider keys and caller keys are different credentials and are intentionally
-reported separately.
-
-The quota view shows per-account windows for session-backed providers. Account
-names and IDs are masked in the console and quota responses.
-
-
-### 429 cooldown
-
-When an upstream returns HTTP 429, local-router puts that provider into a cooldown:
-
-- first cooldown: 60 seconds;
-- repeated 429 responses: exponential backoff;
-- maximum cooldown: 10 minutes;
-- while cooling down, the gateway skips the provider before sending a request;
-- routing groups can continue with another member;
-- the console and CLI test do not bypass the cooldown.
-
-Inspect the current state:
-
-```sh
-curl http://127.0.0.1:3435/api/cooldowns
-```
-
-Adjust the defaults in seconds if needed:
-
-```sh
-LOCAL_ROUTER_COOLDOWN_SECS=30 \
-LOCAL_ROUTER_COOLDOWN_MAX_SECS=300 \
-local-router serve
-```
-
-### Session traceability
-
-One large task is usually many model calls, spread over several vendors.
-local-router is the only place that sees both the agent's request and the
-vendor's answer, so it keeps the link between them:
-
-```text
-session  ses_…          the agent's session — one session is one whole chain
- ├─ request  req_…       one request the agent made
- │   └─ upstream up_…    one attempt at one vendor (failures included)
- └─ request  req_…
-     └─ upstream up_…
-```
-
-**The session is the complete chain.** The requests of one session may carry
-different trace ids (an orchestrator names each of its sub-tasks), and the
-session view gathers them into one tree; the trace view is one task's tree.
-
-- **The trace id travels downstream**: every upstream request carries
-  `x-trace-id`, `x-span-id`, `x-session-id`, `x-request-id` and `x-task-id`,
-  so the vendor's own log (or the relay in front of it) can be read back into
-  the session that caused it. When the caller sends its own `x-trace-id` (or
-  `metadata.trace_id`), local-router keeps it, so an orchestrator's trace and
-  the gateway's trace are the same one.
-- **The vendor's own request id is kept**: the `chatcmpl-…` / `msg_…` a vendor
-  returns is written into the span, so a line on an invoice or in a vendor
-  log can be traced back to the session and the step that caused it.
-- **The console's Traces view** opens on "by session": one row per session,
-  and the whole chain of that session when it is expanded. Switch to "by
-  task" for a single trace. It exports csv and jsonl.
-- **From the shell**:
-
-```sh
-local-router traces                       # the recent traces
-local-router traces --session sess-42     # one session's traces
-local-router trace --session sess-42      # one session, whole chain, as a tree
-local-router trace trc_16c1f6a3d4ba4a08   # one trace, as a tree
-```
-
-Traces land in the `trace_spans` table of `usage.db` and in `traces.jsonl`
-next to it. With `record_usage` turned off, nothing is recorded — not the
-usage, not the trace.
-
-### API endpoints
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat, streaming or non-streaming |
-| `POST /v1/responses` | OpenAI Responses |
-| `POST /v1/messages` | Anthropic Messages |
-| `POST /v1beta/models/{model}:generateContent` | Gemini |
-| `GET /v1/models` | Model catalog |
-| `GET /health` | Health check |
-| `POST /api/providers/{id}/test` | Direct provider chat test |
-| `GET /api/cooldowns` | Current 429 cooldowns |
-| `GET /api/traces` | The trace list (one row per task) |
-| `GET /api/traces/{id}` | One trace, with its span tree |
-| `GET /api/traces/sessions` | The session list (one row per session) |
-| `GET /api/traces/sessions/{id}` | One session, with its whole chain |
-| `GET /api/traces/export` | The trace log as csv or jsonl |
-
-### Security and privacy
-
-- The gateway is local-first and binds to loopback by default.
-- Remote console/API access requires a configured caller key.
-- Console write requests validate the browser origin.
-- Provider keys are masked in the console and are not returned by normal provider APIs.
-- Prompt secret masking can redact API-key-like text and secret-shaped tool arguments.
-- Runtime sessions, tokens, usage data, and personal account data stay outside the repository.
-
-Read [SECURITY.md](SECURITY.md) before exposing the service with `--lan` or a
-container port mapping. Please report security vulnerabilities privately using
-the channel documented there; do not open a public issue for a vulnerability.
-
-### Development
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-cd frontend && npm run build
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
-[docs/CONFIG.md](docs/CONFIG.md) for configuration details.
-
-### License
-
-MIT License. See [LICENSE](LICENSE).
