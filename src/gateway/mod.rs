@@ -2614,6 +2614,9 @@ pub fn build_qwen_body(request: &ChatRequest, model: &str) -> crate::qwen::clien
 
 /// One non-streaming attempt at a target.
 #[allow(clippy::too_many_arguments)]
+// The Err tuple carries the full usage record (≈520 bytes): big, but this is
+// the cold failure path, not the hot one worth boxing for.
+#[allow(clippy::result_large_err)]
 async fn whole_attempt(
     g: &Gateway,
     caller_protocol: Protocol,
@@ -2759,6 +2762,7 @@ async fn whole_attempt(
 
 /// One streaming attempt at a target.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::result_large_err)]
 async fn stream_attempt(
     g: &Gateway,
     caller_protocol: Protocol,
