@@ -211,6 +211,14 @@ pub struct Provider {
     /// provider-level fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_concurrency: Option<usize>,
+    /// The most requests per minute this provider may take. A local
+    /// throttle: a request it refuses moves on to the next target instead
+    /// of starting a cooldown. None means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u64>,
+    /// The most tokens per minute this provider may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpm: Option<u64>,
     /// The models this provider offers for image and video work.
     #[serde(default)]
     pub media_models: Vec<String>,
@@ -249,6 +257,8 @@ impl Default for Provider {
             stream_only: false,
             hold_when_exhausted: false,
             max_concurrency: None,
+            rpm: None,
+            tpm: None,
             media_models: Vec::new(),
             media_paths: None,
         }
@@ -428,6 +438,12 @@ pub struct CallerKey {
     /// A daily token cap, in tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daily_tokens: Option<u64>,
+    /// The most requests per minute this key may make at the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpm: Option<u64>,
+    /// The most tokens per minute this key may spend at the gateway.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpm: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monthly_cost: Option<f64>,
 }
@@ -477,6 +493,26 @@ pub struct Settings {
     /// day's credits land without anyone opening the app.
     #[serde(default = "yes")]
     pub workbuddy_auto_checkin: bool,
+    /// Export the session trace tree to a collector as OpenTelemetry OTLP
+    /// (needs the `otlp` build feature; endpoint empty = off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp: Option<OtlpSettings>,
+}
+
+/// The OTLP tracing sink. Active only with the `otlp` build feature;
+/// an empty endpoint is treated as off.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OtlpSettings {
+    /// The collector's OTLP/HTTP endpoint, e.g. `http://127.0.0.1:4318`.
+    #[serde(default)]
+    pub endpoint: String,
+    /// The service name as seen by the tracing backend.
+    #[serde(default = "default_otlp_service_name")]
+    pub service_name: String,
+}
+
+fn default_otlp_service_name() -> String {
+    "local-router".to_string()
 }
 
 impl Default for Settings {
@@ -496,6 +532,7 @@ impl Default for Settings {
             locale: "zh-CN".to_string(),
             cors_origins: Vec::new(),
             workbuddy_auto_checkin: true,
+            otlp: None,
         }
     }
 }
@@ -546,14 +583,43 @@ impl Settings {
     }
 }
 
+/// The on-disk config schema version. Bumped only on breaking changes;
+/// the gateway rejects imports that name any other version.
+pub const CURRENT_CONFIG_VERSION: u8 = 1;
+
+fn default_config_schema_version() -> u8 {
+    CURRENT_CONFIG_VERSION
+}
+
 /// The whole configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub providers: Vec<Provider>,
     pub groups: Vec<Group>,
     pub settings: Settings,
     pub caller_keys: Vec<CallerKey>,
+    /// Monotonic counter bumped on every successful config write. Clients
+    /// read it in `GET /api/config` and must echo it back on `PUT` for an
+    /// optimistic-concurrency check; a stale write loses with 409.
+    #[serde(default)]
+    pub revision: u64,
+    /// The on-disk config schema version. See [`CURRENT_CONFIG_VERSION`].
+    #[serde(default = "default_config_schema_version")]
+    pub schema_version: u8,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            providers: Vec::new(),
+            groups: Vec::new(),
+            settings: Settings::default(),
+            caller_keys: Vec::new(),
+            revision: 0,
+            schema_version: CURRENT_CONFIG_VERSION,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -729,6 +795,8 @@ mod tests {
             key: "sk-caller".into(),
             enabled: true,
             daily_tokens: None,
+            rpm: None,
+            tpm: None,
             monthly_cost: None,
         });
         store.save(&config).unwrap();
@@ -787,6 +855,50 @@ impl Config {
 
     pub fn group_mut(&mut self, id: &str) -> Option<&mut Group> {
         self.groups.iter_mut().find(|g| g.id == id)
+    }
+
+    /// Structural checks run before an imported config is written. Serialization
+    /// already guarantees the shape; these guard the cross-field invariants.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut ids = std::collections::HashSet::new();
+        for p in &self.providers {
+            if p.id.trim().is_empty() {
+                return Err("a provider id must not be empty".into());
+            }
+            if !ids.insert(p.id.clone()) {
+                return Err(format!("duplicate provider id: {}", p.id));
+            }
+        }
+        let mut gids = std::collections::HashSet::new();
+        for g in &self.groups {
+            if g.id.trim().is_empty() {
+                return Err("a group id must not be empty".into());
+            }
+            if !gids.insert(g.id.clone()) {
+                return Err(format!("duplicate group id: {}", g.id));
+            }
+        }
+        for g in &self.groups {
+            for m in &g.models {
+                // A member is `provider/model` or `group/id`; the head must name
+                // a provider or another group that exists.
+                if let Some((head, _)) = Config::split_model(m) {
+                    if !ids.contains(head) && !gids.contains(head) {
+                        return Err(format!(
+                            "group '{}' references unknown provider or group '{}'",
+                            g.id, head
+                        ));
+                    }
+                }
+            }
+        }
+        let mut cids = std::collections::HashSet::new();
+        for k in &self.caller_keys {
+            if !cids.insert(k.id.clone()) {
+                return Err(format!("duplicate caller key id: {}", k.id));
+            }
+        }
+        Ok(())
     }
 
     /// Every model the gateway serves, as `provider/model` or `group/id`.
@@ -917,6 +1029,11 @@ pub struct AppState {
     pub cooldowns: crate::gateway::cooldown::Registry,
     /// Per-provider/API-key concurrency gates shared by gateway and console.
     pub concurrency: crate::gateway::concurrency::Registry,
+    /// Local rate limits (RPM/TPM/daily budget) shared by gateway and console.
+    pub rate_limits: crate::gateway::rate_limit::Registry,
+    /// The number of requests currently being processed by the gateway. A
+    /// process-wide gauge that the `/metrics` endpoint reads out.
+    pub in_flight: Arc<AtomicU64>,
     pub started: chrono::DateTime<chrono::Utc>,
     /// The address the web page actually listens on. Startup overlays the
     /// environment and the command line on the file; handlers that care —
@@ -938,6 +1055,8 @@ impl AppState {
             sqlite: crate::store::Store::shared(),
             cooldowns: crate::gateway::cooldown::Registry::default(),
             concurrency: crate::gateway::concurrency::Registry::default(),
+            rate_limits: crate::gateway::rate_limit::Registry::default(),
+            in_flight: Arc::new(AtomicU64::new(0)),
             started: chrono::Utc::now(),
             web_bind: Arc::new(tokio::sync::RwLock::new(web_bind)),
             mtime: Arc::new(tokio::sync::Mutex::new(mtime)),
@@ -982,13 +1101,24 @@ impl AppState {
     pub async fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> anyhow::Result<T> {
         let mut guard = self.config.write().await;
         let out = f(&mut guard);
+        guard.revision += 1;
         self.store.save(&guard)?;
         drop(guard);
         *self.mtime.lock().await = self.store.mtime();
         Ok(out)
     }
+
+    /// Write a fully-validated config out and adopt it in memory, bumping the
+    /// on-disk mtime so the next request's `sync()` sees no spurious reload.
+    pub async fn commit_config(&self, config: Config) -> anyhow::Result<()> {
+        self.store.save(&config)?;
+        *self.config.write().await = config;
+        *self.mtime.lock().await = self.store.mtime();
+        Ok(())
+    }
 }
 
+use std::sync::atomic::AtomicU64;
 #[cfg(test)]
 mod config_surface_tests {
     use super::*;
@@ -1035,6 +1165,8 @@ mod config_surface_tests {
             stream_only: true,
             hold_when_exhausted: true,
             max_concurrency: Some(3),
+            rpm: Some(60),
+            tpm: Some(100000),
             media_models: vec!["img".into()],
             media_paths: None,
         });
@@ -1068,6 +1200,8 @@ mod config_surface_tests {
             key: "sk-ck".into(),
             enabled: true,
             daily_tokens: Some(10),
+            rpm: None,
+            tpm: None,
             monthly_cost: Some(1.5),
         });
 

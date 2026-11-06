@@ -5,6 +5,7 @@ pub mod config;
 pub mod dashboard;
 pub mod gateway;
 pub mod mask;
+pub mod metrics;
 pub mod oauth;
 pub mod presets;
 pub mod pricing;
@@ -18,6 +19,7 @@ pub mod store;
 #[cfg(test)]
 pub(crate) mod testenv;
 pub mod trace;
+pub mod telemetry;
 pub mod trae;
 pub mod web;
 pub mod workbuddy;

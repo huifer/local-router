@@ -9,15 +9,16 @@
 use std::collections::BTreeMap;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, Method, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::config::{AppState, Group, Provider, ProviderKey, Routing, Settings, Stays};
+use crate::config::{AppState, Config, Group, Provider, ProviderKey, Routing, Settings, Stays};
 use crate::gateway::client;
 use crate::gateway::usage;
 use crate::presets;
@@ -63,6 +64,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/providers/{id}/refresh", post(api_refresh_models))
         .route("/api/providers/{id}/test", post(api_test_provider))
         .route("/api/cooldowns", get(api_cooldowns))
+        .route("/api/rate-limits", get(api_rate_limits))
         .route("/api/providers/{id}/oauth", post(api_oauth_start))
         .route("/api/providers/{id}/login", post(api_session_login_start))
         .route(
@@ -96,6 +98,7 @@ pub fn router(state: AppState) -> Router {
             patch(api_update_group).delete(api_delete_group),
         )
         .route("/api/settings", get(api_settings).put(api_save_settings))
+        .route("/api/config", get(api_config_export).put(api_config_import))
         .route(
             "/api/caller-keys",
             get(api_caller_keys).post(api_add_caller_key),
@@ -583,6 +586,23 @@ struct UpdateProvider {
     remove_headers: Option<Vec<String>>,
     #[serde(default)]
     header_order: Option<Vec<String>>,
+    /// The provider's local rate limits. `null` (or 0) clears a limit;
+    /// absent leaves it alone.
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    rpm: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    tpm: Option<Option<u64>>,
+}
+
+/// Distinguishes "absent" (outer `None`, leaves the limit alone) from
+/// "present as null" (inner `None`, clears it). Plain
+/// `Option<Option<T>>` would collapse both to the same value.
+fn de_optional_optional<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: serde::Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 async fn api_update_provider(
@@ -604,6 +624,8 @@ async fn api_update_provider(
         forward_headers: None,
         remove_headers: None,
         header_order: None,
+        rpm: None,
+        tpm: None,
     });
     state
         .update(|config| {
@@ -648,6 +670,13 @@ async fn api_update_provider(
             }
             if let Some(v) = input.header_order {
                 p.header_order = v;
+            }
+            // `null` clears a limit; a number sets it; absent leaves it alone.
+            if let Some(v) = input.rpm {
+                p.rpm = v.filter(|n| *n > 0);
+            }
+            if let Some(v) = input.tpm {
+                p.tpm = v.filter(|n| *n > 0);
             }
             Ok(())
         })
@@ -1735,6 +1764,13 @@ async fn api_cooldowns(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"cooldowns": state.cooldowns.snapshot().await}))
 }
 
+/// The live windows of every local rate limit: how many requests and tokens
+/// each limited scope has spent in the current minute, and its running
+/// daily-token total. Budget overrun shows up here before it bites.
+async fn api_rate_limits(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({"rate_limits": state.rate_limits.snapshot()}))
+}
+
 async fn api_test_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2160,6 +2196,114 @@ async fn api_settings(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"settings": config.settings}))
 }
 
+/// Query parameters for `GET /api/config`.
+#[derive(serde::Deserialize)]
+struct ConfigExportQuery {
+    /// When true, provider and caller keys are included in the response.
+    /// Defaults to false so an accidental `curl` or console read never leaks
+    /// a key onto a terminal or into a copied payload.
+    #[serde(default)]
+    include_keys: bool,
+}
+
+/// Export the full configuration as JSON. Keys are redacted unless
+/// `?include_keys=true` is given — the safe default keeps secrets out of
+/// logs, clipboard, and the console's network pane.
+async fn api_config_export(
+    State(state): State<AppState>,
+    Query(query): Query<ConfigExportQuery>,
+) -> Response {
+    state.sync().await;
+    let mut config = state.config.read().await.clone();
+    if !query.include_keys {
+        mask_config_keys(&mut config);
+    }
+    match serde_json::to_string_pretty(&config) {
+        Ok(body) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(r#"{{"error":"could not serialize config: {e}"}}"#),
+        )
+            .into_response(),
+    }
+}
+
+/// Replace the whole configuration. The body must carry the current
+/// `revision`; an outdated one is rejected with 409 (optimistic concurrency),
+/// and an unknown `schema_version` or an invalid structure returns 400. On
+/// success the config is written atomically and its `revision` is bumped.
+async fn api_config_import(State(state): State<AppState>, Json(body): Json<Config>) -> Response {
+    if body.schema_version != crate::config::CURRENT_CONFIG_VERSION {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(
+                r#"{{"error":"unsupported config schema version {} (expected {})"}}"#,
+                body.schema_version,
+                crate::config::CURRENT_CONFIG_VERSION
+            ),
+        )
+            .into_response();
+    }
+    let current = state.config.read().await.clone();
+    if body.revision != current.revision {
+        return (
+            StatusCode::CONFLICT,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(
+                r#"{{"error":"revision conflict","expected_revision":{}}}"#,
+                current.revision
+            ),
+        )
+            .into_response();
+    }
+    if let Err(e) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(r#"{{"error":"invalid config: {e}"}}"#),
+        )
+            .into_response();
+    }
+    let mut next = body;
+    next.revision = current.revision + 1;
+    if let Err(e) = state.commit_config(next.clone()).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            format!(r#"{{"error":"could not write config: {e}"}}"#),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        format!(r#"{{"ok":true,"revision":{}}}"#, next.revision),
+    )
+        .into_response()
+}
+
+/// Redact every secret in a config copy so it can be exported without leaking
+/// keys. Importing a masked config yields providers and caller keys with empty
+/// secrets — a safe template, not a working credential set.
+fn mask_config_keys(config: &mut Config) {
+    for p in &mut config.providers {
+        for k in &mut p.keys {
+            k.key.clear();
+        }
+    }
+    for k in &mut config.caller_keys {
+        k.key.clear();
+    }
+    config.settings.default_caller_key.clear();
+}
+
 async fn api_save_settings(
     State(state): State<AppState>,
     body: Bytes,
@@ -2234,6 +2378,8 @@ async fn api_add_caller_key(
                 key,
                 enabled: input.enabled.unwrap_or(true),
                 daily_tokens: None,
+                rpm: None,
+                tpm: None,
                 monthly_cost: None,
             });
             Ok::<(), String>(())

@@ -8,6 +8,65 @@
 
 ### Added
 
+- **Prometheus `/metrics` 端点（M1 遥测）**：网关现在在 `:3435/metrics` 暴露
+  Prometheus 文本格式的实时指标——`local_router_requests_total`（by api /
+  provider / status_class / has_key）、`local_router_tokens_total`（input /
+  output / cache_read，by kind / api / provider）、`local_router_in_flight`
+  gauge、`local_router_cooldowns_active` gauge、以及 `local_router_request_
+  duration_seconds` 延迟摘要。**这些指标只做实时与速率，长期账本仍是
+  `usage.db`**，两者不是同一套真相。label 基数刻意压低（caller_key 只出
+  `has_key`，model 不做 label）。鉴权沿用现有安全模型：回环地址免鉴权，
+  绑到非回环地址时 `/metrics` 与 `/api` 一样要 caller key。设计取舍见
+  `docs/ROADMAP-observability-control.md`。
+
+- **配置快照导出/导入 + 版本号（M2 遥控地基）**：`GET /api/config` 现在导出完整配置
+  （默认**掩码所有 key**，`?include_keys=true` 才带出明文，防 `curl`/控制台把密钥
+  漏进日志或剪贴板）；`PUT /api/config` 接受完整配置，做 schema 版本校验、结构校验
+  （provider / group / caller-key id 唯一，group 成员引用的 provider 必须存在）、
+  以及基于 `revision` 的乐观���发（过期写返回 409）。成功后原子落盘（`config.json`
+  先写临时文件再 rename）并把 `revision` +1。**`config.json` 的每个写操作**（含
+  `provider add` 等增量改动）都会自增 `revision`，所以「导出 → 改 → 导入」的冲突
+  检测对任意两个写入方都成立。这是远程下发 key / 路由规则 / 限流的前置能力。
+
+- **本地限流与预算（M3）**：每个上游和每把调用方 key 现在都能配 **RPM（每分钟
+  请求数）、TPM（每分钟 token 数）与每日 token 预算**（`Provider.rpm/tpm`、
+  `CallerKey.rpm/tpm/daily_tokens`，60 秒滑动窗口，按 UTC 零点翻日）：
+  - **上游级限流是「跳过」而非「冷却」**：打满的目标直接跳到路由组里的下一个
+    目标（trace 里记 `skipped`），不会像厂商 429 那样触发冷却；全部目标都打满
+    才对调用方报 429。
+  - **调用方级限流是硬 429**：请求在路由之前就被拒绝，错误信息说明是哪条
+    限制（RPM/TPM/日预算）打满。
+  - token 在请求完成后才真正入窗（发出前并不知道成本），所以并发在途的请求
+    之间的 TPM 是事后结算的；日预算同理，超限后到 UTC 零点自动恢复。
+  - 只配了限制的 scope 才会有窗口：`GET /api/rate-limits` 只列有限流的对象，
+    并给出每分钟请求数 / token 数与当日 token 总量；网关 `/v1/local-router/status`
+    带同样的表。
+  - `/metrics` 新增 `local_router_rate_limited_total{scope}` 与
+    `local_router_rate_limits_active`。
+  - 配置入口：控制台 Provider 卡片直接填（PATCH `rpm/tpm`，`null` 或 `0` 清除）、
+    `local-router provider limit <id> --rpm N --tpm N`（0 关闭）、配置快照
+    import 同样可带。
+
+- **OTLP 导出（M4，feature flag 默认关）**：网关的内部 span 树现在可以镜像到
+  OpenTelemetry 收集器（Tempo / Jaeger / collector）——`build --features otlp`
+  打开，`settings.otlp.endpoint`（如 `http://127.0.0.1:4318`）配置，即把
+  `session → request → upstream` 整棵树以 OTLP/HTTP 二进制 protobuf 发出。
+  实现是**手写的 protobuf 编码**（不引 OpenTelemetry SDK、不加任何依赖），默认构建
+  里这个模块编译为 no-op，二进制体积与行为不变。内部字符串形式的 trace/span id
+  （`trc_…` 或调用方的 `x-trace-id`）用 SHA-256 确定性映射到 OTel 的 16/8 字节
+  id，父/子链接不变，原始 id 以 `local_router.trace_id` 等 attribute 随行。发送前
+  零依赖（feature 关 = 完全无代码），特征开启时按批（1s 间隔 / 最多 1024 span）
+  POST 到 `{endpoint}/v1/traces`。
+
+- **运维示例与 remote CLI（M5）**：新增 `examples/monitoring/`——一键起
+  Prometheus + Grafana + 网关的监控栈（含 scrape 配置和一张现成面板：请求/
+  分钟、in-flight、冷却数、token 吞吐、p99 延迟、按 provider 的请求分布、429 率），
+  并演示级联时多抓一份。新增 `local-router remote status|models|providers|
+  rate-limits|cooldowns|config --host <url> --key <k>`——薄封装直接打远端网关自己的
+  `/api`（不是新协议），让级联里的另一台机器从本机就能看状态/限流/配置。USAGE.md
+  新增「远程运维」一章，覆盖导出/导入与乐观并发、限流配置、`--lan`+caller key+反代
+  的遥控拓扑、可观测性出口。
+
 - **多机级联（主网关 + 异地上游节点）**：想在美国的 IP 出到 Anthropic、而所有
   agent 都连香港的网关，现在不用改代码也不用发明节点机制——**把另一台机器上的
   local-router 当成一个普通上游加进来**就行：

@@ -778,3 +778,86 @@ local-router daemon stop                    # 先停守护进程
 rm -rf ~/.config/local-router               # 删配置与用量
 # agent 的配置是 CLI 改写的，需要自己改回去（claude/codex/gemini/opencode）
 ```
+
+---
+
+## 8. 远程运维（多机 / 遥控）
+
+local-router 是单机单进程网关，控制面就是它自己的 HTTP API。多台机器（比如
+香港主网关 + 美国出口节点）时，不发明节点机制——把另一台 local-router 当普通
+上游加进来，再用 `--lan` + caller key + 反代就能遥控。
+
+### 8.1 远程改配置（导出 / 导入）
+
+完整配置可以导出、编辑、再导入——备份、两机迁移、git-ops 都靠它：
+
+```sh
+# 导出（默认掩码所有 key，防泄漏）
+curl -s http://127.0.0.1:3435/api/config > config.backup.json
+
+# 要带明文 key（比如完整迁移），显式要求
+curl -s "http://127.0.0.1:3435/api/config?include_keys=true" > config.full.json
+
+# 导入：JSON 里带 revision，匹配当前 revision 才写入
+curl -s -X PUT http://127.0.0.1:3435/api/config \
+  -H "content-type: application/json" --data @config.full.json
+```
+
+导入做三件事：schema 版本校验（不支持的会 400）、结构校验（provider / group /
+caller-key id 唯一、group 引用的 provider 必须存在）、以及**乐观并发**——JSON 里的
+`revision` 必须等于当前值，否则 **409**（`expected_revision` 告诉你当前是多少）。
+每个写操作（包括 `provider add` 这类增量改动）都会自增 `revision`，所以两个
+写入方同时改不会互相覆盖。`GET /api/config` 的返回里带 `revision` 和
+`schema_version`，照着填即可。
+
+### 8.2 远程限流
+
+每把上游和每把调用方 key 都能配本地限流（RPM / TPM / 日预算），配置走上面
+的导出/导入或直接改 config.json：
+
+```json
+{
+  "providers": [{
+    "id": "anthropic",
+    "rpm": 60,       // 每分钟最多 60 个请求
+    "tpm": 100000   // 每分钟最多 10 万 token
+  }],
+  "caller_keys": [{
+    "id": "laptop", "key": "sk-...", "enabled": true,
+    "rpm": 30, "daily_tokens": 500000
+  }]
+}
+```
+
+- **上游级**限流打满 = 跳过该目标换下一个（不触发 429 冷却）；全部目标都打满才
+  对调用方报 429。
+- **调用方级**限流在路由前硬拒，报 429 并说明是哪条限制打满。
+- 日预算按 UTC 零点翻日，超限后到零点自动恢复。
+- 实时看每条限制的窗口用量：`GET /api/rate-limits`（也进 `/api/status` 和
+  `/metrics` 的 `local_router_rate_limits_active` / `local_router_rate_limited_total`）。
+
+### 8.3 遥控拓扑（--lan + caller key + 反代）
+
+让一台网关能被另一台机器遥控，同时保持安全：
+
+```sh
+# 被遥控的实例：绑到非回环地址，并配置一把 caller key
+local-router serve --lan
+
+# 公网暴露时用反代/隧道，并只放行需要的路径
+# （caddy / nginx / Cloudflare Tunnel / Tailscale 任选）
+```
+
+- 非回环地址下，`/api` 和 `/metrics` 都要 `Authorization: Bearer <caller key>`
+  （和网关的调用方 key 同一套）。
+- 所有**写**请求校验 Origin，跨站写一律 403。
+- `config.json` 0600；导出默认不带 key。
+- 多机级联时，把上游机器当普通 generic provider 加进来即可，trace id 逐跳下传，
+  两台的链路是同一条。
+
+### 8.4 可观测性出口
+
+- **Prometheus**：`/metrics`（实时状态与速率；长期账本仍是 usage.db）。
+  现成的监控栈见 `examples/monitoring/`。
+- **OTLP**（需 `build --features otlp`）：`settings.otlp.endpoint` 指向收集器，
+  把 `session → request → upstream` span 树发过去。默认构建不含此代码。

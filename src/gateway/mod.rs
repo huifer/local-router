@@ -3,12 +3,14 @@
 pub mod client;
 pub mod concurrency;
 pub mod cooldown;
+pub mod rate_limit;
 pub mod route;
 pub mod usage;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use axum::body::Body;
@@ -23,6 +25,7 @@ use tokio::sync::Mutex;
 
 use crate::config::{AppState, Provider};
 use crate::gateway::usage::UsageRecord;
+use crate::metrics;
 use crate::protocol::ir::*;
 use crate::protocol::{anthropic, gemini, openai_chat, openai_responses, sse};
 use crate::store;
@@ -227,6 +230,7 @@ pub fn router(gateway: Gateway) -> axum::Router {
         .route("/v1/local-router/usage", get(usage_summary))
         .route("/v1/local-router/usage/requests", get(usage_requests))
         .route("/v1/local-router/status", get(status))
+        .route("/metrics", get(metrics))
         .with_state(gateway.clone());
     // A browser on another site may only talk to the gateway when the
     // user says so.
@@ -270,6 +274,51 @@ async fn health() -> Json<Value> {
     Json(json!({"status": "ok", "version": client::VERSION}))
 }
 
+/// Expose live metrics in Prometheus text format. Shares the gateway's auth
+/// model: open on loopback, requires a caller key when bound to a non-local
+/// address (same rule as the `/api` console paths).
+async fn metrics(State(g): State<Gateway>, headers: HeaderMap) -> Response {
+    let bind = g.state.web_bind().await;
+    let remote = !(bind.eq_ignore_ascii_case("localhost")
+        || bind
+            .parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false));
+    if remote {
+        let accepted = presented_key(&headers)
+            .filter(|k| {
+                let keys = allowed_keys(&g.state);
+                !keys.is_empty() && keys.contains(k)
+            })
+            .is_some();
+        if !accepted {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"send Authorization: Bearer <key>"}"#,
+            )
+                .into_response();
+        }
+    }
+
+    // Push live gauges, then render everything the recorder holds.
+    metrics::set_in_flight(g.state.in_flight.load(Ordering::Relaxed));
+    metrics::set_cooldowns(g.state.cooldowns.snapshot().await.len() as u64);
+    metrics::set_rate_limits(g.state.rate_limits.snapshot().len() as u64);
+    let body = metrics::render();
+    (
+        StatusCode::OK,
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 async fn status(State(g): State<Gateway>) -> Json<Value> {
     let config = g.state.config.read().await;
     Json(json!({
@@ -277,6 +326,7 @@ async fn status(State(g): State<Gateway>) -> Json<Value> {
         "providers": config.providers.len(),
         "groups": config.groups.len(),
         "models": config.model_ids().len(),
+        "rate_limits": g.state.rate_limits.snapshot(),
     }))
 }
 
@@ -649,6 +699,27 @@ async fn authorize(g: &Gateway, headers: &HeaderMap) -> Result<(), ApiError> {
 async fn authorized_caller(g: &Gateway, headers: &HeaderMap) -> Result<CallerIdentity, ApiError> {
     g.state.sync().await;
     check_auth_identity(g, headers)
+}
+
+/// The caller key's own rate limits, when the config gives it any. The
+/// built-in identities (`default`, `env-default`) carry no limits.
+async fn caller_rate_limits(g: &Gateway, caller: &CallerIdentity) -> Result<(), String> {
+    let key = {
+        let config = g.state.config.read().await;
+        config
+            .caller_keys
+            .iter()
+            .find(|k| k.id == caller.id && k.enabled)
+            .cloned()
+    };
+    let Some(key) = key else {
+        return Ok(());
+    };
+    let scope = rate_limit::caller_scope(&key.id);
+    match g.state.rate_limits.check(&scope, key.rpm, key.tpm, key.daily_tokens) {
+        rate_limit::Decision::Allow => Ok(()),
+        rate_limit::Decision::Limited { reason, .. } => Err(reason),
+    }
 }
 
 fn check_auth_identity(g: &Gateway, headers: &HeaderMap) -> Result<CallerIdentity, ApiError> {
@@ -1323,16 +1394,52 @@ async fn handle_gemini(
 }
 
 /// The pipeline every request goes through.
+/// A request-scoped guard: counts the request as in-flight while it is
+/// being processed and records its duration on drop. Dropped on every return
+/// path of `handle`, so it brackets the whole request.
+struct RequestGuard {
+    state: Arc<AtomicU64>,
+    api: &'static str,
+    start: Instant,
+}
+
+impl RequestGuard {
+    fn new(state: &AppState, api: &'static str) -> Self {
+        state.in_flight.fetch_add(1, Ordering::Relaxed);
+        RequestGuard {
+            state: state.in_flight.clone(),
+            api,
+            start: Instant::now(),
+        }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.state.fetch_sub(1, Ordering::Relaxed);
+        let seconds = self.start.elapsed().as_secs_f64();
+        metrics::record_latency(self.api, seconds);
+    }
+}
+
 async fn handle(
     g: Gateway,
     protocol: Protocol,
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    // Count this request as in-flight for the whole of its handling.
+    let _guard = RequestGuard::new(&g.state, protocol.as_str());
+
     let caller = match authorized_caller(&g, &headers).await {
         Ok(caller) => caller,
         Err(e) => return error_response(&e),
     };
+    // The caller key's own throttle, before any routing happens. A refused
+    // caller is refused outright: there is no other target to try.
+    if let Err(limits) = caller_rate_limits(&g, &caller).await {
+        return error_response(&ApiError::RateLimited(limits));
+    }
     // The CLI or the web page may have changed the file.
     g.state.sync().await;
     // Whether the gateway keeps a record of every request. The trace is
@@ -1668,6 +1775,27 @@ async fn handle(
             );
             continue;
         }
+        // The provider's own RPM/TPM throttle. It is a local limit, not a
+        // vendor 429, so skipping the target must not start a cooldown: the
+        // next target answers instead.
+        if let rate_limit::Decision::Limited { .. } = g.state.rate_limits.check(
+            &rate_limit::provider_scope(&target.provider_id),
+            provider.rpm,
+            provider.tpm,
+            None,
+        ) {
+            last_error = ApiError::RateLimited(format!(
+                "the provider {} has hit its local rate limit; try again shortly",
+                target.provider_id
+            ));
+            note_skipped(
+                &g,
+                &link,
+                &target,
+                "the provider's local rate limit is full",
+            );
+            continue;
+        }
         let started = Instant::now();
         let result = if stream {
             stream_attempt(
@@ -1881,6 +2009,23 @@ async fn note_route_trace(
 /// Write one usage record to its sinks: SQLite when it is on, and the
 /// JSONL log for anyone tailing it.
 fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::UsageRecord) {
+    metrics::record_request(rec);
+    // The rate-limit windows learn the request's true token cost here: the
+    // success and failure paths of every upstream attempt come through, and
+    // only the attempt that actually saw tokens carries any.
+    let tokens = rec.input_tokens.saturating_add(rec.output_tokens);
+    if tokens > 0 {
+        if !rec.provider.is_empty() {
+            state
+                .rate_limits
+                .record(&rate_limit::provider_scope(&rec.provider), tokens);
+        }
+        if let Some(caller_id) = &rec.caller_key_id {
+            state
+                .rate_limits
+                .record(&rate_limit::caller_scope(caller_id), tokens);
+        }
+    }
     if let Some(store) = sqlite {
         store.record(rec);
     }
@@ -1916,6 +2061,9 @@ fn persist_span(state: &AppState, sqlite: &Option<store::Store>, span: &trace::S
         store.record_span(span);
     }
     trace::record(&state.trace_path(), span);
+    // Mirror the span to an OTLP collector when the `otlp` build feature is
+    // on and an endpoint is configured (no-op otherwise).
+    crate::telemetry::export_span(span);
 }
 
 /// The trace log that belongs to a usage log.

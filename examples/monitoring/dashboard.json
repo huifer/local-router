@@ -1,0 +1,110 @@
+{
+  "title": "local-router",
+  "timezone": "browser",
+  "schemaVersion": 38,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "tags": ["local-router", "gateway"],
+  "templating": {
+    "list": [
+      {
+        "name": "job",
+        "label": "Instance",
+        "type": "query",
+        "query": "label_values(local_router_requests_total, job)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Requests / min",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        {
+          "expr": "sum(rate(local_router_requests_total{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{status_class}}"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "In-flight requests",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "local_router_in_flight{job=~\"$job\"}", "legendFormat": "in-flight" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Active cooldowns",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "local_router_cooldowns_active{job=~\"$job\"}", "legendFormat": "cooldowns" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Tokens / min (input+output)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        {
+          "expr": "sum(rate(local_router_tokens_total{job=~\"$job\"}[1m]))",
+          "legendFormat": "tokens"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Request duration (p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(local_router_request_duration_seconds_bucket{job=~\"$job\"}[5m])) by (le, api))",
+          "legendFormat": "p99 {{api}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Requests by provider",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(local_router_requests_total{job=~\"$job\"}[1m])) by (provider)",
+          "legendFormat": "{{provider}}"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "429 rate",
+      "type": "timeseries",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "sum(rate(local_router_requests_total{job=~\"$job\", status_class=\"429\"}[5m]))",
+          "legendFormat": "429s / min"
+        }
+      ]
+    }
+  ]
+}

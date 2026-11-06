@@ -78,6 +78,10 @@ export interface Provider {
   hold_when_exhausted?: boolean;
   /** Provider-level in-flight request limit; API keys can override it. */
   max_concurrency?: number | null;
+  /** 本地限流：每分钟最多请求数；空为不限。 */
+  rpm?: number | null;
+  /** 本地限流：每分钟最多 token 数；空为不限。 */
+  tpm?: number | null;
   /** The models this provider offers for image and video work. */
   media_models?: string[];
   /** For a session-backed provider: who is signed in. */

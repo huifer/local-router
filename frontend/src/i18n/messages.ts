@@ -198,6 +198,11 @@ const en: Dict = {
   "providers.maxConcurrency": "Max in-flight requests",
   "providers.maxConcurrencyHint": "0 or empty means unlimited",
   "providers.concurrencySaved": "Concurrency limit saved",
+  "providers.rpm": "req/min",
+  "providers.rpmHint": "Local rate limit: requests per minute. 0 or empty means unlimited",
+  "providers.tpm": "tok/min",
+  "providers.tpmHint": "Local rate limit: tokens per minute. 0 or empty means unlimited",
+  "providers.limitSaved": "Rate limit saved",
   "providers.noKeys": "No key stored for this provider.",
   "providers.signIn": "Sign in",
 
@@ -638,6 +643,11 @@ const zh: Dict = {
   "providers.maxConcurrency": "最大并发请求数",
   "providers.maxConcurrencyHint": "0 或留空表示不限制",
   "providers.concurrencySaved": "并发限制已保存",
+  "providers.rpm": "次/分",
+  "providers.rpmHint": "本地限流：每分钟请求数。0 或留空表示不限制",
+  "providers.tpm": "千 token/分",
+  "providers.tpmHint": "本地限流：每分钟 token 数。0 或留空表示不限制",
+  "providers.limitSaved": "限流已保存",
   "providers.noKeys": "该供应商还没有保存密钥。",
   "providers.signIn": "登录",
 

@@ -7,7 +7,8 @@
 pub(crate) mod console;
 
 use local_router::{
-    config, gateway, presets, pricing, protocol, qwen, server, store, trace, trae, web, workbuddy,
+    config, gateway, metrics, presets, pricing, protocol, qwen, server, store, telemetry, trace,
+    trae, web, workbuddy,
 };
 
 use std::collections::BTreeMap;
@@ -68,6 +69,9 @@ enum Command {
     Doctor,
     /// The terminal dashboard: live providers, traffic and spend.
     Dashboard,
+    /// Query a remote gateway's state over its /api.
+    #[command(subcommand)]
+    Remote(RemoteCmd),
     /// Manage the background daemon (start, stop, status, logs).
     #[command(subcommand)]
     Daemon(DaemonCmd),
@@ -79,6 +83,96 @@ enum Command {
     Qwen(QwenCmd),
     /// Show the price table the gateway bills with.
     Prices,
+}
+
+/// A thin wrapper that drives a remote gateway's own `/api` — the same
+/// endpoints the console uses — so the cascade's other machine can be
+/// inspected from here. Not a new protocol: just HTTP + the caller key.
+#[derive(Debug, Clone, Subcommand)]
+enum RemoteCmd {
+    /// The gateway's own status summary.
+    Status {
+        /// The remote base url, e.g. https://gw.example.com
+        #[arg(long)]
+        host: String,
+        /// The caller key (same one agents use).
+        #[arg(long, env = "LOCAL_ROUTER_REMOTE_KEY")]
+        key: Option<String>,
+    },
+    /// The models the remote gateway serves.
+    Models {
+        #[arg(long)]
+        host: String,
+        #[arg(long, env = "LOCAL_ROUTER_REMOTE_KEY")]
+        key: Option<String>,
+    },
+    /// The configured providers.
+    Providers {
+        #[arg(long)]
+        host: String,
+        #[arg(long, env = "LOCAL_ROUTER_REMOTE_KEY")]
+        key: Option<String>,
+    },
+    /// The live rate-limit windows.
+    RateLimits {
+        #[arg(long)]
+        host: String,
+        #[arg(long, env = "LOCAL_ROUTER_REMOTE_KEY")]
+        key: Option<String>,
+    },
+    /// The 429 cooldowns currently active.
+    Cooldowns {
+        #[arg(long)]
+        host: String,
+        #[arg(long, env = "LOCAL_ROUTER_REMOTE_KEY")]
+        key: Option<String>,
+    },
+    /// Export the remote's full config (keys masked by default).
+    Config {
+        #[arg(long)]
+        host: String,
+        #[arg(long, env = "LOCAL_ROUTER_REMOTE_KEY")]
+        key: Option<String>,
+        /// Include the keys in the export.
+        #[arg(long)]
+        include_keys: bool,
+    },
+}
+
+async fn remote_cmd(cmd: RemoteCmd) -> anyhow::Result<()> {
+    let (path, host, key) = match &cmd {
+        RemoteCmd::Status { host, key } => ("/api/status", host, key),
+        RemoteCmd::Models { host, key } => ("/api/models", host, key),
+        RemoteCmd::Providers { host, key } => ("/api/providers", host, key),
+        RemoteCmd::RateLimits { host, key } => ("/api/rate-limits", host, key),
+        RemoteCmd::Cooldowns { host, key } => ("/api/cooldowns", host, key),
+        RemoteCmd::Config { host, key, include_keys } => (
+            if *include_keys {
+                "/api/config?include_keys=true"
+            } else {
+                "/api/config"
+            },
+            host,
+            key,
+        ),
+    };
+    let url = format!("{}{}", host.trim().trim_end_matches('/'), path);
+    let mut req = reqwest::Client::new().get(&url);
+    if let Some(key) = key.as_deref().filter(|k| !k.trim().is_empty()) {
+        req = req.bearer_auth(key.trim());
+    }
+    let response = req.send().await.context("the remote gateway did not answer")?;
+    let status = response.status();
+    let body = response.text().await.context("the remote reply was not text")?;
+    if !status.is_success() {
+        anyhow::bail!("{} answered {}: {}", url, status, body);
+    }
+    // Pretty-print when the reply is JSON; pass it through otherwise.
+    match serde_json::from_str::<serde_json::Value>(&body) {
+        Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+        Err(_) => println!("{}", body),
+    }
+    Ok(())
 }
 
 #[derive(Subcommand, Debug)]
@@ -298,6 +392,16 @@ enum ProviderCmd {
         key_id: String,
         limit: usize,
     },
+    /// Set a provider's local rate limits (0 disables a limit).
+    Limit {
+        id: String,
+        /// The most requests per minute (0 disables).
+        #[arg(long, default_value = None)]
+        rpm: Option<u64>,
+        /// The most tokens per minute (0 disables).
+        #[arg(long, default_value = None)]
+        tpm: Option<u64>,
+    },
     /// Add a key to a provider.
     Key { id: String, key: String },
     /// Show a provider's header rules.
@@ -399,6 +503,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Command::Qwen(cmd)) => qwen_cmd(cmd).await,
         Some(Command::Prices) => prices().await,
         Some(Command::Dashboard) => local_router::dashboard::run().await,
+        Some(Command::Remote(cmd)) => remote_cmd(cmd).await,
         Some(Command::Daemon(cmd)) => daemon_cmd(cmd).await,
         // Bare `local-router`: a terminal wants the gateway; a pipe (a
         // beginner pasting into the wrong window, a script) wants the
@@ -419,6 +524,8 @@ async fn main() -> anyhow::Result<()> {
 // ---------------------------------------------------------------- servers --
 
 async fn serve(args: ServeArgs) -> anyhow::Result<()> {
+    // Start the Prometheus metrics recorder before any traffic is served.
+    crate::metrics::install();
     let store = Arc::new(Store::new());
     let state = AppState::load(store).await?;
     let config = state.config.read().await;
@@ -450,6 +557,10 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     // bind address, not the file's. The console is on the same port now, so
     // it is exposed exactly when the gateway is.
     state.set_web_bind(&settings.gateway_addr).await;
+
+    // Start the OTLP exporter when the `otlp` feature is built in and an
+    // endpoint is configured.
+    crate::telemetry::init(&settings.otlp.clone().unwrap_or_default());
 
     if settings.workbuddy_auto_checkin {
         start_auto_checkin();
@@ -487,6 +598,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
 /// Serve the console alone — for the case where the gateway runs
 /// somewhere else and this machine only wants the page.
 async fn web_only(args: WebArgs) -> anyhow::Result<()> {
+    crate::metrics::install();
     let store = Arc::new(Store::new());
     let state = AppState::load(store).await?;
     let settings = state.config.read().await.settings.clone().from_env();
@@ -539,6 +651,8 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     let _ = tokio::signal::ctrl_c().await;
+    // Flush any queued OTLP spans before the process exits.
+    crate::telemetry::shutdown().await;
     println!("\nstopping");
 }
 
@@ -790,6 +904,33 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
             };
             save_config(&config)?;
             println!("{id}/{key_id} max concurrency: {display}");
+        }
+        ProviderCmd::Limit { id, rpm, tpm } => {
+            if rpm.is_none() && tpm.is_none() {
+                anyhow::bail!("pass --rpm and/or --tpm (0 disables a limit)");
+            }
+            let mut shown = Vec::new();
+            {
+                let provider = config
+                    .provider_mut(&id)
+                    .with_context(|| format!("there is no provider called {id}"))?;
+                if let Some(n) = rpm {
+                    provider.rpm = (n > 0).then_some(n);
+                    shown.push(format!(
+                        "rpm {}",
+                        provider.rpm.map_or_else(|| "off".into(), |v| v.to_string())
+                    ));
+                }
+                if let Some(n) = tpm {
+                    provider.tpm = (n > 0).then_some(n);
+                    shown.push(format!(
+                        "tpm {}",
+                        provider.tpm.map_or_else(|| "off".into(), |v| v.to_string())
+                    ));
+                }
+            }
+            save_config(&config)?;
+            println!("{id} rate limit: {}", shown.join(", "));
         }
         ProviderCmd::Key { id, key } => {
             let count = {

@@ -178,6 +178,23 @@ export default function ProvidersPage() {
       toast.error((error as Error).message);
     }
   };
+  const setProviderLimit = async (
+    provider: AppData["providers"][number],
+    field: "rpm" | "tpm",
+    raw: string,
+  ) => {
+    const value = raw.trim() ? Math.max(0, Number.parseInt(raw, 10) || 0) : 0;
+    try {
+      await api(`/api/providers/${encodeURIComponent(provider.id)}`, {
+        method: "PATCH",
+        body: { [field]: value },
+      });
+      toast.success(t("providers.limitSaved"));
+      await reload();
+    } catch (error) {
+      toast.error((error as Error).message);
+    }
+  };
 
   return (
     <div className="grid gap-5 pt-7">
@@ -236,9 +253,33 @@ export default function ProvidersPage() {
               </div>
               </button>
               <div className="flex items-center justify-between gap-2 border-t border-border pt-3">
-                <Button variant="ghost" size="sm" onClick={() => toggle(provider)}>
-                  {provider.enabled ? t("providers.pause") : t("providers.enable")}
-                </Button>
+                <div className="flex items-center gap-1.5">
+                  <Button variant="ghost" size="sm" onClick={() => toggle(provider)}>
+                    {provider.enabled ? t("providers.pause") : t("providers.enable")}
+                  </Button>
+                  <input
+                    aria-label={t("providers.rpm")}
+                    title={t("providers.rpmHint")}
+                    type="number"
+                    min="0"
+                    placeholder="∞"
+                    defaultValue={provider.rpm ?? ""}
+                    onBlur={(event) => void setProviderLimit(provider, "rpm", event.currentTarget.value)}
+                    className="h-7 w-14 border border-input bg-background px-1.5 text-center font-mono text-[10px]"
+                  />
+                  <span className="font-mono text-[9px] text-muted-foreground">{t("providers.rpm")}</span>
+                  <input
+                    aria-label={t("providers.tpm")}
+                    title={t("providers.tpmHint")}
+                    type="number"
+                    min="0"
+                    placeholder="∞"
+                    defaultValue={provider.tpm ?? ""}
+                    onBlur={(event) => void setProviderLimit(provider, "tpm", event.currentTarget.value)}
+                    className="h-7 w-14 border border-input bg-background px-1.5 text-center font-mono text-[10px]"
+                  />
+                  <span className="font-mono text-[9px] text-muted-foreground">{t("providers.tpm")}</span>
+                </div>
                 <Button variant="destructive" size="sm" onClick={() => remove(provider)}>
                   {t("providers.remove")}
                 </Button>

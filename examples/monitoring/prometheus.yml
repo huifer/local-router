@@ -1,0 +1,27 @@
+# Prometheus scraping the local-router gateway.
+#
+# The gateway exposes Prometheus text format at /metrics. When the gateway
+# is bound to a non-loopback address, /metrics asks for the same bearer key
+# as /api — paste it into the scrape config's bearer_token.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: local-router
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - local-router:3435
+    # Uncomment and set the key if the gateway is bound to a remote address:
+    # bearer_token: "local-router"
+
+  # To monitor a second instance (the multi-machine cascade), add another
+  # job pointing at its address. Each instance reports its own series; the
+  # trace ids are already carried downstream, so the two trees line up.
+  # - job_name: local-router-upstream
+  #   metrics_path: /metrics
+  #   static_configs:
+  #     - targets:
+  #         - us-node:3435
+  #   bearer_token: "local-router"
