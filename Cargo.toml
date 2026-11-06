@@ -2,7 +2,7 @@
 name = "local-router"
 version = "0.1.1"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 description = "A local AI gateway that gives every coding agent every model — web mode"
 repository = "https://github.com/huifer/local-router"
 homepage = "https://github.com/huifer/local-router"
@@ -60,7 +60,7 @@ axum = { version = "0.8", features = ["macros", "multipart"] }
 bytes = "1"
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 reqwest = { version = "0.12", default-features = false, features = [
@@ -82,12 +82,12 @@ base64 = "0.22"
 rand = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-sha2 = "0.10"
+sha2 = "0.11"
 aes = "0.8"
 cbc = { version = "0.1", features = ["alloc"] }
 rsa = { version = "0.9", default-features = false, features = ["std"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
-md-5 = "0.10"
+md-5 = "0.11"
 hex = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"
@@ -108,5 +108,5 @@ lto = "thin"
 strip = true
 
 [dependencies.rusqlite]
-version = "0.32"
+version = "0.41"
 features = ["bundled"]

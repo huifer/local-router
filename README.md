@@ -55,7 +55,7 @@ a desktop client.
 
 ### Quick start
 
-Requirements: Rust 1.80+ and Node.js 24+ for building the console.
+Requirements: Rust 1.89+ and Node.js 24+ for building the console.
 
 ```sh
 npm install && npm run build --prefix frontend
@@ -315,7 +315,7 @@ MIT License. See [LICENSE](LICENSE).
 
 ### 本地运行
 
-需要 Rust 1.80+ 与 Node.js 24+（仅构建控制台用）：
+需要 Rust 1.89+ 与 Node.js 24+（仅构建控制台用）：
 
 ```sh
 npm install && npm run build --prefix frontend   # 构建 React 控制台（cargo 也会自动调）
