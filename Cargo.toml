@@ -90,7 +90,7 @@ pkcs1 = { version = "0.7", features = ["pem"] }
 md-5 = "0.11"
 hex = "0.4"
 metrics = "0.24"
-metrics-exporter-prometheus = "0.16"
+metrics-exporter-prometheus = "0.18"
 
 [features]
 # OTLP tracing export is opt-in and hand-rolled (see src/telemetry.rs): no
