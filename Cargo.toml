@@ -9,6 +9,9 @@ homepage = "https://github.com/huifer/local-router"
 documentation = "https://github.com/huifer/local-router#readme"
 license = "MIT"
 readme = "README.md"
+# frontend/dist 被 .gitignore 排除，但二进制用 include_str! 内嵌了它，
+# 发布包必须强制带上预构建好的控制台产物。
+include = ["frontend/dist"]
 keywords = ["llm", "gateway", "proxy", "openai", "anthropic"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 default-run = "local-router"

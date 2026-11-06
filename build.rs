@@ -54,12 +54,25 @@ fn main() {
             .status();
         match status {
             Ok(status) if status.success() => {}
-            Ok(status) => panic!(
-                "the frontend build failed with {status}; run `npm install && npm run build` in ./frontend and retry"
-            ),
-            Err(err) => panic!(
-                "could not run npm to build the console ({err}); build ./frontend once, or ship a prebuilt frontend/dist"
-            ),
+            Ok(status) => {
+                if index.exists() {
+                    // 发布包里自带预构建 dist；验证/CI 环境往往没有 npm。
+                    println!("cargo:warning=frontend build failed with {status}; using the bundled frontend/dist");
+                } else {
+                    panic!(
+                        "the frontend build failed with {status}; run `npm install && npm run build` in ./frontend and retry"
+                    )
+                }
+            }
+            Err(err) => {
+                if index.exists() {
+                    println!("cargo:warning=could not run npm ({err}); using the bundled frontend/dist");
+                } else {
+                    panic!(
+                        "could not run npm to build the console ({err}); build ./frontend once, or ship a prebuilt frontend/dist"
+                    )
+                }
+            }
         }
     }
 }
