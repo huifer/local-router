@@ -15,12 +15,22 @@ any client that accepts a base URL) one routed, observable API.
   and Gemini, including streaming, tools, reasoning blocks, and token usage.
 - **Routing groups**: ordered failover, rotation, usage-aware, smart, and weighted
   routing, with sticky sessions, nested groups, and multiple keys.
-- **Multi-machine cascade**: point a provider at another local-router (or any
-  OpenAI/Anthropic/Gemini-compatible endpoint) to route through an overseas
-  egress — unified routing, failover, cooldowns, and one trace across hops.
-  Bare model ids resolve when exactly one provider serves them, so both
-  machines can keep the same model names. See
-  [examples/multi-machine](examples/multi-machine/README.md).
+- **Multi-node deployment**: run one gateway per machine and cascade them —
+  point a provider at another local-router (or any OpenAI/Anthropic/Gemini-compatible
+  endpoint) to route through an overseas egress, with unified routing, failover,
+  cooldowns, and one trace across hops. Bare model ids resolve when exactly one
+  provider serves them, so every node can keep the same model names. Each node
+  is remotely manageable over its own console API (`--lan` + a caller key + your
+  reverse proxy): full config snapshots move between nodes with export/import
+  and optimistic concurrency, `local-router remote …` queries another node's
+  state, per-node rate limits keep hot nodes in check, and every node exposes
+  `/metrics` for Prometheus. See
+  [examples/multi-machine](examples/multi-machine/README.md) and
+  [USAGE.md § 8](USAGE.md#8-远程运维多机--遥控).
+- **Monitoring & tracing exports**: a Prometheus `/metrics` endpoint for live
+  state — requests, in-flight, cooldowns, token throughput, p99 latency — and
+  an optional OTLP export (`cargo build --features otlp`) that mirrors the
+  session span tree to Tempo/Jaeger.
 - **Session-backed providers**: WorkBuddy and QwenWork without API keys, with
   account pools, renewal, quota visibility, and check-in support.
 - **Console**: provider, model, route, usage, session, project, context, quota,
@@ -280,8 +290,14 @@ MIT License. See [LICENSE](LICENSE).
 - **四种协议互译**：OpenAI Chat / OpenAI Responses / Anthropic / Gemini，
   任意「入口 × 上游」组合（流式、工具调用、思考块、token 用量）
 - **路由组**：order / rotate / usage / smart / weight，故障转移、会话粘性、嵌套组、多 key
-- **多机级联**：上游在另一台机器上时，把它当普通上游加进来即可——异地出口、
-  统一路由、链路互通
+- **多节点部署**：每台机器跑一个网关，级联起来——上游在另一台机器上时，把它当
+  普通上游加进来即可（异地出口、统一路由、链路互通，模型名各节点保持一致）。
+  每个节点都能远程遥控：`--lan` + caller key + 反代暴露控制面，配置快照
+  （导出/导入 + revision 乐观并发）在节点间迁移，`local-router remote` 直接查
+  远端状态，限流每节点独立；每个节点都有 `/metrics`，链路可导出 OTLP
+- **可观测性**：Prometheus `/metrics` 实时指标（请求、in-flight、冷却、token
+  吞吐、p99 延迟），OTLP 导出（`cargo build --features otlp`）把 span 树送到
+  Tempo / Jaeger
 - **订阅登录态上游**：WorkBuddy、QwenWork（千问办公）免 key 接入，
   自动续期、自动签到
 - **控制台**：React + TypeScript + Vite 构建的服务商 / 模型 / 路由 / 用量 /
@@ -782,7 +798,11 @@ local-router claude group/backup
 - `hold_when_exhausted`：账户配额窗口空了就不再路由到该上游（默认关；
   实测 WorkBuddy 在额度为 0 时仍可服务，所以不要对它开）
 
-## 多机级联：上游在另一台机器上
+## 多节点部署：级联 + 远程运维 + 监控
+
+每台机器跑一个完整的 local-router，节点之间用级联与远程运维串起来。
+
+### 级联：上游在另一台机器上
 
 想在美国的 IP 出到 Anthropic、而所有 agent 都连香港的网关——**把另一台机器上
 的 local-router 当成一个普通上游加进来**就行，不用发明节点机制：
@@ -806,6 +826,41 @@ local-router group add claude --models claude-us/claude-sonnet-4-5 --routing ord
 示例配置、可本机跑的验证脚本（不需要真实 API key）、以及「上游那台其实只
 需要跑个 nginx 反代」的更简形态，见
 [examples/multi-machine](examples/multi-machine/README.md)。
+
+### 远程运维：遥控另一个节点
+
+每个节点就是自己的控制面。绑到非回环地址（`--lan`）+ caller key + 反代，
+就可以从主网关这边遥控它：
+
+```sh
+# 远程查状态 / 模型 / 限流 / 冷却 / 配置
+local-router remote status     --host https://us.example.com --key <caller-key>
+local-router remote providers  --host https://us.example.com --key <caller-key>
+local-router remote rate-limits --host https://us.example.com --key <caller-key>
+
+# 配置快照在节点间迁移：导出（默认掩码 key）→ 导入（revision 乐观并发，
+# 两个写入方同时改不会互相覆盖，过期写 409）
+curl -s "https://us.example.com/api/config?include_keys=true" > us.json
+curl -s -X PUT https://hk.example.com/api/config \
+  -H "content-type: application/json" --data @us.json
+```
+
+- 非回环地址下，`/api` 与 `/metrics` 都要 `Authorization: Bearer <caller key>`；
+  写请求校验 Origin；导出默认不带 key，防反代裸奔泄漏
+- **限流每节点独立**：每个节点可以给自己的上游和调用方配 RPM/TPM/日预算
+  （详见 [USAGE.md 第 8 章](USAGE.md)）
+
+### 监控：一次抓全所有节点
+
+每个节点都有 `/metrics`，Prometheus 各抓一份就能看全（级联两跳的 trace id
+已下传，链路本就连通）；要 span 树进 Tempo/Jaeger，两边都开 `--features otlp`
+并指向同一个收集器即可：
+
+```sh
+docker compose -f examples/monitoring/compose.yaml up -d   # Prometheus + Grafana 现成栈
+```
+
+面板见 [examples/monitoring](examples/monitoring/README.md)。
 
 ## 开发
 
@@ -841,7 +896,7 @@ cd frontend && npm run dev   # 控制台热更新（API 代理到 :3435）
 
 核心：多服务商网关、协议互译、路由组、用量记录、会话/项目/上下文观测、
 订阅账号登录态接入（WorkBuddy / QwenWork）、网页管理、CLI、多 key
-故障转移。有意不做：桌面菜单栏、桌面客户端形态、插件生态、本地 PII 脱敏、
+故障转移、多节点级联与远程运维、Prometheus/OTLP 可观测性出口。有意不做：桌面菜单栏、桌面客户端形态、插件生态、本地 PII 脱敏、
 QwenWork 企业版（VPC / PAT）。
 
 ## License
