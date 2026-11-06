@@ -84,7 +84,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sha2 = "0.11"
 aes = "0.8"
-cbc = { version = "0.1", features = ["alloc"] }
+cbc = { version = "0.2", features = ["alloc"] }
 rsa = { version = "0.9", default-features = false, features = ["std"] }
 pkcs1 = { version = "0.7", features = ["pem"] }
 md-5 = "0.11"
