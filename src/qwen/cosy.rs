@@ -18,11 +18,10 @@
 use std::collections::BTreeMap;
 
 use aes::cipher::block_padding::Pkcs7;
-use aes::cipher::generic_array::GenericArray;
 use aes::cipher::KeyIvInit;
 use aes::Aes128;
 use base64::Engine;
-use cbc::cipher::BlockEncryptMut;
+use cbc::cipher::BlockModeEncrypt;
 use cbc::Encryptor;
 use md5::Digest;
 use rand::RngCore;
@@ -79,15 +78,15 @@ pub fn user_blob(u: &CosyUser, rsa: &RsaPublicKey) -> anyhow::Result<CosyBlob> {
         bytes
     };
     let cipher = Aes128CbcEnc::new(
-        GenericArray::from_slice(&key),
-        GenericArray::from_slice(&key),
+        key.as_slice().try_into().expect("the AES key is 16 bytes"),
+        key.as_slice().try_into().expect("the AES iv is 16 bytes"),
     );
     // PKCS7 pads at most one block, so the buffer holds the message plus 16.
     let msg_len = raw.len();
     let mut buf = vec![0u8; msg_len + 16];
     buf[..msg_len].copy_from_slice(raw.as_bytes());
     let encrypted = cipher
-        .encrypt_padded_mut::<Pkcs7>(&mut buf, msg_len)
+        .encrypt_padded::<Pkcs7>(&mut buf, msg_len)
         .map_err(|e| anyhow::anyhow!("the COSY user blob could not be encrypted: {e}"))?
         .to_vec();
     let info = base64::engine::general_purpose::STANDARD.encode(encrypted);
