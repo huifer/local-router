@@ -803,6 +803,7 @@ async fn the_gateway_routes_a_qwenwork_provider_through_the_signed_path() {
         groups: vec![],
         settings: Default::default(),
         caller_keys: vec![],
+        ..Default::default()
     };
     config.settings.default_caller_key = "gw-key".into();
     let mut provider = Provider {

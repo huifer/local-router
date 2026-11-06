@@ -231,6 +231,8 @@ async fn world_with(hold_when_exhausted: bool) -> (String, Seen, String) {
         stream_only: true,
         hold_when_exhausted,
         max_concurrency: None,
+        rpm: None,
+        tpm: None,
         media_models: Vec::new(),
         media_paths: None,
     });

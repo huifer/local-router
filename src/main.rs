@@ -146,7 +146,11 @@ async fn remote_cmd(cmd: RemoteCmd) -> anyhow::Result<()> {
         RemoteCmd::Providers { host, key } => ("/api/providers", host, key),
         RemoteCmd::RateLimits { host, key } => ("/api/rate-limits", host, key),
         RemoteCmd::Cooldowns { host, key } => ("/api/cooldowns", host, key),
-        RemoteCmd::Config { host, key, include_keys } => (
+        RemoteCmd::Config {
+            host,
+            key,
+            include_keys,
+        } => (
             if *include_keys {
                 "/api/config?include_keys=true"
             } else {
@@ -161,9 +165,15 @@ async fn remote_cmd(cmd: RemoteCmd) -> anyhow::Result<()> {
     if let Some(key) = key.as_deref().filter(|k| !k.trim().is_empty()) {
         req = req.bearer_auth(key.trim());
     }
-    let response = req.send().await.context("the remote gateway did not answer")?;
+    let response = req
+        .send()
+        .await
+        .context("the remote gateway did not answer")?;
     let status = response.status();
-    let body = response.text().await.context("the remote reply was not text")?;
+    let body = response
+        .text()
+        .await
+        .context("the remote reply was not text")?;
     if !status.is_success() {
         anyhow::bail!("{} answered {}: {}", url, status, body);
     }

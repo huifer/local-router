@@ -160,8 +160,14 @@ mod tests {
         record_request(&rec);
 
         let out = render();
-        assert!(out.contains("local_router_requests_total"), "missing request counter:\n{out}");
-        assert!(out.contains("local_router_tokens_total"), "missing token counter:\n{out}");
+        assert!(
+            out.contains("local_router_requests_total"),
+            "missing request counter:\n{out}"
+        );
+        assert!(
+            out.contains("local_router_tokens_total"),
+            "missing token counter:\n{out}"
+        );
         let line = out
             .lines()
             .find(|l| l.starts_with("local_router_requests_total"))

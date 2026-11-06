@@ -66,7 +66,9 @@ fn main() {
             }
             Err(err) => {
                 if index.exists() {
-                    println!("cargo:warning=could not run npm ({err}); using the bundled frontend/dist");
+                    println!(
+                        "cargo:warning=could not run npm ({err}); using the bundled frontend/dist"
+                    );
                 } else {
                     panic!(
                         "could not run npm to build the console ({err}); build ./frontend once, or ship a prebuilt frontend/dist"

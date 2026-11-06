@@ -58,9 +58,7 @@ mod otlp {
         let bytes = encode_span(span);
         let mut queue = exporter.queue.lock().expect("OTLP queue lock");
         if queue.len() >= MAX_BATCH {
-            tracing::warn!(
-                "the OTLP export queue is full ({MAX_BATCH} spans); dropping this span"
-            );
+            tracing::warn!("the OTLP export queue is full ({MAX_BATCH} spans); dropping this span");
             return;
         }
         queue.push(bytes);
@@ -189,7 +187,7 @@ mod otlp {
     }
 
     fn field_varint(field: u32, value: u64) -> Vec<u8> {
-        let mut out = varint(((field as u64) << 3) | 0);
+        let mut out = varint((field as u64) << 3);
         out.extend_from_slice(&varint(value));
         out
     }

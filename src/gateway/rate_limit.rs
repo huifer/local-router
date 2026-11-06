@@ -47,11 +47,7 @@ impl Entry {
         while self.requests.front().is_some_and(|t| now - *t >= WINDOW) {
             self.requests.pop_front();
         }
-        while self
-            .tokens
-            .front()
-            .is_some_and(|(t, _)| now - *t >= WINDOW)
-        {
+        while self.tokens.front().is_some_and(|(t, _)| now - *t >= WINDOW) {
             self.tokens.pop_front();
         }
     }
@@ -247,12 +243,14 @@ mod tests {
         let registry = Registry::default();
         for _ in 0..3 {
             assert!(
-                matches!(registry.check("provider:r", Some(3), None, None), Decision::Allow),
+                matches!(
+                    registry.check("provider:r", Some(3), None, None),
+                    Decision::Allow
+                ),
                 "the first three requests pass"
             );
         }
-        let Decision::Limited { reason, .. } =
-            registry.check("provider:r", Some(3), None, None)
+        let Decision::Limited { reason, .. } = registry.check("provider:r", Some(3), None, None)
         else {
             panic!("the fourth request must be limited");
         };
@@ -270,8 +268,7 @@ mod tests {
         // 60 of 100 tokens spent: one more request still passes, but its
         // tokens would overflow, which the next admission cycle catches.
         registry.record("provider:t", 50);
-        let Decision::Limited { reason, .. } =
-            registry.check("provider:t", None, Some(100), None)
+        let Decision::Limited { reason, .. } = registry.check("provider:t", None, Some(100), None)
         else {
             panic!("110 tokens in the window must trip the 100 TPM limit");
         };
@@ -283,8 +280,7 @@ mod tests {
         let registry = Registry::default();
         registry.check("caller:d", None, None, Some(10));
         registry.record("caller:d", 10);
-        let Decision::Limited { reason, .. } =
-            registry.check("caller:d", None, None, Some(10))
+        let Decision::Limited { reason, .. } = registry.check("caller:d", None, None, Some(10))
         else {
             panic!("the spent daily budget must refuse");
         };

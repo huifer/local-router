@@ -16,10 +16,10 @@ pub mod server;
 pub mod session_logins;
 pub mod sessions;
 pub mod store;
+pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod testenv;
 pub mod trace;
-pub mod telemetry;
 pub mod trae;
 pub mod web;
 pub mod workbuddy;

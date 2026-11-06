@@ -9,8 +9,8 @@ pub mod usage;
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::body::Body;
@@ -308,12 +308,10 @@ async fn metrics(State(g): State<Gateway>, headers: HeaderMap) -> Response {
     let body = metrics::render();
     (
         StatusCode::OK,
-        [
-            (
-                axum::http::header::CONTENT_TYPE,
-                "text/plain; version=0.0.4; charset=utf-8",
-            ),
-        ],
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
         body,
     )
         .into_response()
@@ -716,7 +714,11 @@ async fn caller_rate_limits(g: &Gateway, caller: &CallerIdentity) -> Result<(), 
         return Ok(());
     };
     let scope = rate_limit::caller_scope(&key.id);
-    match g.state.rate_limits.check(&scope, key.rpm, key.tpm, key.daily_tokens) {
+    match g
+        .state
+        .rate_limits
+        .check(&scope, key.rpm, key.tpm, key.daily_tokens)
+    {
         rate_limit::Decision::Allow => Ok(()),
         rate_limit::Decision::Limited { reason, .. } => Err(reason),
     }

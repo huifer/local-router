@@ -103,6 +103,8 @@ fn provider(base_url: String) -> Provider {
         stream_only: false,
         hold_when_exhausted: false,
         max_concurrency: None,
+        rpm: None,
+        tpm: None,
         media_models: Vec::new(),
         media_paths: None,
     }
@@ -134,6 +136,7 @@ async fn a_sessions_vendor_calls_are_found_again_by_their_trace() {
         groups: vec![],
         settings: Default::default(),
         caller_keys: vec![],
+        ..Default::default()
     };
     let config_path = dir.join("config.json");
     let store = Arc::new(local_router::config::Store::at(&config_path));
@@ -267,6 +270,7 @@ async fn a_callers_own_trace_id_is_kept_all_the_way_down() {
         groups: vec![],
         settings: Default::default(),
         caller_keys: vec![],
+        ..Default::default()
     };
     let store = Arc::new(local_router::config::Store::at(dir.join("config.json")));
     store.save(&config).unwrap();
@@ -343,6 +347,7 @@ async fn a_session_shows_its_whole_chain_across_the_callers_own_tasks() {
         groups: vec![],
         settings: Default::default(),
         caller_keys: vec![],
+        ..Default::default()
     };
     let store = Arc::new(local_router::config::Store::at(dir.join("config.json")));
     store.save(&config).unwrap();

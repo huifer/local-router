@@ -35,6 +35,8 @@ fn provider(id: &str, models: &[&str], keys: usize) -> Provider {
         stream_only: false,
         hold_when_exhausted: false,
         max_concurrency: None,
+        rpm: None,
+        tpm: None,
         media_models: Vec::new(),
         media_paths: None,
     }
@@ -46,6 +48,7 @@ fn config_with(providers: Vec<Provider>, groups: Vec<Group>) -> Config {
         groups,
         settings: Default::default(),
         caller_keys: Vec::new(),
+        ..Default::default()
     }
 }
 

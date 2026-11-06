@@ -166,6 +166,8 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         stream_only: false,
         hold_when_exhausted: false,
         max_concurrency: None,
+        rpm: None,
+        tpm: None,
         media_models: Vec::new(),
         media_paths: None,
     }
@@ -297,6 +299,7 @@ fn base_config() -> Config {
         groups: vec![],
         settings: Default::default(),
         caller_keys: vec![],
+        ..Default::default()
     }
 }
 
