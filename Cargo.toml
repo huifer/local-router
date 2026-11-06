@@ -9,9 +9,44 @@ homepage = "https://github.com/huifer/local-router"
 documentation = "https://github.com/huifer/local-router#readme"
 license = "MIT"
 readme = "README.md"
-# frontend/dist 被 .gitignore 排除，但二进制用 include_str! 内嵌了它，
-# 发布包必须强制带上预构建好的控制台产物。
-include = ["frontend/dist"]
+
+# 发布包需要 frontend/dist（被 .gitignore 排除、但二进制用 include_str! 内嵌），
+# 而 [package].include 一旦出现就会取代 git 枚举，所以这里完整列出文件集。
+include = [
+    "build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "src/**",
+    "tests/**",
+    "examples/**",
+    "docs/**",
+    "scripts/**",
+    ".github/**",
+    "frontend/dist",
+    "frontend/index.html",
+    "frontend/package.json",
+    "frontend/package-lock.json",
+    "frontend/tsconfig.json",
+    "frontend/vite.config.ts",
+    "frontend/src/**",
+    "README.md",
+    "CHANGELOG.md",
+    "USAGE.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md",
+    "og-image.jpg",
+    "Dockerfile",
+    "compose.yaml",
+    ".dockerignore",
+    ".gitignore",
+]
+exclude = [
+    "frontend/node_modules",
+    "frontend/tsconfig.tsbuildinfo",
+]
+
 keywords = ["llm", "gateway", "proxy", "openai", "anthropic"]
 categories = ["command-line-utilities", "network-programming", "web-programming::http-server"]
 default-run = "local-router"
