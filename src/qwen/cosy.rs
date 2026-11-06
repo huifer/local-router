@@ -219,7 +219,7 @@ pub fn encode_body(text: &str) -> String {
     if nb > 0 {
         s.push(ALPHABET[((acc << (6 - nb)) & 63) as usize] as char);
     }
-    while s.len() % 4 != 0 {
+    while !s.len().is_multiple_of(4) {
         s.push('$');
     }
     swap_thirds(&s)
@@ -338,7 +338,7 @@ mod tests {
     #[test]
     fn encoded_bodies_use_the_shuffled_alphabet_and_dollar_padding() {
         let wire = encode_body("{}");
-        assert!(wire.len() % 4 == 0);
+        assert!(wire.len().is_multiple_of(4));
         for c in wire.chars() {
             assert!(
                 c == '$' || ALPHABET.contains(&(c as u8)),
