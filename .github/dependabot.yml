@@ -4,14 +4,33 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # 同类依赖一次一个 PR，而 RustCrypto 这类成对升级（aes + cbc 共用
+    # cipher 版本）分开提必然各自编译失败。分两条组规则打包：补丁/次要版本
+    # 一起提，主要版本单独提（大版本要人看 changelog）。
+    groups:
+      cargo-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 10
+
   - package-ecosystem: npm
     directory: /frontend
     schedule:
       interval: weekly
+    groups:
+      npm-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    open-pull-requests-limit: 10
+
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions-minor:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     ignore:
       # dtolnay/rust-toolchain 的版本钉在 msrv job 里，等于项目的 MSRV——
       # 必须与 Cargo.toml 的 rust-version 保持一致（见 30b8cf1），由人手动管理，
