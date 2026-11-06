@@ -12,3 +12,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # dtolnay/rust-toolchain 的版本钉在 msrv job 里，等于项目的 MSRV——
+      # 必须与 Cargo.toml 的 rust-version 保持一致（见 30b8cf1），由人手动管理，
+      # 不跟随 Dependabot 自动升级。
+      - dependency-name: "dtolnay/rust-toolchain"
