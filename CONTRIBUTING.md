@@ -6,19 +6,21 @@ CLI。提交改动前请先读 README 的「范围与取舍」，明确不做的
 
 ## 开发环境
 
-- Rust 1.80+（`rustup` 稳定通道即可）
+- Rust 1.89+（与 `Cargo.toml` 的 `rust-version`、CI 的 msrv job 一致）
 - Node.js 24+（仅构建控制台用）
 
 ```sh
 git clone <仓库地址> && cd local-router
 npm ci --prefix frontend          # 控制台依赖（锁定文件已提交）
-cargo test                        # 228 个测试（含 src/ 内的原生单元测试）
+cargo test --all-targets --all-features
 ```
 
 测试分两层：`src/` 内的 `#[cfg(test)]` 原生单元测试（纯逻辑，快）与
-`tests/` 内的集成测试（真起 HTTP）。改哪层就在哪层补用例；控制台的
-字段变更必须同步 `frontend/src/types.ts` 与 `tests/web.rs` 的 API 形状
-用例，两边一起变。
+`tests/` 内的集成测试（真起 HTTP）。只跑某一块：`cargo test --lib`（单元）/
+`--test translate`（协议翻译）/ `--test gateway`（端到端）/ `--test web`
+（控制台）。手工冒烟可配合 `scripts/mock_vendor.py` 起一个假厂商。改哪层
+就在哪层补用例；控制台的字段变更必须同步 `frontend/src/types.ts` 与
+`tests/web.rs` 的 API 形状用例，两边一起变。
 
 `cargo build` 会通过 `build.rs` 自动调用 npm 构建控制台；没有 npm 的环境
 可设 `LOCAL_ROUTER_SKIP_FRONTEND=1` 用桩页面代替。

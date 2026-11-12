@@ -3,7 +3,11 @@
 面向「第一次用」和「日常运维」两种场景：照着第 1–3 节走完，就能把本地
 AI 网关跑起来并让编码 agent 用上；第 4 节之后是按需查阅的参考。
 
-- 想了解项目是什么、为什么这么设计 → [README.md](README.md)
+- 想了解项目是什么 → [README.zh-CN.md](README.zh-CN.md)
+- 手册没写到的机制细节 → [docs/](docs/) 下的参考页：[API](docs/API.md) ·
+  [链路追踪](docs/TRACING.md) · [用量与计费](docs/BILLING.md) ·
+  [登录态上游](docs/PROVIDERS.md) · [配置参考](docs/CONFIG.md) ·
+  [基准测试](docs/BENCHMARK.md)
 - 想贡献代码 → [CONTRIBUTING.md](CONTRIBUTING.md)
 - 想报安全问题 → [SECURITY.md](SECURITY.md)
 
@@ -251,6 +255,8 @@ local-router provider expose deepseek deepseek-chat deepseek-reasoner   # 改暴
 local-router provider models deepseek          # 拉厂商自己的模型列表
 local-router provider test deepseek             # 发一个真实请求测连通性
 local-router provider key deepseek sk-第二个key  # 加一把 key（多 key 轮试）
+local-router provider concurrency deepseek <key-id|session> 4  # 单把 key 的最大同时请求数，超限排队；0 取消
+local-router provider limit deepseek --rpm 60 --tpm 100000  # 限流（0 关闭）；caller key 同理走控制台/PATCH
 local-router provider rm deepseek
 
 # 请求头重写（某些中转/上游挑剔头的时候用）
@@ -301,6 +307,8 @@ local-router group weights balanced "a/m1=3,b/m2=1"   # weight 模式的权重
 ### 2.5 调用 API
 
 四种入口协议任意选，与上游协议自由组合（流式 / 非流式都支持）。
+
+> 完整端点表、鉴权头与媒体/状态接口见 [docs/API.md](docs/API.md)。
 
 ```sh
 KEY=local-router
@@ -395,6 +403,8 @@ local-router qwen use <名字>              # 切换到某个账号
 多个账号可以并存（WorkBuddy 存 `~/.config/local-router/workbuddy-session.json`，
 千问办公存 `qwen-session.json`），网关让请求在它们之间**轮流走**，分摊额度；
 `use` 指定优先用哪个。
+
+> token 生命周期、协议封装与多账号轮转的机制详见 [docs/PROVIDERS.md](docs/PROVIDERS.md)。
 
 > **每个账号的额度是独立的**：控制台「供应商 → WorkBuddy → 抽屉 → 已登录
 > 账号」里，每个账号一行，显示它自己的剩余额度与今日签到状态；行尾的
@@ -568,6 +578,8 @@ EOF
 下一个请求就按新价算（价目是估算，`credits_per_million` 是订阅制厂商
 的额度折算率）。
 
+> 成本/credits 的计算口径、双凭据账单维度与 SQLite 查询详见 [docs/BILLING.md](docs/BILLING.md)。
+
 ### 场景 K：新模型上线，不想改配置
 
 给 provider 配 `auto_include`（glob，`*` 通配）：
@@ -608,6 +620,8 @@ curl http://127.0.0.1:3435/v1/chat/completions \
 
 `x-task-id` 是可选的子任务名：编排层知道自己的子 agent 边界时带上，
 链路里就能分出「第几步」。不带也能用，只是少一层。
+
+> span 树模型、trace id 下传规则与落盘格式详见 [docs/TRACING.md](docs/TRACING.md)。
 
 ### 场景 M：上游在另一台机器上（异地出口）
 

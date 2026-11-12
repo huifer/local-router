@@ -82,6 +82,9 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
   "gemini_base_url": null,
 
   "keys": [{ "id": "7f6724dd", "key": "sk-…", "enabled": true, "label": null }],
+  "max_concurrency": null,
+  "rpm": null,
+  "tpm": null,
   "models": ["deepseek-chat", "deepseek-reasoner"],
   "auto_include": [],
   "catalog": "deepseek",
@@ -108,6 +111,8 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `protocol` | 上游说哪种话 | `openai_chat` / `openai_responses` / `anthropic` / `gemini` / `qwenwork` |
 | `base_url` 等四个 | 同一家的不同协议各一个地址 | 留空则回落到 `base_url` |
 | `keys` | 这个家的多把 key | 故障时逐把试 |
+| `max_concurrency` | provider 级最大同时请求数 | 单把 key 可用自己的 `max_concurrency` 覆盖；超限排队，`0`/null 不限 |
+| `rpm` / `tpm` | 本地限流：每分钟请求数 / token 数 | 只对配了限制的 provider 生效；触发时换下一个路由目标，**不**触发 429 冷却（本地限流不是厂商 429） |
 | `models` | **对外暴露的模型白名单**，也是**转发给上游的模型 id** | 路由到没列出的模型会 404；级联时外层可以直接写下游认识的 id（见 [examples/multi-machine](../examples/multi-machine/README.md)） |
 | `auto_include` | glob（只支持 `*`） | 刷新模型时匹配的自动并入 `models` |
 | `headers` | 每个请求都带的静态头 | 值里 `{version}`/`{platform}`/`{arch}` 会展开 |
@@ -121,6 +126,12 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `media_models` | 这家能做图/视频的模型 | 会出现在 `/v1/models` 里 |
 | `media_paths` | 厂商自己的媒体路径 | 不设就走 OpenAI `/v1` 家族 |
 | `auth` | `"workbuddy"` / `"qwenwork"` | 用本机登录态，免 key |
+
+> **请求头规则典型用法**：有的中转要求带调用方自己的会话头（如 OpenCode 的
+> Console Go 上游拒绝没有 `x-opencode-session` 的请求，`forward_headers`
+> 原样带过去即可直连）；有的对陌生头直接 400（`remove_headers` 删掉）。
+> 执行顺序：静态头 → 转发头 → 删除（删除最后执行，能删掉鉴权头）；
+> `header_order` 只是发送顺序提示。
 
 ### 3.2 groups[] —— 一个路由组
 
@@ -185,8 +196,14 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 
 ```json
 [{ "id": "k1", "name": "laptop", "key": "sk-…", "enabled": true,
-   "daily_tokens": null, "monthly_cost": null }]
+   "rpm": null, "tpm": null, "daily_tokens": null, "monthly_cost": null }]
 ```
+
+| 字段 | 含义 |
+| --- | --- |
+| `rpm` / `tpm` | 这把调用方 key 的本地限流（路由前硬 429，不入冷却） |
+| `daily_tokens` | 每日 token 预算（UTC 零点翻日，硬限制） |
+| `monthly_cost` | 月度成本口径（仅记录/展示，当前不强制） |
 
 ---
 

@@ -1,907 +1,153 @@
 # local-router
 
-[English](#english) · [中文](#中文)
+English · [中文](README.zh-CN.md)
 
-## English
+A local AI gateway that puts all of your model providers behind one process and
+gives every coding agent — Claude Code, Codex, Gemini CLI, OpenCode, or any
+client that accepts a base URL — one routed, observable API.
 
-local-router is a local AI gateway that puts multiple model providers behind one
-process and gives coding agents (Claude Code, Codex, Gemini CLI, OpenCode, and
-any client that accepts a base URL) one routed, observable API.
-
-### Highlights
+## Features
 
 - **One Rust binary**: gateway, React console, and CLI.
 - **Protocol translation**: OpenAI Chat, OpenAI Responses, Anthropic Messages,
-  and Gemini, including streaming, tools, reasoning blocks, and token usage.
-- **Routing groups**: ordered failover, rotation, usage-aware, smart, and weighted
-  routing, with sticky sessions, nested groups, and multiple keys.
-- **Multi-node deployment**: run one gateway per machine and cascade them —
-  point a provider at another local-router (or any OpenAI/Anthropic/Gemini-compatible
-  endpoint) to route through an overseas egress, with unified routing, failover,
-  cooldowns, and one trace across hops. Bare model ids resolve when exactly one
-  provider serves them, so every node can keep the same model names. Each node
-  is remotely manageable over its own console API (`--lan` + a caller key + your
-  reverse proxy): full config snapshots move between nodes with export/import
-  and optimistic concurrency, `local-router remote …` queries another node's
-  state, per-node rate limits keep hot nodes in check, and every node exposes
-  `/metrics` for Prometheus. See
-  [examples/multi-machine](examples/multi-machine/README.md) and
-  [USAGE.md § 8](USAGE.md#8-远程运维多机--遥控).
-- **Monitoring & tracing exports**: a Prometheus `/metrics` endpoint for live
-  state — requests, in-flight, cooldowns, token throughput, p99 latency — and
-  an optional OTLP export (`cargo build --features otlp`) that mirrors the
-  session span tree to Tempo/Jaeger.
-- **Session-backed providers**: WorkBuddy and QwenWork without API keys, with
-  account pools, renewal, quota visibility, and check-in support.
-- **Console**: provider, model, route, usage, session, project, context, quota,
-  billing, trace, and settings views.
+  and Gemini — any "inbound × upstream" combination, including streaming,
+  tools, reasoning blocks, token usage, and image/video endpoints.
+- **Routing groups**: order / rotate / usage / smart / weight, with failover,
+  sticky sessions, nested groups, and multi-key rotation.
+- **Stability**: global 429 cooldown with exponential backoff, per-key
+  in-flight queueing, per-provider / per-caller RPM/TPM rate limits and daily
+  token budgets.
 - **Session traceability**: every session and every upstream call it makes are
-  recorded as a span tree — session → request → vendor call — and the trace id
-  travels downstream with the request.
-- **Direct chat tests**: test a provider from the console or with
-  `local-router provider test <provider-id>`.
-- **Per-key concurrency**: configure a queueing in-flight limit with
-  `local-router provider concurrency <provider-id> <key-id|session> <limit>`;
-  use `0` to remove the limit.
-- **429 cooldown**: after an upstream returns HTTP 429, local-router temporarily
-  stops sending requests to that provider and tries the next route target.
-- **Docker support**: multi-stage image with `/data` persistence.
+  recorded as a span tree (session → request → upstream); the trace id travels
+  downstream to the vendor, and the vendor's own request id is kept for
+  lookups.
+- **Usage & billing**: one JSONL line plus SQLite per request, USD cost and
+  subscription credits, split by provider key / caller key / agent.
+- **Observability exports**: Prometheus `/metrics` for live state; optional
+  OTLP export (`cargo build --features otlp`) sends the span tree to
+  Tempo / Jaeger.
+- **Multi-node deployment**: run one gateway per machine and cascade them — an
+  upstream node is just another provider. Config snapshots (export/import with
+  revision-based optimistic concurrency) move between nodes;
+  `local-router remote` queries a remote node's state.
+- **Session-backed providers**: WorkBuddy, QwenWork, and Trae CN without API
+  keys — multi-account rotation, auto renewal, auto check-in.
+- **Console**: providers, models, routes, usage, sessions, projects, context,
+  quotas, traces, and settings — all editable live, effective on the next
+  request.
+- **Docker**: multi-stage image with `/data` persistence.
 
 This project is an independent web and CLI implementation. It does not provide
 a desktop client.
 
-> For a five-minute setup, daily commands, troubleshooting, and common scenarios,
-> see [USAGE.md](USAGE.md).
+## Quick start
 
-### Quick start
-
-Requirements: Rust 1.89+ and Node.js 24+ for building the console.
+From source (Rust 1.89+, Node.js 24+ — Node is only needed to build the
+console):
 
 ```sh
-npm install && npm run build --prefix frontend
+npm install && npm run build --prefix frontend   # first build (cargo also runs this automatically)
 cargo build --release
-./target/release/local-router
+./target/release/local-router                    # gateway + console on the same port :3435
 ```
-
-The gateway and console share `http://127.0.0.1:3435`.
 
 Docker:
 
 ```sh
-docker compose up -d
+docker compose up -d          # http://localhost:3435
 # or
-docker build -t local-router .
-docker run -p 3435:3435 -v lr-data:/data local-router
-```
-
-### Configure an agent
-
-```sh
-local-router provider add deepseek --key sk-xxx
-local-router claude deepseek/deepseek-chat
-local-router codex kimi/kimi-k2
-local-router gemini glm/glm-4.6
-local-router opencode deepseek/deepseek-chat
-```
-
-Or use environment variables:
-
-```sh
-export OPENAI_BASE_URL=http://127.0.0.1:3435/v1
-export OPENAI_API_KEY=local-router
-export ANTHROPIC_BASE_URL=http://127.0.0.1:3435
-export ANTHROPIC_API_KEY=local-router
-export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3435
-export GEMINI_API_KEY=local-router
-```
-
-### CLI essentials
-
-```sh
-local-router serve [--port N] [--addr A] [--lan] [--no-console]
-local-router daemon start|stop|status|logs
-local-router provider list
-local-router provider test <provider-id>
-local-router provider concurrency <provider-id> <key-id|session> <limit>
-local-router models
-local-router usage --period today
-local-router traces --period 7d
-local-router trace <trace-id>
-local-router doctor
-local-router dashboard
-local-router workbuddy status|credits|login|checkin|models
-local-router qwen status|credits|login|models
-```
-
-`provider test` sends a minimal real `ping` request and prints the latency and
-upstream response. When the daemon is running, the CLI uses the same console
-endpoint as the web button, so it shares the daemon's cooldown state. QwenWork
-and Trae CN use their dedicated protocols rather than a generic OpenAI request.
-
-`provider concurrency` sets the maximum number of in-flight requests for one
-upstream API key. Requests beyond the limit wait in a queue; use `0` to remove
-the limit. For session-backed providers, `session` sets the provider-level
-fallback; a stored API key can override the provider limit.
-
-### Configuration and local data
-
-By default, local-router stores its data in `~/.config/local-router/`; Docker
-uses `/data`. Set `LOCAL_ROUTER_HOME` to change it. Runtime credentials, session
-files, usage databases, and logs are local data and are intentionally excluded
-from this repository.
-
-Important files include:
-
-- `config.json`: providers, groups, settings, and caller keys.
-- `usage.jsonl` and `usage.db`: request usage and billing records.
-- `traces.jsonl`: the trace log — one line per span (session, request, vendor call).
-- `sessions.json` and `projects.json`: local observability metadata.
-- `workbuddy-session.json` and `qwen-session.json`: local login sessions.
-- `prices.json`: optional pricing overrides.
-
-Do not commit any of these runtime files. Use `.env` only through your local
-environment or a secret manager; never place real provider keys in source,
-issues, examples, or pull requests.
-
-### Usage, quotas, and billing
-
-Requests can be recorded in JSONL and SQLite. The console and HTTP API expose
-request counts, input/output/cache/reasoning tokens, estimated USD cost, and
-subscription credits. Set `LOCAL_ROUTER_DISABLE_SQLITE=1` to use JSONL only.
-
-The Bills view and usage APIs separate two credential dimensions:
-
-- **Provider API keys**: `provider / key_label` (or `key_id`) with requests,
-  failures, input/output/cache/reasoning tokens, cost, and credits.
-- **Caller API keys**: the local-router key used by an agent or client to enter
-  the gateway, with the same token and cost totals.
-- **Agents**: grouped from the caller User-Agent.
-
-`/api/usage` returns `by_provider_key`, `by_caller_key`, and key fields in
-`recent`. `local-router usage` and its CSV output include both dimensions.
-Provider keys and caller keys are different credentials and are intentionally
-reported separately.
-
-The quota view shows per-account windows for session-backed providers. Account
-names and IDs are masked in the console and quota responses.
-
-
-### 429 cooldown
-
-When an upstream returns HTTP 429, local-router puts that provider into a cooldown:
-
-- first cooldown: 60 seconds;
-- repeated 429 responses: exponential backoff;
-- maximum cooldown: 10 minutes;
-- while cooling down, the gateway skips the provider before sending a request;
-- routing groups can continue with another member;
-- the console and CLI test do not bypass the cooldown.
-
-Inspect the current state:
-
-```sh
-curl http://127.0.0.1:3435/api/cooldowns
-```
-
-Adjust the defaults in seconds if needed:
-
-```sh
-LOCAL_ROUTER_COOLDOWN_SECS=30 \
-LOCAL_ROUTER_COOLDOWN_MAX_SECS=300 \
-local-router serve
-```
-
-### Session traceability
-
-One large task is usually many model calls, spread over several vendors.
-local-router is the only place that sees both the agent's request and the
-vendor's answer, so it keeps the link between them:
-
-```text
-session  ses_…          the agent's session — one session is one whole chain
- ├─ request  req_…       one request the agent made
- │   └─ upstream up_…    one attempt at one vendor (failures included)
- └─ request  req_…
-     └─ upstream up_…
-```
-
-**The session is the complete chain.** The requests of one session may carry
-different trace ids (an orchestrator names each of its sub-tasks), and the
-session view gathers them into one tree; the trace view is one task's tree.
-
-- **The trace id travels downstream**: every upstream request carries
-  `x-trace-id`, `x-span-id`, `x-session-id`, `x-request-id` and `x-task-id`,
-  so the vendor's own log (or the relay in front of it) can be read back into
-  the session that caused it. When the caller sends its own `x-trace-id` (or
-  `metadata.trace_id`), local-router keeps it, so an orchestrator's trace and
-  the gateway's trace are the same one.
-- **The vendor's own request id is kept**: the `chatcmpl-…` / `msg_…` a vendor
-  returns is written into the span, so a line on an invoice or in a vendor
-  log can be traced back to the session and the step that caused it.
-- **The console's Traces view** opens on "by session": one row per session,
-  and the whole chain of that session when it is expanded. Switch to "by
-  task" for a single trace. It exports csv and jsonl.
-- **From the shell**:
-
-```sh
-local-router traces                       # the recent traces
-local-router traces --session sess-42     # one session's traces
-local-router trace --session sess-42      # one session, whole chain, as a tree
-local-router trace trc_16c1f6a3d4ba4a08   # one trace, as a tree
-```
-
-Traces land in the `trace_spans` table of `usage.db` and in `traces.jsonl`
-next to it. With `record_usage` turned off, nothing is recorded — not the
-usage, not the trace.
-
-### API endpoints
-
-| Endpoint | Purpose |
-| --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat, streaming or non-streaming |
-| `POST /v1/responses` | OpenAI Responses |
-| `POST /v1/messages` | Anthropic Messages |
-| `POST /v1beta/models/{model}:generateContent` | Gemini |
-| `GET /v1/models` | Model catalog |
-| `GET /health` | Health check |
-| `POST /api/providers/{id}/test` | Direct provider chat test |
-| `GET /api/cooldowns` | Current 429 cooldowns |
-| `GET /api/traces` | The trace list (one row per task) |
-| `GET /api/traces/{id}` | One trace, with its span tree |
-| `GET /api/traces/sessions` | The session list (one row per session) |
-| `GET /api/traces/sessions/{id}` | One session, with its whole chain |
-| `GET /api/traces/export` | The trace log as csv or jsonl |
-
-### Security and privacy
-
-- The gateway is local-first and binds to loopback by default.
-- Remote console/API access requires a configured caller key.
-- Console write requests validate the browser origin.
-- Provider keys are masked in the console and are not returned by normal provider APIs.
-- Prompt secret masking can redact API-key-like text and secret-shaped tool arguments.
-- Runtime sessions, tokens, usage data, and personal account data stay outside the repository.
-
-Read [SECURITY.md](SECURITY.md) before exposing the service with `--lan` or a
-container port mapping. Please report security vulnerabilities privately using
-the channel documented there; do not open a public issue for a vulnerability.
-
-### Development
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets
-cd frontend && npm run build
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution workflow and
-[docs/CONFIG.md](docs/CONFIG.md) for configuration details.
-
-### License
-
-MIT License. See [LICENSE](LICENSE).
-
-## 中文
-一个本地 AI 网关：把你的所有模型服务商收进一个进程，给每个编码 agent
-（Claude Code / Codex / Gemini CLI / OpenCode / 任何吃 base URL 的工具）
-提供统一、可路由、可观测的模型接口。
-
-- **Rust 单二进制**：网关 + React 控制台 + CLI，一个文件跑起来
-- **四种协议互译**：OpenAI Chat / OpenAI Responses / Anthropic / Gemini，
-  任意「入口 × 上游」组合（流式、工具调用、思考块、token 用量）
-- **路由组**：order / rotate / usage / smart / weight，故障转移、会话粘性、嵌套组、多 key
-- **多节点部署**：每台机器跑一个网关，级联起来——上游在另一台机器上时，把它当
-  普通上游加进来即可（异地出口、统一路由、链路互通，模型名各节点保持一致）。
-  每个节点都能远程遥控：`--lan` + caller key + 反代暴露控制面，配置快照
-  （导出/导入 + revision 乐观并发）在节点间迁移，`local-router remote` 直接查
-  远端状态，限流每节点独立；每个节点都有 `/metrics`，链路可导出 OTLP
-- **可观测性**：Prometheus `/metrics` 实时指标（请求、in-flight、冷却、token
-  吞吐、p99 延迟），OTLP 导出（`cargo build --features otlp`）把 span 树送到
-  Tempo / Jaeger
-- **订阅登录态上游**：WorkBuddy、QwenWork（千问办公）免 key 接入，
-  自动续期、自动签到
-- **控制台**：React + TypeScript + Vite 构建的服务商 / 模型 / 路由 / 用量 /
-  会话 / 项目 / 上下文 / 额度 / 链路追踪 / 设置界面
-- **链路追踪**：每个会话与它的每次上游调用都记成 span 树，
-  session → 请求 → 上游调用，trace id 随请求下发到厂商
-- **Docker**：多阶段构建，`/data` 持久化，compose 一键起
-
-本项目为独立实现，只做网页模式 + CLI，不做桌面客户端。
-
-> **第一次用请看 [USAGE.md](USAGE.md)** —— 五分钟跑起来、日常命令速查、
-> 11 个常见场景的做法、排障问答。本 README 是项目全貌与设计说明。
-
-## 快速开始
-
-### 本地运行
-
-需要 Rust 1.89+ 与 Node.js 24+（仅构建控制台用）：
-
-```sh
-npm install && npm run build --prefix frontend   # 构建 React 控制台（cargo 也会自动调）
-cargo build --release
-./target/release/local-router                    # 网关 + 控制台，同一个端口 :3435
-local-router --version                           # 0.1.1
-```
-
-### Docker
-
-```sh
-docker compose up -d          # http://localhost:3435（网关与控制台同一个端口）
-# 或
 docker build -t local-router . && docker run -p 3435:3435 -v lr-data:/data local-router
 ```
 
-## 把 agent 指过来
+## Point your agents at it
 
 ```sh
-# 方式一：CLI 改写各 agent 自己的配置
+# Option 1: let the CLI rewrite each agent's own config
 local-router provider add deepseek --key sk-xxx
-local-router claude deepseek/deepseek-chat     # 写 ~/.claude/settings.json
-local-router codex  kimi/kimi-k2               # 写 ~/.codex/config.toml
-local-router gemini glm/glm-4.6                # 写 ~/.gemini/.env
-local-router opencode deepseek/deepseek-chat   # 写 opencode.json
+local-router claude deepseek/deepseek-chat     # writes ~/.claude/settings.json
+local-router codex  kimi/kimi-k2               # writes ~/.codex/config.toml
+local-router gemini glm/glm-4.6                # writes ~/.gemini/.env
+local-router opencode deepseek/deepseek-chat   # writes opencode.json
 
-# 方式二：环境变量（任何工具）
+# Option 2: environment variables (works with any tool)
 export OPENAI_BASE_URL=http://127.0.0.1:3435/v1      OPENAI_API_KEY=local-router
 export ANTHROPIC_BASE_URL=http://127.0.0.1:3435      ANTHROPIC_API_KEY=local-router
 export GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:3435  GEMINI_API_KEY=local-router
 ```
 
-## CLI
+## CLI in one screen
 
 ```sh
-local-router                                   # 网关 + 控制台（前台，一个进程）
 local-router serve [--port N] [--addr A] [--lan] [--no-console]
-local-router web [--port N]
-
-# 后台守护进程：同一进程提供网关 + 控制台，断开终端也活着
-local-router daemon start  [--port N] [--addr A] [--lan]
-local-router daemon status | stop | logs
-
-local-router provider add <preset|名字> --key sk-… [--url …] [--protocol anthropic] [--models a,b]
+local-router daemon start|stop|status|logs|install     # background / autostart
+local-router provider add <preset|name> --key sk-… [--url …] [--protocol anthropic]
 local-router provider list | rm | models | expose | media | test | key
-local-router models                            # 模型目录
-local-router group add <名字> --models a/m1,b/m2 --routing order | list | rm
-local-router ls | usage [--csv] | doctor | prices
-local-router traces [--period 7d] [--session X] [--provider Y] [--csv]
-local-router trace <trace-id>
-local-router dashboard                        # 终端仪表盘（实时刷新，q 退出）
-local-router daemon start|stop|status|logs    # 后台守护进程
-local-router claude|codex|gemini|opencode <model>
-local-router workbuddy status|credits|login|checkin|models   # WorkBuddy 登录态
-local-router qwen status|credits|login|models                # QwenWork 设备流
+local-router models                                    # exposed model catalog
+local-router group add <name> --models a/m1,b/m2 --routing order
+local-router usage [--period today] [--csv]            # usage and cost
+local-router traces | trace <id>                       # tracing
+local-router dashboard                                 # terminal dashboard
+local-router doctor                                    # self-check
+local-router remote status --host <url> --key <k>      # query a remote node
+local-router workbuddy status|credits|login|checkin    # session-backed providers
+local-router qwen status|credits|login
 ```
 
-### 直接测试对话与 429 冷却
+The full command reference lives in the Chinese manual,
+[USAGE.md § 2.3](USAGE.md#23-命令行速查).
 
-控制台 Provider 详情抽屉里的「测试对话」和命令行使用同一条最小真实对话测试链路：
+## Documentation
 
-```sh
-local-router provider test <provider-id>
-local-router provider concurrency <provider-id> <key-id|session> <limit>
-```
-
-如果 daemon 正在运行，CLI 会调用后台测试接口，因此和控制台共享冷却状态；QwenWork
-和 Trae CN 会使用各自的专用协议，不会被当作普通 OpenAI 上游。没有 daemon 时，CLI
-才会回退为直连测试。
-
-`provider concurrency` 为单个上游 API Key 设置最大同时进行的请求数，超过限制的请求会排队；
-传入 `0` 取消限制。会话型 provider 使用 `session` 作为 provider 级兜底限制，
-普通 Provider API Key 使用自己的 key id，并可覆盖 provider 级限制。
-
-上游返回 HTTP 429 后，网关会让该 provider 默认安静 60 秒；连续 429 会指数退避，最长
-10 分钟。冷却期间网关在真正发送请求前跳过该 provider，路由组会尝试下一个成员，
-控制台和 CLI 测试也不会绕过冷却。查看状态：
-
-```sh
-curl http://127.0.0.1:3435/api/cooldowns
-```
-
-可以用 `LOCAL_ROUTER_COOLDOWN_SECS` 和 `LOCAL_ROUTER_COOLDOWN_MAX_SECS`（单位：秒）
-调整默认冷却时间。
-
-## 配置
-
-`~/.config/local-router/`（`LOCAL_ROUTER_HOME` 可覆盖，Docker 里是 `/data`）：
-
-```
-config.json       # providers、groups、settings、caller-keys（0600）
-usage.jsonl       # 每请求一行：模型、provider、token、时延、状态、成本
-usage.db          # 同一份记录的 SQLite 视图（可关）
-sessions.json     # 会话标题簿（会话 id → 标题）
-projects.json     # 项目注册表（目录 → 名称 / 颜色 / 预算）
-prices.json       # 可选：价目表覆盖
-workbuddy-session.json  # WorkBuddy 浏览器登录的 token（0600）
-qwen-session.json       # QwenWork 设备流登录的 token（0600）
-```
-
-文件被 CLI / 另一个进程修改后，网关在下一个请求自动重载（mtime 探测），
-不用重启。
-
-`config.json` 里的 `settings` 还能改几件事：
-
-| 字段 | 作用 |
+| Document | Contents |
 | --- | --- |
-| `cors_origins` | 允许哪些浏览器源跨域调用网关。默认空（不允许）；填 `["*"]` 或 `["http://localhost:3000"]` 才开 |
-| `default_caller_key` | 调用方默认用的 key |
-| `record_usage` | 是否记录用量 |
-| `masking` | 是否在发往上游前遮蔽提示词里的密钥（`sk-…`/`ghp_…`/长 hex 等；工具参数里名字含 key/token/secret 的字段一并遮蔽） |
-| `workbuddy_auto_checkin` | 是否自动领 WorkBuddy 每日签到（默认开） |
-| `send_agent_user_agent` | 是否把 agent 的 User-Agent 转发给上游 |
+| [USAGE.md](USAGE.md) | Manual (Chinese): setup in five minutes, daily commands, 11 scenarios, troubleshooting |
+| [docs/API.md](docs/API.md) | Gateway endpoints, auth, model naming (Chinese) |
+| [docs/TRACING.md](docs/TRACING.md) | Session ↔ upstream trace model and storage format (Chinese) |
+| [docs/BILLING.md](docs/BILLING.md) | Usage records, cost/credits semantics, bill dimensions, SQLite queries (Chinese) |
+| [docs/PROVIDERS.md](docs/PROVIDERS.md) | Session-backed providers: WorkBuddy / QwenWork / Trae CN mechanics (Chinese) |
+| [docs/CONFIG.md](docs/CONFIG.md) | Field-level `config.json` reference (Chinese) |
+| [docs/BENCHMARK.md](docs/BENCHMARK.md) | Throughput baseline and benchmark reproduction (Chinese) |
+| [examples/multi-machine](examples/multi-machine/README.md) | Runnable two-node cascade example |
+| [examples/monitoring](examples/monitoring/README.md) | Ready-made Prometheus + Grafana stack |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Contribution workflow |
+| [SECURITY.md](SECURITY.md) | Security model and vulnerability reporting |
+| [CHANGELOG.md](CHANGELOG.md) | Changes per version |
 
-`usage.jsonl` 跟 `config.json` 放在同一个目录；超过 8 MB 会自动翻页成
-`usage.jsonl.1`（可用 `LOCAL_ROUTER_USAGE_MAX_BYTES` 改这个上限）。
+## Security notes
 
-### SQLite 存储
+- Binds to loopback by default; with `--lan` or container exposure, `/api` and
+  `/metrics` require a caller key, and write requests validate `Origin`.
+- Provider keys are masked in the console; `config.json` is written with 0600;
+  prompt secret masking (`masking`) stops `sk-…` / `ghp_…` / long hex strings
+  from leaking upstream.
+- Runtime credentials, sessions, and usage data live under `LOCAL_ROUTER_HOME`
+  on your machine — nothing is committed.
 
-用量记录同时写入 **SQLite**（`usage.db`，跟 config 同目录）：
+Read [SECURITY.md](SECURITY.md) before exposing the service beyond loopback.
 
-- 写入走单连接 + WAL，本地网关的开销可以忽略；
-- 控制台 / HTTP API 的聚合（按天、按平台、按模型、总账）直接用 SQL 查询，
-  不再扫全量日志，数据量大了也不卡；
-- JSONL 日志保留（兼容导出/人工查看），两者内容一致；
-- 设 `LOCAL_ROUTER_DISABLE_SQLITE=1` 可关掉，退回纯 JSONL。
+## Scope and trade-offs
 
-可以直接用任何 SQLite 客户端查：
+**Core**: multi-provider gateway, protocol translation, routing groups, usage
+recording, session/project/context observability, session-backed providers
+(WorkBuddy / QwenWork / Trae CN), web console, CLI, multi-key failover,
+multi-node cascade with remote operations, Prometheus/OTLP exports.
 
-```sql
-sqlite3 ~/.config/local-router/usage.db \
-  "SELECT provider, count(*), sum(cost_usd), sum(credits)
-   FROM usage_records WHERE time >= '2026-10-26' GROUP BY provider;"
-```
+**Intentionally out of scope**: desktop menu-bar apps, a desktop client form
+factor, plugin ecosystems, local PII scrubbing, QwenWork enterprise
+(VPC / PAT).
 
-### 额度与开销统计
-
-每个请求的记录里都带钱：
-
-```json
-{"model":"workbuddy/hy3","input_tokens":15,"output_tokens":128,
- "cost_usd":0.000148,"credits":0.0172,"priced":true}
-```
-
-- **cost_usd**：按厂商公开价目表算的美元成本（每百万 tokens）。
-- **credits**：订阅制厂商（如 WorkBuddy）自己额度单位的估算消耗。
-- **priced=false** 表示该模型没有价格记录，钱无法估算（用量页会计数）。
-
-看总账：
+## Development
 
 ```sh
-local-router usage --period today    # 按 provider / 按模型，含 $ 与 credits 列
-local-router usage --csv             # 机器可读，含 cost_usd / credits 列
-local-router prices                  # 当前价目表（29+ 模型）
-```
-
-HTTP API（`period=today|24h|7d|30d|all`）：
-
-```sh
-curl -H "Authorization: Bearer <key>" \
-  'http://127.0.0.1:3435/v1/local-router/usage?period=7d'
-# → cost_usd / credits / unpriced 汇总 + per_provider[] 每个平台的账单
-```
-
-控制台 Usage → Bills 现在分别提供：
-
-- **按上游 Provider API Key**：`provider / key_label`（没有 label 时显示 `key_id`）的请求数、失败数、输入/输出 token、缓存/推理 token、成本和 credits；
-- **按调用方 API Key**：哪个 agent 或客户端使用了 local-router 的哪把 caller key；
-- **按 agent**：从 User-Agent 识别的调用方。
-
-`/api/usage` 返回 `by_provider_key`、`by_caller_key` 和 `recent` 明细；命令行
-`local-router usage` 和 `--csv` 也包含这两个 API Key 维度。上游 Provider Key 与调用方
-Key 是两套不同的凭据，控制台会分开统计。控制台 Usage 页有「BY PLATFORM」面板：每个平台一段时期的请求数、token、
-美元成本、credits 消耗一目了然。可视化图表：
-
-
-
-- **按天柱状图**（近 14 天）：请求数 + 成本双维度；
-- **每平台成本横条**：美元与 credits 双条，谁是花钱大头一眼可见；
-- **模型占比甜甜圈**：请求份额按模型分布。
-
-数据来自 SQLite 聚合查询（页面顶部有 `SQLITE` / `JSONL` 标签标明当前存储）。
-
-**改价格 / 加新厂商**：写 `~/.config/local-router/prices.json`（不用重启）：
-
-```json
-{"hy3": {"input": 0.5, "output": 2.0, "credits_per_million": 200.0}}
-```
-
-价目是估算：订阅制厂商的 credit 折算率来自套餐额度与公开价的比例，可能与
-厂商实际扣减有偏差；`prices.json` 可随时校准。
-
-### 守护进程与端口
-
-两种常驻方式，**同一个进程**同时提供网关（API）和控制台（React 页面）：
-
-```sh
-local-router daemon start              # 后台运行，默认 3435（网关 + 控制台）
-local-router daemon status             # 运行中？端口？日志在哪
-local-router daemon logs               # tail -f 日志
-local-router daemon stop               # 优雅停止（SIGTERM，卡死自动 SIGKILL）
-```
-
-端口与绑定（CLI 参数 > 环境变量 > config.json > 默认值）：
-
-| 参数 | 作用 |
-| --- | --- |
-| `--port` / `LOCAL_ROUTER_GATEWAY_PORT` | 网关端口（默认 3435） |
-| `--no-console` | 只提供模型 API，不提供控制台页面（配置里是 `settings.console: false`） |
-| `--addr` / `LOCAL_ROUTER_GATEWAY_ADDR` | 网关绑定地址（默认 127.0.0.1） |
-| — | 控制台与网关共用端口与地址，没有单独的设置 |
-| `--lan` / `LOCAL_ROUTER_LAN=1` | 两个地址都改绑 `0.0.0.0`（局域网可访问） |
-
-`daemon start` 会等两个端口就绪才返回；stop 会在 5 秒内退不干净时自动
-SIGKILL。日志在 `~/.config/local-router/daemon/daemon.log`。
-
-### 环境变量
-
-| 变量 | 作用 |
-| --- | --- |
-| `LOCAL_ROUTER_HOME` | 配置目录（Docker 里设为 `/data`） |
-| `LOCAL_ROUTER_GATEWAY_PORT` / `LOCAL_ROUTER_WEB_PORT` | 端口（CLI 参数可再覆盖） |
-| `LOCAL_ROUTER_GATEWAY_ADDR` | 绑定地址 |
-| `LOCAL_ROUTER_DEFAULT_KEY` | 运行时调用密钥（**不落盘**，优先于文件里的 key） |
-| `LOCAL_ROUTER_LAN` | `1` 等价于 `--lan` |
-| `LOCAL_ROUTER_LOG` | 日志过滤（如 `debug`） |
-
-> 鉴权：网关请求需要 `Authorization: Bearer <key>`（也接受 `x-api-key` /
-> `x-goog-api-key` / `api-key`），key 取 `LOCAL_ROUTER_DEFAULT_KEY` →
-> 设置里的默认 key → caller keys 任一匹配；一把 key 都没有时拒绝一切请求。
->
-> 控制台：回环地址上免鉴权（本机信任）；页面绑到非回环地址（`--lan`、
-> 容器）时 `/api` 需要同一套 key，控制台会提示输入一次。所有写请求校验
-> `Origin`，跨站写一律 403。`config.json` 以 0600 落盘；
-> `LOCAL_ROUTER_DEFAULT_KEY` 只在进程内存。
-
-## 网关端点
-
-| 端点 | 说明 |
-| --- | --- |
-| `POST /v1/chat/completions` | OpenAI Chat（流式 / 非流式） |
-| `POST /v1/images/generations` · `/v1/images/edits` | 图片生成 / 编辑（multipart 编辑） |
-| `POST /v1/videos` · `GET/DELETE /v1/videos/{id}` · `GET /v1/videos/{id}/content` | 视频任务：创建 / 查状态 / 取文件 / 取消 |
-| `POST /v1/responses` | OpenAI Responses |
-| `POST /v1/messages` · `/v1/messages/count_tokens` | Anthropic Messages |
-| `POST /v1beta/models/{model}:generateContent` / `:streamGenerateContent` | Gemini |
-| `GET /v1/models` | 模型目录（OpenAI list 形状） |
-| `GET /health` · `/v1/local-router/status` | 健康检查 / 运行状态 |
-
-任意「入口协议 × 上游协议」组合都支持：系统提示、多模态消息、工具定义 /
-调用 / 结果、思考块（含 signature）、stop 原因、token 用量（缓存读写、
-思考 token）双向翻译。上游忽略 `stream=true` 返回 JSON 时，网关自动把整段
-回复转成事件流。
-
-## WorkBuddy：用本机登录态当上游
-
-不想买 API key，但本机装了 WorkBuddy？local-router 可以直接复用 WorkBuddy 的
-登录态，把它当成一个上游：
-
-```sh
-local-router provider add workbuddy      # 不需要 key
-local-router workbuddy status            # 登录状态、账号、token 有效期
-local-router workbuddy credits           # 积分（资源包 + 签到）
-local-router workbuddy login             # 浏览器登录（打印链接 + 自动接入）
-local-router workbuddy checkin           # 手动领当日签到（通常自动完成）
-local-router workbuddy models            # 账号可用的模型
-local-router claude workbuddy/hy3        # 让 Claude Code 走 WorkBuddy
-```
-
-要点：
-
-- **不落盘**：access token 只在内存里。`config.json` 里只有
-  `"auth": "workbuddy"` 这样的标记，没有任何密钥；日志和 `usage.jsonl` 里也
-  不会出现 token。
-- **自动续期**：token 快到期时会用 refresh token 换一个新的（refresh token
-  放在 `X-Refresh-Token` 头里，由 WorkBuddy 客户端同样的接口换发）。
-- **协议**：上游只接受流式请求（`POST /v2/chat/completions`）。local-router
-  会在调用方要整段回复时把它流式收回来再拼好，所以 OpenAI / Anthropic /
-  Responses / Gemini 四种入口都能用。
-- **自动签到**：网关会自己盯签到活动，到点未签就代签（默认开；
-  `config.json` 里 `"workbuddy_auto_checkin": false` 关掉）。每日 +100 credits
-  就不用手动领了。也可手动：`local-router workbuddy checkin`。
-- **登录**：不用装客户端，直接
-
-  ```sh
-  local-router workbuddy login
-  ```
-
-  它会打印一个登录链接（并自动打开浏览器），登录完成后 token 自动保存到
-  local-router 自己的会话文件（0600），provider 自动加上——WorkBuddy 客户端
-  与它的登录文件完全不受影响。链接五分钟内有效，也可以复制到别的机器的
-  浏览器里打开。
-  已有本机 WorkBuddy 登录态时无需此步，直接可用；登录完成后可用检查脚本
-  验证：
-
-  ```sh
-  bash scripts/workbuddy-login-check.sh   # 五步检查：客户端/登录态/服务端/接入/真实推理
-  ```
-- 容器里看不到宿主机的登录态，除非你把会话文件挂进去
-  （`LOCAL_ROUTER_WORKBUDDY_SESSION`）。
-
-### 图片与视频
-
-图片与视频走各厂商自己的原生端点，网关只做转发与统一入口：
-
-```sh
-# 用 WorkBuddy 的图像模型画一张图
-curl http://127.0.0.1:3435/v1/images/generations \
-  -H "Authorization: Bearer local-router" \
-  -H "content-type: application/json" \
-  -d '{"model":"workbuddy/hunyuan-image-v3.0-art","prompt":"一只戴帽子的猫"}'
-
-# 视频是异步任务：创建 → 查状态 → 取文件
-curl http://127.0.0.1:3435/v1/videos \
-  -H "Authorization: Bearer local-router" \
-  -H "content-type: application/json" \
-  -d '{"model":"workbuddy/kling-video-v3","prompt":"一只猫在跑"}'
-```
-
-要点：
-
-- **模型要声明**：给 provider 配上能做图/视频的模型
-  （`local-router provider media <id> <模型...>`），它们会出现在 `/v1/models`
-  里，并带 `modalities` / `native_endpoints` 元信息，客户端据此发现能力。
-- **厂商原生路径可配**：默认走 OpenAI 的 `/v1` 家族；像 WorkBuddy 把媒体放在
-  `/v2` 且视频一次生成完（没有任务状态接口），在 provider 的 `media_paths` 里
-  写明即可，网关会自己兜住状态与下载。
-- 图片/视频的用量不计入 chat 的 token 统计，但同样计入 `usage.jsonl` 的请求数。
-
-### WorkBuddy 相关的环境变量
-
-| 变量 | 作用 |
-| --- | --- |
-| `LOCAL_ROUTER_WORKBUDDY_SESSION` | 登录态文件的完整路径（找不到时不再猜别的位置） |
-| `LOCAL_ROUTER_WORKBUDDY_ENDPOINT` | 换用别的 WorkBuddy 端点（私有化 / 测试） |
-| `WORKBUDDY_HOME` | 登录态所在目录（默认自动查找） |
-| `LOCAL_ROUTER_QWEN_SESSION` | QwenWork 会话文件路径 |
-| `LOCAL_ROUTER_QWEN_ENDPOINT` | 换用别的 QwenWork 端点（测试） |
-
-## 用量页：会话 / 项目 / 上下文
-
-Usage 页在 Overview 之外还有几个子标签，数据全部来自请求本身：
-
-- **Sessions**：每个会话一行 —— 标题取首个用户消息的第一行，请求数、token、
-  花费。agent 带上 `x-session-id`（或 Anthropic 的 `metadata.user_id`）
-  就会被记录。
-- **Projects**：按工作目录分组。agent 上报 CWD（`x-project` /
-  `x-project-dir` / `x-cwd` 头，或 body 里的 `metadata.cwd`）后自动建档；
-  控制台里可改名、配色、设 token/费用预算、合并重复目录。合并会把两个
-  存储里的历史记录一起重键。
-- **Context**：每个请求的上下文窗口拆解 —— 系统提示 / 工具定义 / 附件文件 /
-  对话各占多少 token（按 ~3.6 字符/token 估算），窗口填充率与缓存友好度
-  评分。填充率需要知道模型窗口大小，未知时显示为 0。
-- **Quota**：登录态上游的额度窗口（WorkBuddy 资源包 / QwenWork 钱包），
-  以及 `GET /v1/local-router/quotas` 的路由视角。
-
-## 链路追踪：会话 ↔ 上游调用
-
-一个大任务往往被拆成很多次模型调用，分布在多个厂商上。local-router 是
-唯一同时看到「agent 的请求」和「厂商的回答」的地方，所以它把两边的关联
-记下来：
-
-```
-session  ses_…          agent 的会话 —— 一次会话就是一条完整的链路
- ├─ request  req_…       agent 发的一次请求
- │   └─ upstream up_…    对某个厂商的一次尝试（含失败、降级、被跳过的）
- └─ request  req_…
-     └─ upstream up_…
-```
-
-**按会话看，才是完整的链路。** 同一个会话的请求可能带着不同的 trace id
-（编排层给每个子任务起一个），会话视图会把它们收成一条树；按 trace 看
-则是一条任务自己的树。
-
-```
-trace  trc_…            一个任务（调用方自己的 trace id，或会话派生）
- └─ session  ses_…      agent 的会话
-     └─ request  req_…  agent 发的一次请求
-         └─ upstream up_…  对某个厂商的一次尝试（含失败与降级）
-```
-
-- **trace id 逐层下传**：请求头里带 `x-trace-id` / `x-span-id` /
-  `x-session-id` / `x-request-id` / `x-task-id` 发给上游，厂商（或厂商前面
-  的中转）自己的日志里就有这个 id，可以反查回本地会话。调用方自己带
-  `x-trace-id`（或 body 里的 `metadata.trace_id`）时，网关沿用它，编排层
-  的 trace 与网关的 trace 就是同一条。
-- **厂商自己的 request id 也留着**：上游返回的 `chatcmpl-…` / `msg_…` 会写
-  进 span，厂商账单或日志里的一条记录，可以反查回是哪次会话的哪一步。
-- **控制台 Traces 页**：默认「按会话」——每个会话一行，点开是这个会话的
-  完整链路；切到「按任务」看单条 trace。可导出 csv / jsonl。
-- **命令行**：
-
-```sh
-local-router traces                       # 最近的链路
-local-router traces --session sess-42     # 只看某个会话
-local-router trace --session sess-42      # 一个会话的完整链路（树）
-local-router trace trc_16c1f6a3d4ba4a08   # 一条任务的树
-```
-
-- **落盘位置**：SQLite 的 `trace_spans` 表 + 同目录的 `traces.jsonl`；
-  `record_usage` 关掉时链路也不记。
-
-## QwenWork（千问办公）：设备流登录当上游
-
-有 QwenWork 个人账号？不用 API key，走千问办公桌面客户端同款设备流登录，
-把它当一个上游：
-
-```sh
-local-router qwen login      # 打印登录链接 → 浏览器登录 → 自动配置 provider
-local-router qwen status     # 登录状态、账号、token 有效期
-local-router qwen credits    # 额度余额（钱包分日常/月度/长期池）
-local-router qwen models     # 账号可用的模型
-local-router claude qwenwork/qwen3-coder-plus   # 让 Claude Code 走 QwenWork
-```
-
-要点：
-
-- **协议专线**：QwenWork 每个请求都要过 COSY 信封（RSA 包 AES 密钥 +
-  MD5 签名 + 乱序 base64 体编码），通用 OpenAI 管道表达不了，网关里它走
-  自己的模块；调用方看到的仍是标准的四种入口协议。
-- **不落盘密钥**：设备 token 只在 `qwen-session.json`（0600）与内存里；
-  `config.json` 中只有 `"auth": "qwenwork"` 标记。
-- **自动续期**：token 到期前五分钟自动用 refresh token 换新（换发结果
-  不回写磁盘，与客户端行为一致）。
-- **只支持个人公有云**（gateway.qwenwork.cn）；企业版 VPC / PAT 不做。
-- 容器里看不到宿主机登录态时，把会话文件挂进去并设
-  `LOCAL_ROUTER_QWEN_SESSION`。
-
-### 请求头重写
-
-不同上游对请求头的挑剔程度不一样：有的中转站要求带上调用方自己的会话头，
-有的会拒绝陌生的 `anthropic-version`，还有的按头发顺序做指纹。provider 上
-有五组规则（对齐 [icebear0828/codex-proxy](https://github.com/icebear0828/codex-proxy)
-的请求头重写能力）：
-
-| 规则 | 作用 | 执行顺序 |
-| --- | --- | --- |
-| `headers` | 每个请求都带的静态头，值里 `{version}` / `{platform}` / `{arch}` 会展开 | 1 |
-| `forward_headers` | 把**调用方**发来的同名头原样转发给上游（没带就不造一个） | 2 |
-| `remove_headers` | 把命名的头删掉——鉴权头、静态头、转发来的都可能删 | 3（最后跑，赢过一切） |
-| `user_agent` | UA 模板，占位符同样展开；不设则透传 agent 的 UA（见 `send_agent_user_agent`） | — |
-| `header_order` | 上游头的发送顺序，没列的跟在后面（纯提示，多数厂商不在乎） | 发送时 |
-
-命令行：
-
-```sh
-local-router provider set-headers deepseek "x-profile=gw-{version}-{arch}" "x-team=infra"
-local-router provider forward-headers deepseek "x-opencode-session,x-request-id"
-local-router provider remove-headers deepseek "anthropic-version"
-local-router provider header-order deepseek "user-agent,authorization,x-profile"
-local-router provider user-agent deepseek "my-relay/{version} ({platform} {arch})"
-local-router provider headers deepseek        # 查看全部规则
-```
-
-控制台 PATCH `/api/providers/{id}` 同样接受 `headers` / `forward_headers` /
-`remove_headers` / `header_order` / `user_agent` 字段。
-
-典型用法：**OpenCode 的 Console Go 上游**会拒绝没有 `x-opencode-session`
-的请求——`forward-headers` 把 agent 自己的会话头原样带过去就能直连；
-**要删掉某厂商不认识的头**（有些中转对陌生头直接 400）用 `remove-headers`。
-
-### 模型目录与自动纳新
-
-每个 provider 的 `models` 是对外暴露的白名单；「刷新模型」（控制台按钮或
-`/api/providers/{id}/refresh`）会拉取厂商的完整目录。给 provider 配上
-`auto_include`（glob，`*` 是通配符，如 `["mock-*", "glm-4.6"]`）后，厂商
-新列出且匹配 glob 的模型会**自动并入** provider 并落盘——新模型上线不用
-改配置、不用重启。响应里的 `auto_included` 说明本次自动新增了哪些。
-
-## 路由组
-
-```sh
-local-router group add "backup" --models deepseek/deepseek-chat,glm/glm-4.6 --routing order
-local-router claude group/backup
-```
-
-- `order` 主备故障转移 · `rotate` 轮询 · `usage` 最少使用 · `smart` 额度感知 · `weight` 加权
-- `stays=auto|session|turn|off|strict`：会话粘性（prompt cache 还值钱时留在同一个 key 上）。`turn` 在新对话时重新选；`strict` 只认会话的目标，目标消失就报错、拒绝回退
-- 组内可嵌套组（带环检测）；一个 provider 配多把 key 会逐个尝试
-- `hold_when_exhausted`：账户配额窗口空了就不再路由到该上游（默认关；
-  实测 WorkBuddy 在额度为 0 时仍可服务，所以不要对它开）
-
-## 多节点部署：级联 + 远程运维 + 监控
-
-每台机器跑一个完整的 local-router，节点之间用级联与远程运维串起来。
-
-### 级联：上游在另一台机器上
-
-想在美国的 IP 出到 Anthropic、而所有 agent 都连香港的网关——**把另一台机器上
-的 local-router 当成一个普通上游加进来**就行，不用发明节点机制：
-
-```sh
-# 香港主网关
-local-router provider add claude-us \
-  --url https://us.example.com --key <上游节点的 caller-key> --protocol anthropic
-local-router provider expose claude-us claude-opus-4-5,claude-sonnet-4-5
-local-router group add claude --models claude-us/claude-sonnet-4-5 --routing order
-```
-
-- 跨机访问必须配 **caller key**（一把 key 都没有时网关拒绝一切请求）
-- **TLS 不内置**：公网暴露用 caddy/nginx 反代，或 Cloudflare Tunnel / Tailscale
-- **模型名不用绕**：主网关转发时剥掉自己的前缀，裸模型名（有且仅有一个上游提供时）
-  直接在上游节点路由——两台机器模型名保持一致即可
-- **trace id 逐层下传**：两边的链路是同一条，在任意一边都能查全
-- 冷却是**每台实例独立**的；主网关对「上游节点」这个上游另有一份冷却
-- 每加一台节点要在主网关手动 `provider add` 一次，没有自动发现
-
-示例配置、可本机跑的验证脚本（不需要真实 API key）、以及「上游那台其实只
-需要跑个 nginx 反代」的更简形态，见
-[examples/multi-machine](examples/multi-machine/README.md)。
-
-### 远程运维：遥控另一个节点
-
-每个节点就是自己的控制面。绑到非回环地址（`--lan`）+ caller key + 反代，
-就可以从主网关这边遥控它：
-
-```sh
-# 远程查状态 / 模型 / 限流 / 冷却 / 配置
-local-router remote status     --host https://us.example.com --key <caller-key>
-local-router remote providers  --host https://us.example.com --key <caller-key>
-local-router remote rate-limits --host https://us.example.com --key <caller-key>
-
-# 配置快照在节点间迁移：导出（默认掩码 key）→ 导入（revision 乐观并发，
-# 两个写入方同时改不会互相覆盖，过期写 409）
-curl -s "https://us.example.com/api/config?include_keys=true" > us.json
-curl -s -X PUT https://hk.example.com/api/config \
-  -H "content-type: application/json" --data @us.json
-```
-
-- 非回环地址下，`/api` 与 `/metrics` 都要 `Authorization: Bearer <caller key>`；
-  写请求校验 Origin；导出默认不带 key，防反代裸奔泄漏
-- **限流每节点独立**：每个节点可以给自己的上游和调用方配 RPM/TPM/日预算
-  （详见 [USAGE.md 第 8 章](USAGE.md)）
-
-### 监控：一次抓全所有节点
-
-每个节点都有 `/metrics`，Prometheus 各抓一份就能看全（级联两跳的 trace id
-已下传，链路本就连通）；要 span 树进 Tempo/Jaeger，两边都开 `--features otlp`
-并指向同一个收集器即可：
-
-```sh
-docker compose -f examples/monitoring/compose.yaml up -d   # Prometheus + Grafana 现成栈
-```
-
-面板见 [examples/monitoring](examples/monitoring/README.md)。
-
-## 开发
-
-```sh
-cargo fmt --all -- --check   # 格式
+cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                   # 293 个测试
-#   src/ 内是 Rust 原生单元测试（#[cfg(test)]）：协议 IR 与四协议往返、
-#   COSY 信封、配置/价目/预设/会话/项目、用量聚合、上下文估算、
-#   URL 与帧解析、仪表盘渲染、控制台守卫源校验
-#   tests/ 内是集成测试：协议翻译 / 路由 / HTTP 端到端 / 控制台守卫与 API
-#   形状 / WorkBuddy 会话与续期 / QwenWork 信封 / agent 配置写入 / 用量存储
-cd frontend && npm run dev   # 控制台热更新（API 代理到 :3435）
+cargo test --all-targets            # unit tests in src/ + integration tests in tests/
+cd frontend && npm run dev          # console hot reload (API proxied to :3435)
 ```
 
-只跑某一块：`cargo test --lib`（单元）/ `--test translate`（协议）/
-`--test gateway`（端到端）/ `--test web`（控制台）/ `--test qwen`（QwenWork）。
-
-`cargo build` 会通过 `build.rs` 自动构建 `frontend/`（检测到源码变化或
-`dist` 缺失时）。CI / 无 npm 环境可设 `LOCAL_ROUTER_SKIP_FRONTEND=1` 用
-桩页面代替。手工冒烟可配合 `scripts/mock_vendor.py` 起一个假厂商。
-
-## 参与贡献
-
-- [USAGE.md](USAGE.md)：使用说明（安装、命令速查、场景做法、排障）
-- [docs/CONFIG.md](docs/CONFIG.md)：配置参考（文件格式、每个字段、覆盖优先级）
-- [CONTRIBUTING.md](CONTRIBUTING.md)：环境搭建、提交前检查、怎么改
-- [SECURITY.md](SECURITY.md)：漏洞私下报告渠道与安全模型
-- [CHANGELOG.md](CHANGELOG.md)：每个版本的变更
-- 行为准则：[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-
-## 范围与取舍
-
-核心：多服务商网关、协议互译、路由组、用量记录、会话/项目/上下文观测、
-订阅账号登录态接入（WorkBuddy / QwenWork）、网页管理、CLI、多 key
-故障转移、多节点级联与远程运维、Prometheus/OTLP 可观测性出口。有意不做：桌面菜单栏、桌面客户端形态、插件生态、本地 PII 脱敏、
-QwenWork 企业版（VPC / PAT）。
+`cargo build` builds `frontend/` automatically through `build.rs`; set
+`LOCAL_ROUTER_SKIP_FRONTEND=1` in npm-less environments to use a stub page.
 
 ## License
 
 MIT
-
----
-
