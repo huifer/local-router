@@ -168,6 +168,18 @@
   `{{API_KEY_xxx}}` 占位符，真实值只在运行中的 magpie 进程内存里。脚本先让
   magpie 把网页开在本机（Settings → 网页 →「此电脑」），再逐个问真实密钥并
   写进 local-router 同名 provider 的 keys。
+- **压测台架与基线文档**：零依赖的两个脚本 + 一份实测记录，让「网关能扛多少」
+  从猜测变成可复现的数字：
+  - `scripts/benchmark.mjs` —— 多进程负载发生器（Node 单进程的事件循环会先于
+    网关饱和，还会撞上 macOS 临时端口耗尽；worker 结果经临时文件回传，绕开
+    IPC send+exit 截断消息的坑）；
+  - `scripts/mock_vendor.mjs` —— keep-alive 高并发上游桩（backlog 8192，
+    `--delay-ms` 模拟慢上游、`--fail` 模拟报错）。压大并发不要用
+    `scripts/mock_vendor.py`（HTTP/1.0 + backlog=5，502 会先在桩上出现）；
+  - `docs/BENCHMARK.md` —— 1 → 2000 并发阶梯、流式、慢上游、账本开关对照
+    与行为验证的完整数字，结论：默认配置（record_usage 开）～2.5–3k rps 封顶，
+    瓶颈是账本落库的单锁串行路径（关掉后 13–19.5k rps，5–7×）；百万请求零
+    错误零警告。复现步骤见文档 §6。
 
 ### Fixed
 
