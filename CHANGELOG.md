@@ -122,8 +122,6 @@
   （`openai_chat` / `openai_responses` / `anthropic` / `gemini`），之前只有交互式
   控制台支持这个参数，命令行会报 `unexpected argument '--protocol'`。
 
-### Added
-
 - **会话 ↔ 上游调用的链路追踪**：一个大任务被拆成很多次模型调用时，现在能
   回答「这次会话一共调了谁、调了几次、卡在哪一步」：
   - 每个请求开一个 **span**，每次上游尝试（成功、失败、降级都算）再开一个
