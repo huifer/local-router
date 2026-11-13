@@ -17,6 +17,16 @@
   **真模型优先**。入口：控制台 Groups 表单、`POST /api/groups`、
   `PATCH /api/groups/{id}`（`alias` 传空串清除）。
 
+- **Usage → Token 消耗页**：专门看 token 的页签——总量六格（含缓存读写与
+  推理单列）、按小时 / 按天的输入·缓存·输出堆叠图、按模型与平台的消耗排行
+  （可按总量 / 输入 / 输出 / 缓存排序）、最近 200 条请求里最耗 token 的明细；
+  总览的请求时间线与每日图也能在「请求数 / TOKEN」间切换。口径写死在一处：
+  **总量 = 输入 + 输出 + 缓存读取 + 缓存写入**（缓存命中只是单价低，不是
+  没消耗），推理 token 是输出的细分、单列不重复计入；失败请求计请求数、
+  不计 token。`GET /api/usage` 的 `requests_timeline[]` 与 `by_day[]` 现在
+  带完整 token 分列，`GET /v1/local-router/usage`（含 `/requests`）新增
+  `total_tokens`，口径见 docs/BILLING.md。
+
 - **Prometheus `/metrics` 端点（M1 遥测）**：网关现在在 `:3435/metrics` 暴露
   Prometheus 文本格式的实时指标——`local_router_requests_total`（by api /
   provider / status_class / has_key）、`local_router_tokens_total`（input /
@@ -192,6 +202,10 @@
 
 ### Fixed
 
+- **按天账单漏算缓存 token**：`usage::by_day` 之前只累加输入/输出，把
+  cache_read / cache_write / reasoning（及 unpriced 计数）全丢了——缓存密集
+  的 agent 里按天曲线因此只有真值的一半上下，与总账对不上。现在与
+  `totals` / `group_by` 累加同样字段，并有回归测试钉住两边一致。
 - **PATCH `/api/groups/{id}` 缺 `name` 时静默不生效**：`GroupInput.name`
   原来是必填字段，只发 `{"alias":…}` 之类的局部更新会被 serde 拒绝，而
   错误又被默认值兜底吞掉——返回 ok 但什么都没改。`name` 改为可选

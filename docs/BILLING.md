@@ -36,6 +36,30 @@ Prometheus `/metrics` 只做实时与速率（counter 重启归零）。两者�
 {"hy3": {"input": 0.5, "output": 2.0, "credits_per_million": 200.0}}
 ```
 
+## Token 消耗口径
+
+控制台 **Usage → Token 消耗** 是专门看 token 的页面（总览自身的两张图也能在
+「请求数 / TOKEN」间切换）：按小时、按天的堆叠图拆成 **输入 / 缓存 / 输出** 三层，
+下面接按模型、按平台的消耗排行（可按总量 / 输入 / 输出 / 缓存排序），以及最近
+200 条请求里最耗 token 的明细。
+
+口径写死在一处，避免各面板互相矛盾：
+
+```
+total_tokens = input_tokens + output_tokens + cache_read_tokens + cache_write_tokens
+```
+
+- **缓存读取、缓存写入也是消耗**：缓存命中只是单价低，不是没消耗。缓存密集的
+  agent 里它往往占一半以上，漏算会让按天曲线远低于总账。
+- **推理 token 不计入总量**：它是 `output_tokens` 的细分，单独一格展示，
+  重复相加会翻倍。
+- **失败请求计请求数、不计 token**：与 `usage::totals` 一致。
+
+`/api/usage` 的 `requests_timeline[]` 每个小时点带全部 token 字段与
+`total_tokens`；`by_day[]` / `by_model[]` / `by_provider_costs{}` 都返回完整
+`Totals`。`GET /v1/local-router/usage` 与 `/v1/local-router/usage/requests`
+额外返回 `total_tokens`，其 `per_provider[]` 也带缓存与推理 token。
+
 ## 账单的三个维度
 
 `/api/usage` 返回 `by_provider_key`、`by_caller_key` 与 `recent` 明细；
@@ -63,9 +87,12 @@ curl -H "Authorization: Bearer <key>" \
 
 控制台：
 
+- **Usage → Token 消耗**：token 总量、逐小时 / 逐天堆叠图、按模型与平台的
+  消耗排行、最耗 token 的请求明细（口径见上节）。
 - **Usage → Bills**：按上游 key / 调用方 key / agent 三个维度分账。
-- **Overview**：近 14 天请求数 + 成本柱状图、每平台成本横条（$ 与 credits
-  双条）、模型占比甜甜圈；页面顶部的 `SQLITE` / `JSONL` 标签标明当前存储。
+- **Overview**：顶部指标含总 token 与缓存读取；请求时间线、每日图可在
+  请求数与 token 间切换；每平台 / 每模型横条带 token 总量；模型占比甜甜圈；
+  页面顶部的 `SQLITE` / `JSONL` 标签标明当前存储。
 
 ## 直接用 SQL
 

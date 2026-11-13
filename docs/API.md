@@ -80,8 +80,8 @@ provider 的 `models` 列表既是对外白名单，也是转发给上游的模�
 | `GET /health` | 健康检查 |
 | `GET /v1/local-router/status` | 运行状态 |
 | `GET /v1/local-router/quotas` | 各上游额度窗口（路由视角） |
-| `GET /v1/local-router/usage?period=today\|24h\|7d\|30d\|all` | 用量汇总（含 `by_provider_key` / `by_caller_key`） |
-| `GET /v1/local-router/usage/requests?limit=N` | 逐请求明细 |
+| `GET /v1/local-router/usage?period=today\|24h\|7d\|30d\|all` | 用量汇总（含 `by_provider_key` / `by_caller_key`；`total_tokens` 与缓存、推理 token 分列，口径见 [BILLING.md](BILLING.md)） |
+| `GET /v1/local-router/usage/requests?limit=N` | 逐请求明细（同样带 token 分列） |
 | `GET /v1/local-router/route` | 这次会路由到哪（带 `X-Session-ID` 可看粘性） |
 
 ## 控制面（`/api/*`）
@@ -96,7 +96,7 @@ provider 的 `models` 列表既是对外白名单，也是转发给上游的模�
 | `GET /api/models` · caller-keys · settings | 模型目录 / 调用方 key / 全局设置 |
 | `GET /api/cooldowns` | 当前 429 冷却状态 |
 | `GET /api/rate-limits` | 限流配置与窗口用量 |
-| `GET /api/usage` · `/api/usage/...` | 账单与明细（见 [BILLING.md](BILLING.md)） |
+| `GET /api/usage?period=…` | 账单与明细；`requests_timeline[]` / `by_day[]` / 各维度均含完整 token 分列（见 [BILLING.md](BILLING.md)） |
 | `GET /api/traces` · `/api/traces/{id}` · `/api/traces/sessions…` · `/api/traces/export` | 链路查询与导出（见 [TRACING.md](TRACING.md)） |
 | `GET /metrics` | Prometheus 文本指标（实时状态；长期账本仍是 `usage.db`，见 [BILLING.md](BILLING.md)） |
 

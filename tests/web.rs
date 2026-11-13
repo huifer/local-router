@@ -399,6 +399,36 @@ async fn the_usage_endpoint_carries_every_panel_shape() {
     assert!(body["context"]["by_provider"].is_array());
     assert!(body["context"]["totals"].is_object());
     assert!(body["context"]["captured"].is_boolean());
+    // The token panels read the hourly series and the daily buckets. Both
+    // must carry every token kind, not just input/output.
+    for point in body["requests_timeline"].as_array().unwrap() {
+        for field in [
+            "hour",
+            "requests",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+        ] {
+            assert!(
+                point.get(field).is_some(),
+                "requests_timeline.{field} missing"
+            );
+        }
+    }
+    for day in body["by_day"].as_array().unwrap() {
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+        ] {
+            assert!(day[1].get(field).is_some(), "by_day.{field} missing");
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

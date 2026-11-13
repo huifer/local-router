@@ -2659,15 +2659,49 @@ async fn api_usage(
             .unwrap_or_else(|| "unknown".into())
     });
 
-    // Per-hour request counts for the Requests timeline (line/bar toggle).
-    let mut hour_map: BTreeMap<String, u64> = BTreeMap::new();
+    // Per-hour request counts AND token counts. Both the request timeline
+    // and the token panel read this one series, so the two charts can never
+    // disagree. Failed attempts are counted as requests but carry no tokens,
+    // exactly as `usage::totals` does.
+    #[derive(Default)]
+    struct HourTotals {
+        requests: u64,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        reasoning: u64,
+    }
+    let mut hour_map: BTreeMap<String, HourTotals> = BTreeMap::new();
     for r in &records {
         let hour = r.time.chars().take(13).collect::<String>();
-        *hour_map.entry(hour).or_insert(0) += 1;
+        let entry = hour_map.entry(hour).or_default();
+        entry.requests += 1;
+        if !r.ok {
+            continue;
+        }
+        entry.input += r.input_tokens;
+        entry.output += r.output_tokens;
+        entry.cache_read += r.cache_read_tokens;
+        entry.cache_write += r.cache_write_tokens;
+        entry.reasoning += r.reasoning_tokens;
     }
+    // `total_tokens` is the billable volume: reasoning tokens are a break-out
+    // of the output tokens, so adding them again would double count.
     let requests_timeline: Vec<Value> = hour_map
         .into_iter()
-        .map(|(hour, count)| json!({ "hour": hour, "requests": count }))
+        .map(|(hour, h)| {
+            json!({
+                "hour": hour,
+                "requests": h.requests,
+                "input_tokens": h.input,
+                "output_tokens": h.output,
+                "cache_read_tokens": h.cache_read,
+                "cache_write_tokens": h.cache_write,
+                "reasoning_tokens": h.reasoning,
+                "total_tokens": h.input + h.output + h.cache_read + h.cache_write,
+            })
+        })
         .collect();
 
     // Per-provider cost, as a map (the legacy by_provider_costs field, now
@@ -2780,22 +2814,9 @@ async fn api_usage(
     let by_provider_key_json = by_key_json.clone();
     let by_caller_key_json = map_to_array(by_caller_key);
     let by_project_json = map_to_array(by_project);
-    let by_day_json = by_day
-        .into_iter()
-        .map(|(day, t)| {
-            json!([
-                day,
-                {
-                    "requests": t.requests,
-                    "failed": t.failed,
-                    "input_tokens": t.input_tokens,
-                    "output_tokens": t.output_tokens,
-                    "cost_usd": t.cost_usd,
-                    "credits": t.credits,
-                }
-            ])
-        })
-        .collect::<Vec<_>>();
+    // Same shape as every other dimension, so the daily chart can switch
+    // between requests and any token kind without a second code path.
+    let by_day_json = map_to_array(by_day);
 
     Json(json!({
         "storage": if use_sqlite { "sqlite" } else { "jsonl" },

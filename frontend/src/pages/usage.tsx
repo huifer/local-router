@@ -17,7 +17,7 @@ import {
 import { RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
-import type { ProjectRow, QuotaAccount, UsageData, UsageTotals } from "@/types";
+import type { ProjectRow, QuotaAccount, UsageData, UsageRecord, UsageTotals } from "@/types";
 import { api, getProjects, getUsage, mergeProjects, updateProject } from "@/api";
 import {
   Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Dialog,
@@ -27,10 +27,11 @@ import {
 import { SectionToolbar, StatusDot, formatTime, formatTokens } from "@/components/shared/bits";
 import { useT } from "@/i18n";
 
-const views = ["overview", "sessions", "projects", "context", "quota", "bills"] as const;
+const views = ["overview", "tokens", "sessions", "projects", "context", "quota", "bills"] as const;
 type View = (typeof views)[number];
 const viewLabels: Record<View, string> = {
   overview: "Overview",
+  tokens: "Tokens",
   sessions: "Sessions",
   projects: "Projects",
   context: "Context",
@@ -68,7 +69,9 @@ export default function UsagePage() {
         <Tabs value={view} onValueChange={(value) => setView(value as View)}>
           <TabsList>
             {views.map((item) => (
-              <TabsTrigger key={item} value={item}>{t(`usage.${item}`)}</TabsTrigger>
+              <TabsTrigger key={item} value={item}>
+                {t(item === "tokens" ? "usage.tokensTab" : `usage.${item}`)}
+              </TabsTrigger>
             ))}
           </TabsList>
         </Tabs>
@@ -111,6 +114,7 @@ export default function UsagePage() {
       ) : (
         <>
           {view === "overview" && <UsageOverview usage={usage} />}
+          {view === "tokens" && <TokensPanel usage={usage} />}
           {view === "sessions" && <SessionsPanel usage={usage} />}
           {view === "projects" && <ProjectsPanel projects={projects} onChanged={reloadUsage} />}
           {view === "context" && <ContextPanel usage={usage} />}
@@ -126,6 +130,65 @@ export default function UsagePage() {
 
 const chartColors = ["#9ef0bf", "#5ec9a8", "#7ec9e8", "#a89ef0", "#f0d29e", "#f09e9e", "#9ef0e0", "#c9e87e"];
 
+const tokenColors = { input: "#7ec9e8", cache: "#a89ef0", output: "#9ef0bf" };
+
+/** The billable volume. Reasoning is a break-out of output, never a 5th bucket. */
+function billableTokens(t: UsageTotals): number {
+  return (t.input_tokens ?? 0) + (t.output_tokens ?? 0)
+    + (t.cache_read_tokens ?? 0) + (t.cache_write_tokens ?? 0);
+}
+
+function billableRecord(r: UsageRecord): number {
+  return (r.input_tokens ?? 0) + (r.output_tokens ?? 0)
+    + (r.cache_read_tokens ?? 0) + (r.cache_write_tokens ?? 0);
+}
+
+type TokenRank = "total" | "input" | "output" | "cache";
+
+function rankValue(t: UsageTotals, rank: TokenRank): number {
+  switch (rank) {
+    case "input": return t.input_tokens ?? 0;
+    case "output": return t.output_tokens ?? 0;
+    case "cache": return (t.cache_read_tokens ?? 0) + (t.cache_write_tokens ?? 0);
+    default: return billableTokens(t);
+  }
+}
+
+type ChartMetric = "requests" | "tokens";
+
+/** The same switch on both overview charts: counts or token volume. */
+function MetricToggle({ value, onChange }: { value: ChartMetric; onChange: (m: ChartMetric) => void }) {
+  const { t } = useT();
+  return (
+    <div className="flex gap-0.5">
+      {(["requests", "tokens"] as const).map((metric) => (
+        <button
+          key={metric}
+          onClick={() => onChange(metric)}
+          className={`cursor-pointer rounded-sm border px-2 py-1 font-mono text-[9px] uppercase tracking-[0.08em] outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
+            value === metric
+              ? "border-primary/30 bg-primary/5 text-primary"
+              : "border-transparent text-muted-foreground hover:border-border hover:text-foreground"
+          }`}
+        >
+          {metric === "requests" ? t("usage.metricRequests") : t("usage.metricTokens")}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Three stacked token buckets, shared by the timeline and the daily chart. */
+function TokenLegend({ t: translate }: { t: ReturnType<typeof useT>["t"] }) {
+  return (
+    <div className="chart-legend flex-wrap px-5 pb-1">
+      <span><i className="dot" style={{ background: tokenColors.input }} />{translate("usage.inputLabel")}</span>
+      <span><i className="dot" style={{ background: tokenColors.cache }} />{translate("usage.cacheLabel")}</span>
+      <span><i className="dot" style={{ background: tokenColors.output }} />{translate("usage.outputLabel")}</span>
+    </div>
+  );
+}
+
 function UsageOverview({ usage }: { usage: UsageData }) {
   const { t } = useT();
   const totals = usage.totals;
@@ -140,11 +203,13 @@ function UsageOverview({ usage }: { usage: UsageData }) {
         <span />
         <Badge>{usage.storage === "sqlite" ? "SQLITE" : "JSONL"}</Badge>
       </div>
-      <div className="grid grid-cols-5 border border-border bg-card max-[900px]:grid-cols-2">
+      <div className="grid grid-cols-3 border border-border bg-card max-[900px]:grid-cols-2">
         <Metric label={t("usage.requests")} value={totals.requests.toLocaleString()} />
         <Metric label={t("usage.failed")} value={totals.failed.toLocaleString()} danger={totals.failed > 0} />
+        <Metric label={t("usage.totalTokens")} value={formatTokens(billableTokens(totals))} />
         <Metric label={t("usage.inputTokens")} value={formatTokens(totals.input_tokens)} />
         <Metric label={t("usage.outputTokens")} value={formatTokens(totals.output_tokens)} />
+        <Metric label={t("usage.cacheRead")} value={formatTokens(totals.cache_read_tokens)} />
         <Metric label={t("usage.cacheHit")} value={`${Math.round(cacheRate * 100)}%`} />
         <Metric label={t("usage.cost")} value={`$${totals.cost_usd.toFixed(4)}`} />
         <Metric label={t("usage.credits")} value={totals.credits.toFixed(1)} />
@@ -169,7 +234,10 @@ function UsageOverview({ usage }: { usage: UsageData }) {
                   <div>
                     <strong className="block font-mono text-[11px]">{name}</strong>
                     <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
-                      {t("usage.requestsCount", { n: value.requests })} · {formatTokens(value.input_tokens)} in · {formatTokens(value.output_tokens)} out
+                      {t("usage.requestsCount", { n: value.requests })} · {formatTokens(billableTokens(value))} {t("usage.metricTokens")} · {formatTokens(value.input_tokens)} in · {formatTokens(value.output_tokens)} out
+                      {(value.cache_read_tokens ?? 0) + (value.cache_write_tokens ?? 0) > 0
+                        ? ` · ${formatTokens((value.cache_read_tokens ?? 0) + (value.cache_write_tokens ?? 0))} cache`
+                        : ""}
                     </span>
                   </div>
                   <div className="text-right">
@@ -206,7 +274,7 @@ function UsageOverview({ usage }: { usage: UsageData }) {
                   <div>
                     <strong className="block font-mono text-[11px]">{name}</strong>
                     <span className="mt-1 block font-mono text-[10px] text-muted-foreground">
-                      {t("usage.requestsCount", { n: value.requests })} · {t("usage.output", { n: formatTokens(value.output_tokens) })}
+                      {t("usage.requestsCount", { n: value.requests })} · {formatTokens(billableTokens(value))} {t("usage.metricTokens")} · {t("usage.output", { n: formatTokens(value.output_tokens) })}
                     </span>
                   </div>
                   <span className="usage-number text-[15px]">{value.requests}</span>
@@ -300,70 +368,120 @@ function Metric({ label, value, danger = false }: { label: string; value: string
 
 function TimelineChart({ points }: { points: UsageData["requests_timeline"] }) {
   const { t } = useT();
+  const [metric, setMetric] = useState<ChartMetric>("tokens");
   if (!points.length) {
     return <EmptyState title={t("usage.noRequests")} detail={t("usage.noRequestsDetail")} />;
   }
-  const data = points.map((p) => ({ ...p, label: p.hour.slice(5, 13) }));
+  const data = points.map((p) => ({
+    label: p.hour.slice(5, 13),
+    requests: p.requests,
+    input: p.input_tokens ?? 0,
+    cache: (p.cache_read_tokens ?? 0) + (p.cache_write_tokens ?? 0),
+    output: p.output_tokens ?? 0,
+  }));
   return (
-    <div className="h-40 px-3 pt-4">
-      <ResponsiveContainer width="100%" height="100%">
-        <AreaChart data={data} margin={{ top: 4, right: 12, bottom: 0, left: -18 }}>
-          <defs>
-            <linearGradient id="timeline-fill" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="0%" stopColor="#9ef0bf" stopOpacity={0.35} />
-              <stop offset="100%" stopColor="#9ef0bf" stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
-          <XAxis dataKey="label" tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
-          <YAxis tickLine={false} axisLine={false} allowDecimals={false} width={44} />
-          <ReTooltip cursor={{ stroke: "var(--border)" }} />
-          <Area type="monotone" dataKey="requests" stroke="#9ef0bf" strokeWidth={1.6} fill="url(#timeline-fill)" />
-        </AreaChart>
-      </ResponsiveContainer>
-    </div>
+    <>
+      <div className="flex justify-end px-4"><MetricToggle value={metric} onChange={setMetric} /></div>
+      <div className="h-40 px-3 pt-2">
+        <ResponsiveContainer width="100%" height="100%">
+          <AreaChart data={data} margin={{ top: 4, right: 12, bottom: 0, left: 6 }}>
+            <defs>
+              <linearGradient id="timeline-fill" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0%" stopColor="#9ef0bf" stopOpacity={0.35} />
+                <stop offset="100%" stopColor="#9ef0bf" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="label" tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
+            <YAxis tickLine={false} axisLine={false} allowDecimals={false} width={52}
+              tickFormatter={(value) => metric === "tokens" ? formatTokens(Number(value)) : String(value)} />
+            <ReTooltip cursor={{ stroke: "var(--border)" }}
+              formatter={(value, name) => metric === "tokens"
+                ? [formatTokens(Number(value)), name]
+                : [Number(value).toLocaleString(), t("usage.requests")]} />
+            {metric === "requests" ? (
+              <Area type="monotone" dataKey="requests" stroke="#9ef0bf" strokeWidth={1.6} fill="url(#timeline-fill)" />
+            ) : (
+              <>
+                <Area type="monotone" dataKey="input" name={t("usage.inputLabel")} stackId="tokens" stroke={tokenColors.input} strokeWidth={1.2} fill={tokenColors.input} fillOpacity={0.3} />
+                <Area type="monotone" dataKey="cache" name={t("usage.cacheLabel")} stackId="tokens" stroke={tokenColors.cache} strokeWidth={1.2} fill={tokenColors.cache} fillOpacity={0.3} />
+                <Area type="monotone" dataKey="output" name={t("usage.outputLabel")} stackId="tokens" stroke={tokenColors.output} strokeWidth={1.2} fill={tokenColors.output} fillOpacity={0.3} />
+              </>
+            )}
+          </AreaChart>
+        </ResponsiveContainer>
+      </div>
+      {metric === "tokens" && <TokenLegend t={t} />}
+    </>
   );
 }
 
 function DayChart({ data }: { data: [string, UsageTotals][] }) {
   const { t } = useT();
+  const [metric, setMetric] = useState<ChartMetric>("tokens");
   if (!data.length) {
     return <EmptyState title={t("usage.noDaily")} detail={t("usage.noDailyDetail")} />;
   }
-  const days = data.slice(-14).map(([day, v]) => ({ day: day.slice(5), requests: v.requests, cost: v.cost_usd }));
+  const days = data.slice(-14).map(([day, v]) => ({
+    day: day.slice(5),
+    requests: v.requests,
+    input: v.input_tokens ?? 0,
+    cache: (v.cache_read_tokens ?? 0) + (v.cache_write_tokens ?? 0),
+    output: v.output_tokens ?? 0,
+  }));
   return (
-    <div className="h-44 px-3 pt-4">
-      <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={days} margin={{ top: 4, right: 12, bottom: 0, left: -18 }} barCategoryGap="28%">
-          <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
-          <XAxis dataKey="day" tickLine={false} axisLine={false} />
-          <YAxis yAxisId="req" tickLine={false} axisLine={false} allowDecimals={false} width={44} />
-          <ReTooltip
-            cursor={{ fill: "rgba(158,240,191,0.05)" }}
-            formatter={(value, name) => (name === "requests" ? [value, "requests"] : [`$${Number(value).toFixed(4)}`, "cost"])}
-          />
-          <Bar yAxisId="req" dataKey="requests" fill="rgba(158,240,191,0.75)" radius={[2, 2, 0, 0]} maxBarSize={26} />
-        </BarChart>
-      </ResponsiveContainer>
-    </div>
+    <>
+      <div className="flex justify-end px-4"><MetricToggle value={metric} onChange={setMetric} /></div>
+      <div className="h-44 px-3 pt-2">
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={days} margin={{ top: 4, right: 12, bottom: 0, left: 6 }} barCategoryGap="28%">
+            <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+            <XAxis dataKey="day" tickLine={false} axisLine={false} />
+            <YAxis tickLine={false} axisLine={false} allowDecimals={false} width={52}
+              tickFormatter={(value) => metric === "tokens" ? formatTokens(Number(value)) : String(value)} />
+            <ReTooltip
+              cursor={{ fill: "rgba(158,240,191,0.05)" }}
+              formatter={(value, name) => metric === "tokens"
+                ? [formatTokens(Number(value)), name]
+                : [Number(value).toLocaleString(), t("usage.requests")]}
+            />
+            {metric === "requests" ? (
+              <Bar dataKey="requests" fill="rgba(158,240,191,0.75)" radius={[2, 2, 0, 0]} maxBarSize={26} />
+            ) : (
+              <>
+                <Bar dataKey="input" name={t("usage.inputLabel")} stackId="tokens" fill={tokenColors.input} maxBarSize={26} />
+                <Bar dataKey="cache" name={t("usage.cacheLabel")} stackId="tokens" fill={tokenColors.cache} maxBarSize={26} />
+                <Bar dataKey="output" name={t("usage.outputLabel")} stackId="tokens" fill={tokenColors.output} radius={[2, 2, 0, 0]} maxBarSize={26} />
+              </>
+            )}
+          </BarChart>
+        </ResponsiveContainer>
+      </div>
+      {metric === "tokens" && <TokenLegend t={t} />}
+    </>
   );
 }
 
 function ModelMix({ data }: { data: [string, UsageTotals][] }) {
   const { t } = useT();
-  const models = data.filter(([, v]) => v.requests > 0).slice(0, 8);
+  // Recharts needs a numeric `value`; passing the tuple array straight in
+  // with dataKey="0" pointed it at the model *name* and rendered nothing.
+  const models = data
+    .filter(([, v]) => v.requests > 0)
+    .slice(0, 8)
+    .map(([name, v]) => ({ name, value: v.requests }));
   if (!models.length) {
     return <EmptyState title={t("usage.noMix")} detail={t("usage.noMixDetail")} />;
   }
-  const total = models.reduce((sum, [, v]) => sum + v.requests, 0);
+  const total = models.reduce((sum, m) => sum + m.value, 0);
   return (
     <div className="flex items-center gap-5 p-5 max-[500px]:flex-col">
       <div className="size-36 shrink-0">
         <ResponsiveContainer width="100%" height="100%">
           <PieChart>
-            <Pie data={models} dataKey="0" nameKey="0" innerRadius={36} outerRadius={60} strokeWidth={0} paddingAngle={1}>
+            <Pie data={models} dataKey="value" nameKey="name" innerRadius={36} outerRadius={60} strokeWidth={0} paddingAngle={1}>
               {models.map((entry, index) => (
-                <Cell key={entry[0]} fill={chartColors[index % chartColors.length]} />
+                <Cell key={entry.name} fill={chartColors[index % chartColors.length]} />
               ))}
             </Pie>
             <ReTooltip />
@@ -371,11 +489,11 @@ function ModelMix({ data }: { data: [string, UsageTotals][] }) {
         </ResponsiveContainer>
       </div>
       <div className="grid min-w-0 flex-1 gap-1.5">
-        {models.map(([name, v], index) => (
-          <div key={name} className="flex items-center gap-2">
+        {models.map((m, index) => (
+          <div key={m.name} className="flex items-center gap-2">
             <i className="size-2 shrink-0 rounded-sm" style={{ background: chartColors[index % chartColors.length] }} />
-            <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground" title={name}>{name}</span>
-            <strong className="font-mono text-[10px]">{Math.round((v.requests / total) * 100)}%</strong>
+            <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground" title={m.name}>{m.name}</span>
+            <strong className="font-mono text-[10px]">{Math.round((m.value / total) * 100)}%</strong>
           </div>
         ))}
       </div>
@@ -717,6 +835,219 @@ function QuotaPanel({ usage }: { usage: UsageData }) {
         </Card>
       )}
     </>
+  );
+}
+
+/** The dedicated token view: volume over time, where it went, and which
+ * requests were the heaviest. Everything here comes from the same records
+ * as the overview totals, so the numbers always add up. */
+function TokensPanel({ usage }: { usage: UsageData }) {
+  const { t } = useT();
+  const [rank, setRank] = useState<TokenRank>("total");
+  const totals = usage.totals;
+
+  const hourly = useMemo(() => usage.requests_timeline.map((p) => ({
+    label: p.hour.slice(5, 13),
+    input: p.input_tokens ?? 0,
+    cache: (p.cache_read_tokens ?? 0) + (p.cache_write_tokens ?? 0),
+    output: p.output_tokens ?? 0,
+  })), [usage.requests_timeline]);
+  const daily = useMemo(() => usage.by_day.slice(-14).map(([day, v]) => ({
+    day: day.slice(5),
+    input: v.input_tokens ?? 0,
+    cache: (v.cache_read_tokens ?? 0) + (v.cache_write_tokens ?? 0),
+    output: v.output_tokens ?? 0,
+  })), [usage.by_day]);
+  const hasTokens = hourly.some((h) => h.input + h.cache + h.output > 0);
+  const heaviest = useMemo(() => [...usage.recent]
+    .filter((r) => r.ok && billableRecord(r) > 0)
+    .sort((a, b) => billableRecord(b) - billableRecord(a))
+    .slice(0, 20), [usage.recent]);
+  const platforms: [string, UsageTotals][] = Object.entries(usage.by_provider_costs ?? {});
+
+  return (
+    <>
+      <p className="font-mono text-[10px] leading-relaxed text-muted-foreground">{t("usage.billableNote")}</p>
+      <div className="grid grid-cols-3 border border-border bg-card max-[900px]:grid-cols-2">
+        <Metric label={t("usage.totalTokens")} value={formatTokens(billableTokens(totals))} />
+        <Metric label={t("usage.inputLabel")} value={formatTokens(totals.input_tokens)} />
+        <Metric label={t("usage.outputLabel")} value={formatTokens(totals.output_tokens)} />
+        <Metric label={t("usage.cacheRead")} value={formatTokens(totals.cache_read_tokens)} />
+        <Metric label={t("usage.cacheWrite")} value={formatTokens(totals.cache_write_tokens)} />
+        <Metric label={t("usage.reasoning")} value={formatTokens(totals.reasoning_tokens)} />
+      </div>
+
+      {!hasTokens ? (
+        <Card><EmptyState title={t("usage.noTokens")} detail={t("usage.noTokensDetail")} /></Card>
+      ) : (
+        <>
+          <Card>
+            <CardHeader>
+              <CardDescription className="eyebrow">{t("usage.tokensEyebrow")}</CardDescription>
+              <CardTitle>{t("usage.tokensOverTime")}</CardTitle>
+            </CardHeader>
+            <div className="h-56 px-3 pt-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <AreaChart data={hourly} margin={{ top: 4, right: 12, bottom: 0, left: 6 }}>
+                  <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="label" tickLine={false} axisLine={false} interval="preserveStartEnd" minTickGap={24} />
+                  <YAxis tickLine={false} axisLine={false} allowDecimals={false} width={52}
+                    tickFormatter={(value) => formatTokens(Number(value))} />
+                  <ReTooltip cursor={{ stroke: "var(--border)" }}
+                    formatter={(value, name) => [formatTokens(Number(value)), name]} />
+                  <Area type="monotone" dataKey="input" name={t("usage.inputLabel")} stackId="tokens" stroke={tokenColors.input} strokeWidth={1.2} fill={tokenColors.input} fillOpacity={0.3} />
+                  <Area type="monotone" dataKey="cache" name={t("usage.cacheLabel")} stackId="tokens" stroke={tokenColors.cache} strokeWidth={1.2} fill={tokenColors.cache} fillOpacity={0.3} />
+                  <Area type="monotone" dataKey="output" name={t("usage.outputLabel")} stackId="tokens" stroke={tokenColors.output} strokeWidth={1.2} fill={tokenColors.output} fillOpacity={0.3} />
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
+            <TokenLegend t={t} />
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardDescription className="eyebrow">{t("usage.byDay")}</CardDescription>
+              <CardTitle>{t("usage.dailyTokens")}</CardTitle>
+            </CardHeader>
+            <div className="h-52 px-3 pt-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={daily} margin={{ top: 4, right: 12, bottom: 0, left: 6 }} barCategoryGap="28%">
+                  <CartesianGrid stroke="var(--border)" strokeDasharray="3 3" vertical={false} />
+                  <XAxis dataKey="day" tickLine={false} axisLine={false} />
+                  <YAxis tickLine={false} axisLine={false} allowDecimals={false} width={52}
+                    tickFormatter={(value) => formatTokens(Number(value))} />
+                  <ReTooltip cursor={{ fill: "rgba(158,240,191,0.05)" }}
+                    formatter={(value, name) => [formatTokens(Number(value)), name]} />
+                  <Bar dataKey="input" name={t("usage.inputLabel")} stackId="tokens" fill={tokenColors.input} maxBarSize={28} />
+                  <Bar dataKey="cache" name={t("usage.cacheLabel")} stackId="tokens" fill={tokenColors.cache} maxBarSize={28} />
+                  <Bar dataKey="output" name={t("usage.outputLabel")} stackId="tokens" fill={tokenColors.output} radius={[2, 2, 0, 0]} maxBarSize={28} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <TokenLegend t={t} />
+          </Card>
+        </>
+      )}
+
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="eyebrow">{t("usage.rankBy")}</span>
+        <div className="flex gap-0.5">
+          {(["total", "input", "output", "cache"] as const).map((option) => (
+            <button
+              key={option}
+              onClick={() => setRank(option)}
+              className={`cursor-pointer rounded-sm border px-2.5 py-1.5 font-mono text-[10px] uppercase tracking-[0.08em] outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
+                rank === option
+                  ? "border-primary/30 bg-primary/5 text-primary"
+                  : "border-transparent text-muted-foreground hover:border-border hover:text-foreground"
+              }`}
+            >
+              {t(`usage.rank${option.charAt(0).toUpperCase()}${option.slice(1)}`)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="grid grid-cols-2 gap-5 max-[1100px]:grid-cols-1">
+        <TokenRankCard
+          eyebrow={t("usage.byModel")}
+          title={t("usage.tokensByModel")}
+          rows={usage.by_model}
+          rank={rank}
+        />
+        <TokenRankCard
+          eyebrow={t("usage.byPlatform")}
+          title={t("usage.tokensByPlatform")}
+          rows={platforms}
+          rank={rank}
+        />
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardDescription className="eyebrow">{t("usage.tokenLog")}</CardDescription>
+          <CardTitle>{t("usage.topTokenRequests")}</CardTitle>
+        </CardHeader>
+        {heaviest.length ? (
+          <div className="overflow-auto">
+            <div className="min-w-[720px]">
+              <div className="grid grid-cols-[minmax(0,1.8fr)_90px_90px_90px_90px_100px_150px] items-center gap-2.5 border-b border-border px-5 py-3">
+                <span className="eyebrow">{t("usage.model")}</span>
+                <span className="eyebrow">{t("usage.inputLabel")}</span>
+                <span className="eyebrow">{t("usage.cacheLabel")}</span>
+                <span className="eyebrow">{t("usage.outputLabel")}</span>
+                <span className="eyebrow">{t("usage.reasoning")}</span>
+                <span className="eyebrow">{t("usage.totalTokens")}</span>
+                <span className="eyebrow">{t("usage.lastSeen")}</span>
+              </div>
+              {heaviest.map((record, index) => (
+                <div
+                  key={`${record.time}-${index}`}
+                  className="grid grid-cols-[minmax(0,1.8fr)_90px_90px_90px_90px_100px_150px] items-center gap-2.5 border-b border-border/70 px-5 py-2.5 last:border-b-0"
+                >
+                  <div className="min-w-0">
+                    <strong className="block truncate font-mono text-[11px]" title={record.model}>{record.model}</strong>
+                    <span className="block truncate font-mono text-[9px] text-muted-foreground/70">{record.provider}</span>
+                  </div>
+                  <span className="font-mono text-[10px] text-muted-foreground">{formatTokens(record.input_tokens)}</span>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {formatTokens((record.cache_read_tokens ?? 0) + (record.cache_write_tokens ?? 0))}
+                  </span>
+                  <span className="font-mono text-[10px] text-muted-foreground">{formatTokens(record.output_tokens)}</span>
+                  <span className="font-mono text-[10px] text-muted-foreground/70">{formatTokens(record.reasoning_tokens ?? 0)}</span>
+                  <strong className="usage-number text-[12px]">{formatTokens(billableRecord(record))}</strong>
+                  <span className="font-mono text-[9px] text-muted-foreground/70">{formatTime(record.time)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <EmptyState title={t("usage.noTokens")} detail={t("usage.noTokensDetail")} />
+        )}
+      </Card>
+    </>
+  );
+}
+
+function TokenRankCard({ eyebrow, title, rows, rank }: {
+  eyebrow: string;
+  title: string;
+  rows: [string, UsageTotals][];
+  rank: TokenRank;
+}) {
+  const { t } = useT();
+  const sorted = rows
+    .map(([name, v]) => ({ name, value: rankValue(v, rank), v }))
+    .filter((row) => row.value > 0)
+    .sort((a, b) => b.value - a.value)
+    .slice(0, 12);
+  const max = sorted[0]?.value ?? 1;
+  return (
+    <Card>
+      <CardHeader>
+        <CardDescription className="eyebrow">{eyebrow}</CardDescription>
+        <CardTitle>{title}</CardTitle>
+      </CardHeader>
+      {sorted.length ? (
+        <div className="grid gap-3 px-5 py-3">
+          {sorted.map((row) => (
+            <div key={row.name} className="grid gap-1">
+              <div className="flex items-baseline justify-between gap-3">
+                <span className="min-w-0 truncate font-mono text-[10px]" title={row.name}>{row.name}</span>
+                <strong className="usage-number shrink-0 text-[11px]">{formatTokens(row.value)}</strong>
+              </div>
+              <div className="budget-track h-1">
+                <i className="budget-fill" style={{ width: `${(row.value / max) * 100}%` }} />
+              </div>
+              <span className="font-mono text-[9px] text-muted-foreground/60">
+                {t("usage.inputLabel")} {formatTokens(row.v.input_tokens ?? 0)} · {t("usage.cacheLabel")} {formatTokens((row.v.cache_read_tokens ?? 0) + (row.v.cache_write_tokens ?? 0))} · {t("usage.outputLabel")} {formatTokens(row.v.output_tokens ?? 0)}
+              </span>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <EmptyState title={t("usage.noTokens")} detail={t("usage.noTokensDetail")} />
+      )}
+    </Card>
   );
 }
 

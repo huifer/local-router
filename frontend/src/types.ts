@@ -210,6 +210,15 @@ export interface ProjectRow {
 export interface TimelinePoint {
   hour: string;
   requests: number;
+  /** Token volume in this hour; `total_tokens` is the billable sum
+   * (input + output + cache read + cache write). Reasoning tokens are a
+   * break-out of output and are not added again. */
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+  reasoning_tokens?: number;
+  total_tokens?: number;
 }
 
 export interface ContextProviderRow {

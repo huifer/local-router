@@ -269,6 +269,11 @@ pub fn group_by(records: &[UsageRecord], key: fn(&UsageRecord) -> String) -> Vec
 }
 
 /// The records of one day, keyed by day.
+///
+/// Must aggregate the same fields as `totals()` / `group_by()`: a cached
+/// prompt is token consumption too, and for cache-heavy agents it is most of
+/// it. Leaving those fields out made the daily token numbers disagree with
+/// the headline totals by a wide margin.
 pub fn by_day(records: &[UsageRecord]) -> Vec<(String, Totals)> {
     let mut map: BTreeMap<String, Totals> = BTreeMap::new();
     for r in records {
@@ -281,11 +286,17 @@ pub fn by_day(records: &[UsageRecord]) -> Vec<(String, Totals)> {
         }
         entry.input_tokens += r.input_tokens;
         entry.output_tokens += r.output_tokens;
+        entry.cache_read_tokens += r.cache_read_tokens;
+        entry.cache_write_tokens += r.cache_write_tokens;
+        entry.reasoning_tokens += r.reasoning_tokens;
         if let Some(usd) = r.cost_usd {
             entry.cost_usd += usd;
         }
         if let Some(credits) = r.credits {
             entry.credits += credits;
+        }
+        if !r.priced {
+            entry.unpriced += 1;
         }
     }
     map.into_iter().collect()
@@ -601,6 +612,38 @@ mod tests {
         let day = days.iter().find(|(d, _)| d == "2026-10-26").unwrap();
         assert_eq!(day.1.requests, 2);
         assert_eq!(day.1.output_tokens, 7);
+    }
+
+    #[test]
+    fn by_day_counts_cached_and_reasoning_tokens_like_totals() {
+        let mut cached = record();
+        cached.time = "2026-10-26T08:00:00+00:00".into();
+        cached.input_tokens = 10;
+        cached.output_tokens = 5;
+        cached.cache_read_tokens = 400;
+        cached.cache_write_tokens = 20;
+        cached.reasoning_tokens = 3;
+        cached.priced = false;
+        let mut failed = record();
+        failed.time = "2026-10-26T09:00:00+00:00".into();
+        failed.ok = false;
+        failed.cache_read_tokens = 999;
+
+        let days = by_day(&[cached.clone(), failed.clone()]);
+        let (_, day) = days.iter().find(|(d, _)| d == "2026-10-26").unwrap();
+        assert_eq!(day.requests, 2);
+        assert_eq!(day.failed, 1);
+        assert_eq!(day.input_tokens, 10);
+        assert_eq!(day.output_tokens, 5);
+        assert_eq!(day.cache_read_tokens, 400);
+        assert_eq!(day.cache_write_tokens, 20);
+        assert_eq!(day.reasoning_tokens, 3);
+        assert_eq!(day.unpriced, 1);
+        // The daily slice must agree with the headline totals.
+        let all = totals(&[cached, failed]);
+        assert_eq!(day.cache_read_tokens, all.cache_read_tokens);
+        assert_eq!(day.cache_write_tokens, all.cache_write_tokens);
+        assert_eq!(day.reasoning_tokens, all.reasoning_tokens);
     }
 
     // ------------------------------------------------------- context --

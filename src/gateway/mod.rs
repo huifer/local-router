@@ -576,6 +576,11 @@ async fn usage_summary(
                 "failed": totals.failed,
                 "input": totals.input_tokens,
                 "output": totals.output_tokens,
+                "cache_read": totals.cache_read_tokens,
+                "cache_write": totals.cache_write_tokens,
+                "reasoning": totals.reasoning_tokens,
+                "total_tokens": totals.input_tokens + totals.output_tokens
+                    + totals.cache_read_tokens + totals.cache_write_tokens,
                 "cost_usd": totals.cost_usd,
                 "credits": totals.credits,
                 "unpriced": totals.unpriced,
@@ -592,6 +597,8 @@ async fn usage_summary(
         "cache_read": totals.cache_read_tokens,
         "cache_write": totals.cache_write_tokens,
         "reasoning": totals.reasoning_tokens,
+        "total_tokens": totals.input_tokens + totals.output_tokens
+            + totals.cache_read_tokens + totals.cache_write_tokens,
         "cost_usd": totals.cost_usd,
         "credits": totals.credits,
         "unpriced": totals.unpriced,
@@ -640,6 +647,11 @@ async fn usage_requests(
         "errors": totals.failed,
         "input": totals.input_tokens,
         "output": totals.output_tokens,
+        "cache_read": totals.cache_read_tokens,
+        "cache_write": totals.cache_write_tokens,
+        "reasoning": totals.reasoning_tokens,
+        "total_tokens": totals.input_tokens + totals.output_tokens
+            + totals.cache_read_tokens + totals.cache_write_tokens,
         "cost_usd": totals.cost_usd,
         "credits": totals.credits,
         "unpriced": totals.unpriced,
