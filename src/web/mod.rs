@@ -2028,6 +2028,8 @@ async fn api_groups(State(state): State<AppState>) -> Json<Value> {
 #[derive(serde::Deserialize)]
 struct GroupInput {
     id: Option<String>,
+    /// PATCH bodies may omit the name; only POST requires it.
+    #[serde(default)]
     name: String,
     #[serde(default)]
     models: Vec<String>,
@@ -2037,6 +2039,9 @@ struct GroupInput {
     stays: Option<Stays>,
     #[serde(default)]
     listed: Option<bool>,
+    /// A public alias shaped like `provider/model` (e.g. `local-router/auto`).
+    #[serde(default)]
+    alias: Option<String>,
     #[serde(default)]
     note: Option<String>,
     /// The weight of each member, for `weight` routing (member=weight).
@@ -2067,6 +2072,7 @@ async fn api_add_group(
         weights: Default::default(),
         stays: input.stays.unwrap_or_default(),
         listed: input.listed.unwrap_or(true),
+        alias: input.alias.filter(|s| !s.trim().is_empty()),
         note: input.note,
     };
     state
@@ -2075,6 +2081,7 @@ async fn api_add_group(
                 return Err("there is already a group with that id".to_string());
             }
             config.groups.push(group);
+            config.validate()?;
             Ok(())
         })
         .await
@@ -2100,6 +2107,7 @@ async fn api_update_group(
         routing: None,
         stays: None,
         listed: None,
+        alias: None,
         note: None,
         weights: None,
     });
@@ -2123,12 +2131,16 @@ async fn api_update_group(
             if let Some(l) = input.listed {
                 g.listed = l;
             }
+            if let Some(a) = input.alias {
+                g.alias = if a.trim().is_empty() { None } else { Some(a) };
+            }
             if input.note.is_some() {
                 g.note = input.note;
             }
             if let Some(w) = input.weights {
                 g.weights = w;
             }
+            config.validate()?;
             Ok(())
         })
         .await

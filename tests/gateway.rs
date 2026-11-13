@@ -426,6 +426,7 @@ async fn a_group_fails_over_to_the_next_member() {
         weights: Default::default(),
         stays: Default::default(),
         listed: true,
+        alias: None,
         note: None,
     });
     let world = world(config).await;
@@ -454,6 +455,7 @@ async fn a_group_of_dead_members_reports_the_error() {
         weights: Default::default(),
         stays: Default::default(),
         listed: true,
+        alias: None,
         note: None,
     });
     let world = world(config).await;
@@ -521,6 +523,7 @@ async fn a_rate_limited_key_reports_the_error() {
         weights: Default::default(),
         stays: Default::default(),
         listed: true,
+        alias: None,
         note: None,
     });
     let world = world(config).await;

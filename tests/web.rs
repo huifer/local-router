@@ -657,3 +657,73 @@ async fn the_trace_list_answers_with_the_traces_it_has() {
     assert_eq!(value["session_id"], "sess-nope");
     assert!(value["tree"].is_null());
 }
+
+// ------------------------------------------------------- group aliases --
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_alias_can_be_set_and_bad_ones_are_refused() {
+    let state = state_at("127.0.0.1").await;
+    // Seed one provider and one group through the store.
+    {
+        let mut config = state.config.write().await;
+        config.providers.push(local_router::config::Provider {
+            id: "a".into(),
+            name: "A".into(),
+            kind: "custom".into(),
+            enabled: true,
+            protocol: local_router::protocol::ir::Protocol::OpenAiChat,
+            base_url: Some("http://127.0.0.1:9/v1".into()),
+            models: vec!["m1".into()],
+            keys: vec![local_router::config::ProviderKey::new("sk-a".to_string())],
+            ..Default::default()
+        });
+        config.groups.push(local_router::config::Group {
+            id: "auto".into(),
+            name: "Auto".into(),
+            models: vec!["a/m1".into()],
+            routing: local_router::config::Routing::Order,
+            weights: Default::default(),
+            stays: Default::default(),
+            listed: true,
+            alias: None,
+            note: None,
+        });
+    }
+    let app = console(state.clone());
+    let patch = |body: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/groups/auto")
+                        .header("content-type", "application/json")
+                        .header("host", "127.0.0.1:3425")
+                        .header("origin", "http://127.0.0.1:3425")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response.status()
+        }
+    };
+    // A good alias sticks.
+    assert_eq!(
+        patch(r#"{"alias":"local-router/auto"}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        state.config.read().await.groups[0].alias.as_deref(),
+        Some("local-router/auto")
+    );
+    // A malformed one is refused and leaves the old value alone.
+    assert_ne!(patch(r#"{"alias":"plain-name"}"#).await, StatusCode::OK);
+    assert_eq!(
+        state.config.read().await.groups[0].alias.as_deref(),
+        Some("local-router/auto")
+    );
+    // The reserved prefix is refused too.
+    assert_ne!(patch(r#"{"alias":"group/auto"}"#).await, StatusCode::OK);
+}

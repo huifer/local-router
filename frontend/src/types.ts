@@ -98,6 +98,8 @@ export interface Group {
   routing: Routing;
   stays: Stays;
   listed: boolean;
+  /** 对外别名（provider/model 形态，如 local-router/auto）。 */
+  alias?: string;
   note?: string;
 }
 

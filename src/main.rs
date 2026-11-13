@@ -2210,6 +2210,7 @@ async fn group_cmd(cmd: GroupCmd) -> anyhow::Result<()> {
                 weights: Default::default(),
                 stays,
                 listed: true,
+                alias: None,
                 note: None,
             });
             save_config(&config)?;

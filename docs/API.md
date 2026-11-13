@@ -29,6 +29,7 @@ key 的取值顺序：`LOCAL_ROUTER_DEFAULT_KEY`（环境变量，**不落盘**�
 | --- | --- |
 | `provider/model` | 点名某个上游的某个模型 |
 | `group/id` | 走一个路由组 |
+| 组别名（`alias`） | `provider/model` 形态的组对外名，如 `local-router/auto` |
 | 裸模型名（如 `deepseek-chat`） | **有且仅有一个**上游提供时直接路由；两个都提供则报错，一个都没有报 404 |
 
 provider 的 `models` 列表既是对外白名单，也是转发给上游的模型 id；

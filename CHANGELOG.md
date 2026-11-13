@@ -8,6 +8,15 @@
 
 ### Added
 
+- **组别名（Group.alias）**：路由组现在可以有一个 `provider/model` 形态的
+  对外名字（如 `local-router/auto`），与 `group/<id>` 完全等价——模型目录、
+  路由、账单里的组归因都认它。`listed: true` 的组，别名同样出现在
+  `/v1/models` 里，只认识 `provider/model` 的客户端 picker 也能搜到。
+  校验：必须形如 `provider/model`、不能用保留的 `group/` 前缀、不能与同名
+  provider 真实提供的模型撞名、组间不能重复；若别名恰好撞上真模型，
+  **真模型优先**。入口：控制台 Groups 表单、`POST /api/groups`、
+  `PATCH /api/groups/{id}`（`alias` 传空串清除）。
+
 - **Prometheus `/metrics` 端点（M1 遥测）**：网关现在在 `:3435/metrics` 暴露
   Prometheus 文本格式的实时指标——`local_router_requests_total`（by api /
   provider / status_class / has_key）、`local_router_tokens_total`（input /
@@ -182,6 +191,14 @@
     错误零警告。复现步骤见文档 §6。
 
 ### Fixed
+
+- **PATCH `/api/groups/{id}` 缺 `name` 时静默不生效**：`GroupInput.name`
+  原来是必填字段，只发 `{"alias":…}` 之类的局部更新会被 serde 拒绝，而
+  错误又被默认值兜底吞掉——返回 ok 但什么都没改。`name` 改为可选
+  （只有 POST 要求它）。
+- **被拒绝的配置修改不再落盘**：`AppState::update` 之前对闭包返回 `Err`
+  的修改照样 revision+1 并写盘，校验拒绝的非法状态会进 config.json。现在
+  `Err` 时回滚内存、不写盘、把错误如实返回给调用方。
 
 - **QwenWork 签名路径修正**（`code 101 Signature invalid` 的根因）：COSY 签名
   覆盖的是 URL 的**路径部分**，此前把 query string（`?FetchKeys=…&Encode=1`）

@@ -154,6 +154,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `stays` | `auto` / `session` / `turn` / `off` / `strict` | 一段对话粘在谁身上 |
 | `weights` | 成员 → 整数（1–1000） | 只在 `routing: weight` 时用 |
 | `listed` | true/false | 组名是否出现在模型目录里（`group/mixed`） |
+| `alias` | 字符串，可选 | 对外别名，`provider/model` 形态（如 `local-router/auto`），与 `group/<id>` 等价；不能撞真模型 |
 | `models` | 成员 | 可以是 `provider/model`，也可以是 `group/别的组`（嵌套） |
 
 ### 3.3 settings —— 全局设置

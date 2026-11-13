@@ -380,6 +380,17 @@ async fn list_models(State(g): State<Gateway>, headers: HeaderMap) -> Response {
             "owned_by": "local-router",
             "display_name": format!("{} · group", group.name),
         }));
+        // A group's alias is a second name for the same routing policy, so
+        // a picker that only knows `provider/model` ids can find it too.
+        if let Some(alias) = &group.alias {
+            data.push(json!({
+                "id": alias,
+                "object": "model",
+                "created": created,
+                "owned_by": "local-router",
+                "display_name": format!("{} · group", group.name),
+            }));
+        }
     }
     Json(json!({"object": "list", "data": data})).into_response()
 }

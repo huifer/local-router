@@ -41,7 +41,7 @@ export default function GroupsPage() {
   const { t } = useT();
   const { data, reload } = useRouteLoaderData("shell") as { data: AppData; reload: () => Promise<void> };
   const [showAdd, setShowAdd] = useState(false);
-  const [form, setForm] = useState({ name: "", members: [] as string[], routing: "order", stays: "auto" });
+  const [form, setForm] = useState({ name: "", alias: "", members: [] as string[], routing: "order", stays: "auto" });
   const catalog = useMemberCatalog();
   // The id the group will be reachable under: the name as written, lowercased
   // and trimmed to what a path segment can hold.
@@ -69,11 +69,12 @@ export default function GroupsPage() {
           routing: form.routing,
           stays: form.stays,
           listed: true,
+          ...(form.alias.trim() ? { alias: form.alias.trim() } : {}),
         },
       });
       toast.success(t("groups.added"));
       setShowAdd(false);
-      setForm({ name: "", members: [], routing: "order", stays: "auto" });
+      setForm({ name: "", alias: "", members: [], routing: "order", stays: "auto" });
       await reload();
     } catch (error) {
       toast.error((error as Error).message);
@@ -116,6 +117,9 @@ export default function GroupsPage() {
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <span className="font-mono text-[10px] text-ring">group/{group.id}</span>
+                  {group.alias && (
+                    <span className="ml-2 font-mono text-[10px] text-muted-foreground">{group.alias}</span>
+                  )}
                   <h3 className="m-0 mt-2 text-lg tracking-[-0.04em]">{group.name}</h3>
                 </div>
                 <Badge variant="primary">{group.routing}</Badge>
@@ -250,6 +254,13 @@ export default function GroupsPage() {
                   value={form.name}
                   placeholder={t("groups.groupNamePlaceholder")}
                   onChange={(event) => setForm({ ...form, name: event.target.value })}
+                />
+              </Field>
+              <Field label={t("groups.alias")} help={t("groups.aliasHelp")}>
+                <Input
+                  value={form.alias}
+                  placeholder="local-router/auto"
+                  onChange={(event) => setForm({ ...form, alias: event.target.value })}
                 />
               </Field>
               <Field label={t("groups.affinity")} help={t("groups.affinityHelp")}>

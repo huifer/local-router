@@ -382,6 +382,11 @@ pub struct Group {
     /// The models the group names stay out of the global model list.
     #[serde(default = "yes")]
     pub listed: bool,
+    /// An extra public name shaped like `provider/model` that routes to
+    /// this group, e.g. `local-router/auto`. The `group/<id>` name keeps
+    /// working either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
 }
@@ -787,6 +792,7 @@ mod tests {
             stays: Stays::default(),
             weights: BTreeMap::new(),
             listed: true,
+            alias: None,
             note: None,
         });
         config.caller_keys.push(CallerKey {
@@ -853,6 +859,13 @@ impl Config {
         self.groups.iter().find(|g| g.id == id)
     }
 
+    /// The group a public alias (`local-router/auto`) names, if any.
+    pub fn group_by_alias(&self, alias: &str) -> Option<&Group> {
+        self.groups
+            .iter()
+            .find(|g| g.alias.as_deref() == Some(alias))
+    }
+
     pub fn group_mut(&mut self, id: &str) -> Option<&mut Group> {
         self.groups.iter_mut().find(|g| g.id == id)
     }
@@ -876,6 +889,40 @@ impl Config {
             }
             if !gids.insert(g.id.clone()) {
                 return Err(format!("duplicate group id: {}", g.id));
+            }
+            if let Some(alias) = &g.alias {
+                let alias = alias.trim();
+                let Some((head, tail)) = Config::split_model(alias) else {
+                    return Err(format!(
+                        "group '{}' alias '{}' must look like provider/model",
+                        g.id, alias
+                    ));
+                };
+                if head == "group" {
+                    return Err(format!(
+                        "group '{}' alias must not use the reserved 'group/' prefix",
+                        g.id
+                    ));
+                }
+                if ids.contains(head)
+                    && self
+                        .provider(head)
+                        .map(|p| p.models.iter().any(|m| m == tail))
+                        .unwrap_or(false)
+                {
+                    return Err(format!(
+                        "group '{}' alias '{}' collides with a model its provider serves",
+                        g.id, alias
+                    ));
+                }
+                if self
+                    .groups
+                    .iter()
+                    .filter(|other| other.id != g.id)
+                    .any(|other| other.alias.as_deref() == Some(alias))
+                {
+                    return Err(format!("duplicate group alias: {}", alias));
+                }
             }
         }
         for g in &self.groups {
@@ -915,6 +962,9 @@ impl Config {
         for g in &self.groups {
             if g.listed {
                 out.push(format!("group/{}", g.id));
+                if let Some(alias) = &g.alias {
+                    out.push(alias.clone());
+                }
             }
         }
         out
@@ -1097,15 +1147,25 @@ impl AppState {
         }
     }
 
-    /// Apply a change to the configuration and write it out.
-    pub async fn update<T>(&self, f: impl FnOnce(&mut Config) -> T) -> anyhow::Result<T> {
+    /// Apply a change to the configuration and write it out. A closure that
+    /// returns `Err` leaves the config untouched: the mutation is rolled back
+    /// and nothing is written, so a refused change cannot corrupt the file.
+    pub async fn update<T, E: std::fmt::Display>(
+        &self,
+        f: impl FnOnce(&mut Config) -> Result<T, E>,
+    ) -> anyhow::Result<Result<T, String>> {
         let mut guard = self.config.write().await;
+        let before = guard.clone();
         let out = f(&mut guard);
+        if let Err(e) = &out {
+            *guard = before;
+            return Ok(Err(e.to_string()));
+        }
         guard.revision += 1;
         self.store.save(&guard)?;
         drop(guard);
         *self.mtime.lock().await = self.store.mtime();
-        Ok(out)
+        Ok(out.map_err(|e| e.to_string()))
     }
 
     /// Write a fully-validated config out and adopt it in memory, bumping the
@@ -1178,6 +1238,7 @@ mod config_surface_tests {
             weights: BTreeMap::from([("p/m".to_string(), 3u32)]),
             stays: Stays::Strict,
             listed: false,
+            alias: None,
             note: Some("n".into()),
         });
         config.settings = Settings {

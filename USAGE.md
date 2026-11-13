@@ -357,7 +357,13 @@ caller key；一把都没有时**拒绝一切请求**。
 | --- | --- | --- |
 | `provider/model` | `deepseek/deepseek-chat` | 点名某家的某个模型 |
 | `group/id` | `group/backup` | 走路由组（用谁、怎么 failover 由组里定） |
+| 组别名 | `local-router/auto` | 给组起的 `provider/model` 形态对外名（组的 `alias` 字段），与 `group/id` 等价 |
 | 裸模型名 | `deepseek-chat` | **恰好一个**上游提供这个模型时，直接用它 |
+
+组别名在控制台 Groups 表单或 `PATCH /api/groups/{id}` 的 `alias` 字段设置；
+必须形如 `provider/model`、不能用保留的 `group/` 前缀、不能与同名 provider
+真实提供的模型撞名。若别名恰好撞上真模型，**真模型优先**。`listed: true`
+的组，其别名也会出现在 `/v1/models` 目录里。
 
 裸名的判定：**有且仅有一个**上游提供它就用它；两个都提供会报
 `is served by both a and b`（让你写清楚用 `provider/model`）；一个都没有

@@ -151,6 +151,19 @@ impl Router {
             })?;
             return self.plan_group(config, group, session, has_history).await;
         }
+        // A group may also answer to a public alias shaped like a model id
+        // (`local-router/auto`), so callers can name the group the way they
+        // name every other model. An explicit `provider/model` still wins
+        // when that provider really serves the model.
+        if let Some(group) = config.group_by_alias(requested) {
+            let shadowed = Config::split_model(requested)
+                .and_then(|(pid, model)| config.provider(pid).map(|p| (p, model)))
+                .map(|(p, model)| p.enabled && p.models.iter().any(|m| m == model))
+                .unwrap_or(false);
+            if !shadowed {
+                return self.plan_group(config, group, session, has_history).await;
+            }
+        }
 
         let (provider_id, model) = match Config::split_model(requested) {
             Some((provider_id, model)) => (provider_id.to_string(), model.to_string()),

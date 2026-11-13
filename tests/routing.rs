@@ -61,6 +61,7 @@ fn group(id: &str, models: &[&str], routing: Routing) -> Group {
         weights: BTreeMap::new(),
         stays: Stays::Off,
         listed: true,
+        alias: None,
         note: None,
     }
 }
@@ -359,4 +360,89 @@ async fn turn_stays_pick_again_on_a_fresh_exchange() {
         .await
         .unwrap();
     assert_eq!(fresh_s.targets[0].key_id, first_s.targets[0].key_id);
+}
+
+// ------------------------------------------------------------- aliases --
+
+#[tokio::test]
+async fn a_group_alias_routes_like_group_id() {
+    let mut g = group("auto", &["a/m1", "b/m2"], Routing::Order);
+    g.alias = Some("local-router/auto".into());
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],
+        vec![g],
+    );
+    let router = Router::new();
+    let plan = router
+        .plan(&config, "local-router/auto", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.group_id.as_deref(), Some("auto"));
+    assert_eq!(plan.targets.len(), 2);
+    // The canonical name keeps working.
+    let canonical = router
+        .plan(&config, "group/auto", None, true)
+        .await
+        .unwrap();
+    assert_eq!(canonical.targets.len(), plan.targets.len());
+}
+
+#[tokio::test]
+async fn a_real_provider_model_wins_over_an_alias() {
+    let mut g = group("auto", &["b/m2"], Routing::Order);
+    // The alias head names a provider that really serves that model.
+    g.alias = Some("a/m1".into());
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],
+        vec![g],
+    );
+    let router = Router::new();
+    let plan = router.plan(&config, "a/m1", None, true).await.unwrap();
+    assert_eq!(plan.group_id, None);
+    assert_eq!(plan.targets[0].model, "m1");
+}
+
+#[test]
+fn alias_validation_rejects_bad_shapes_and_collisions() {
+    let mut config = config_with(vec![provider("a", &["m1"], 1)], vec![]);
+    let mut g = group("auto", &["a/m1"], Routing::Order);
+    // Not provider/model shaped.
+    g.alias = Some("plain-name".into());
+    config.groups.push(g.clone());
+    assert!(config.validate().is_err());
+    config.groups.clear();
+    // Reserved prefix.
+    g.alias = Some("group/auto".into());
+    config.groups.push(g.clone());
+    assert!(config.validate().is_err());
+    config.groups.clear();
+    // Collides with a model the named provider really serves.
+    g.alias = Some("a/m1".into());
+    config.groups.push(g.clone());
+    assert!(config.validate().is_err());
+    config.groups.clear();
+    // A fresh head is fine.
+    g.alias = Some("local-router/auto".into());
+    config.groups.push(g);
+    assert!(config.validate().is_ok());
+}
+
+#[test]
+fn duplicate_aliases_are_refused() {
+    let mut g1 = group("auto", &["a/m1"], Routing::Order);
+    g1.alias = Some("local-router/auto".into());
+    let mut g2 = group("spare", &["a/m1"], Routing::Order);
+    g2.alias = Some("local-router/auto".into());
+    let config = config_with(vec![provider("a", &["m1"], 1)], vec![g1, g2]);
+    assert!(config.validate().is_err());
+}
+
+#[test]
+fn a_listed_alias_appears_in_the_model_catalog() {
+    let mut g = group("auto", &["a/m1"], Routing::Order);
+    g.alias = Some("local-router/auto".into());
+    let config = config_with(vec![provider("a", &["m1"], 1)], vec![g]);
+    let ids = config.model_ids();
+    assert!(ids.contains(&"group/auto".to_string()));
+    assert!(ids.contains(&"local-router/auto".to_string()));
 }
