@@ -657,6 +657,94 @@ Tunnel/Tailscale。
 需要跑个 nginx 反代」的更简形态，见
 [examples/multi-machine](examples/multi-machine/README.md)。
 
+### 场景 N：把 Magpie 的 provider 配置搬过来
+
+Magpie 的 `~/.config/magpie/providers.json` **不能直接当 config.json 用**：
+字段名不同（`key`/`chat`/`off`/`baseAPI` vs `keys`/`base_url`/`enabled`/
+`protocol`），顶层还缺 `settings`、`caller_keys`、`revision`。用转换脚本：
+
+```sh
+# 只预览：报告会列出可转换 / 跳过 / 冲突的项目
+python3 scripts/import_magpie_providers.py
+
+# 写出一份完整 config（不改现有配置），或追加到现有 config.json
+python3 scripts/import_magpie_providers.py --out /tmp/lr-config.json
+python3 scripts/import_magpie_providers.py --merge            # 自动备份后写入
+python3 scripts/import_magpie_providers.py --only sub2api,longcat --merge
+```
+
+`--merge` 默认只加现有配置里没有的 provider，已有条目（及其密钥）不动；
+`--update` 才覆盖结构字段。`--include-off` 连 Magpie 里关掉的也导（作为
+enabled=false），`--include-picked` 把候选模型并进 `models`。
+
+四处要留意，报告里都会点名：
+
+- **密钥**：Magpie 磁盘上的 key 可能是不可逆的占位符。脚本默认宁可留空
+  也不写入必然 401 的值；加 `--keys-from-web` 会去问 Magpie 的本机网页
+  （Settings → 网页 →「此电脑」）要真实密钥，机制同
+  `scripts/import_magpie_keys.py`。
+- **登录态上游**：WorkBuddy / QwenWork / Trae CN / Copilot 这类在 Magpie 里
+  既没 URL 也没 key，靠插件会话；它们各有专用通道和 session 文件，脚本会
+  跳过，见 [登录态上游](docs/PROVIDERS.md)。
+- **裸模型名冲突**：新 provider 若与现有 provider 提供同名模型，裸名请求会
+  变成「is served by both」而报 400。用 `--only` 跳过聚合型上游，或加
+  `--drop-bare-conflicts` 从新 provider 的 `models` 里删掉重名项。
+- **语义差异**：账号级 `routing`、`insecureTLS`、`decide`、`accountModels`
+  在网关里没有对应；多把 key 在这里是顺序 failover，不是轮转。非标准
+  base URL（如 `/api/coding/paas/v4`）会自动配 `chat_path`。
+
+转换规则的回归测试：`python3 -m unittest discover -s scripts -p 'test_*.py'`。
+
+#### 全部接入：直连 + 级联两层
+
+想把 **Magpie 的全部上游**都接进来，用 `scripts/import_magpie_all.py`：
+
+```sh
+python3 scripts/import_magpie_all.py --enable-all             # 全部导入并启用（先看报告）
+python3 scripts/import_magpie_all.py --enable-all --apply     # 写入（自动备份）
+# 要无歧义的裸名再加 --drop-bare-conflicts（代价见下）
+```
+
+它做两层：
+
+1. **直连**——凡有 URL 的都导入并启用（`--enable-all`；不加则保留 Magpie
+   的 on/off 状态）。少一跳、可单独限流/计费。
+2. **级联**——加一个 `magpie` provider 指向 Magpie 自己的本机网关（地址从
+   `~/.config/magpie/gateway.json` 读，端口会变），models 取它 `/v1/models`
+   当前返回的全量 id（形如 `llm-free/auto`）。local-router 转发时只剥掉自己
+   这一层前缀，对面收到的正是它认识的 id。**插件登录型上游在 local-router
+   没有协议实现（`AuthKind` 只有 WorkBuddy / QwenWork / Trae CN 三家），
+   级联是它们的唯一通路。**
+
+四个要当回事的点：
+
+- **级联只覆盖 Magpie 当前在服务的**。Magpie 里 off 的插件上游在它的
+  `/v1/models` 里根本不存在，级联自然看不到。处理方式：在 Magpie 里
+  把那个 provider 打开，再**重跑一次本脚本**刷新级联表（幂等，可重复跑）。
+- **级联会放大 429**：`magpie` 这个 provider 吃一次上游 429 就整体进入冷却，
+  连带名下全部模型暂停（实测：WorkBuddy 配额 429 后，`magpie/*` 全军冷却）。
+  需要时调 `LOCAL_ROUTER_COOLDOWN_SECS` / `LOCAL_ROUTER_COOLDOWN_MAX_SECS`，
+  或优先走直连。
+- **级联会带进陈旧模型**：Magpie 的模型表可能含它自己已下架的 id（实测
+  `llm-free/qwen3.8-max` → 上游 404），重跑脚本可刷新（级联 models 不取并集，
+  以 Magpie 现况为准）。
+- **`group/*` 不进级联表**：会被 local-router 解析成**本地组**而不是上游模型；
+  本地路由组另走上一层的转换。
+
+**已接入后的实际状态**（全量 + 全部启用）：25 个 provider、818 个模型名，
+线上网关 `/v1/models` 可见 819 个 id。代价是 27 个裸名变成多方提供 ——
+**给 agent 定模型请写 `<provider>/<模型>` 或 `group/<id>`，不要写裸名**；
+想要无歧义的裸名再改用 `--drop-bare-conflicts`（代价见下）。
+
+`--drop-bare-conflicts` 的删除条件是两个都要成立：该裸名被其它 enabled 上游
+提供，**且**级联表里有 `<该 provider>/<名字>` 能取回。不满足第二条件就保留
+（宁可继续歧义，也不把模型删到谁也访问不到），报告会标出「保留但仍有歧义」
+的项。代价是：被删的名字从直连 provider 的白名单消失（直写会报 does not
+serve），只能经级联或组成员访问；被删到空的 provider（如 `qwen`）也等于
+失去直连入口。用绝对规则而非「相对上次的新增」，所以重跑不漂移。另注意：
+路由组成员**不受** models 白名单限制（`route.rs::plan_group` 只查
+`provider.enabled`）。
+
 ---
 
 ## 4. 配置与文件

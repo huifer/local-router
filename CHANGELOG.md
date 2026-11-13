@@ -27,6 +27,22 @@
   带完整 token 分列，`GET /v1/local-router/usage`（含 `/requests`）新增
   `total_tokens`，口径见 docs/BILLING.md。
 
+- **从 Magpie 导入全部上游**：两个脚本把 `~/.config/magpie/providers.json`
+  变成可用的 local-router 配置（两边字段语义不同，不能直接拷）：
+  - `scripts/import_magpie_providers.py`：字段转换（`key`/`chat`/`off`/`baseAPI`
+    → `keys`/`base_url`/`enabled`/`protocol`，`groups[].members` → `models`），
+    默认只出报告，`--out` / `--merge` 才写；`--only` / `--include-off` /
+    `--include-picked` / `--drop-bare-conflicts` / `--keys-from-web`。非标准
+    base URL（如 `/api/coding/paas/v4`）会自动补 `chat_path`，否则 `url_for`
+    会多插一层 `/v1`。配 18 个回归测试（`scripts/test_import_magpie_providers.py`）。
+  - `scripts/import_magpie_all.py`：全量接入，分两层——有 URL 的走直连（可
+    单独限流计费），靠插件登录会话的上游走**级联**（把 Magpie 本机网关当成
+    一个普通上游，模型表取它 `/v1/models` 现况）。Magpie 侧的 `group/*` 不
+    进级联表（会被解析成本地组）。详见 USAGE.md 场景 N。
+  两处代价要当回事：级联 provider 吃一次上游 429 会整体冷却，连带名下
+  全部模型暂停；`models` 同时是白名单，`--drop-bare-conflicts` 删重名项会丢
+  直连入口（仍可经级联访问）。
+
 - **Prometheus `/metrics` 端点（M1 遥测）**：网关现在在 `:3435/metrics` 暴露
   Prometheus 文本格式的实时指标——`local_router_requests_total`（by api /
   provider / status_class / has_key）、`local_router_tokens_total`（input /
