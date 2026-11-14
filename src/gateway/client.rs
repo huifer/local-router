@@ -25,6 +25,13 @@ pub trait StreamCollector: Send {
 /// The version local-router reports to vendors.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The total time one upstream call may take, when the provider does not
+/// say otherwise.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 600;
+
+/// The TCP connection timeout, when the provider does not say otherwise.
+pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 20;
+
 /// The URL a request goes to.
 pub fn url_for(base: &str, protocol: Protocol, model: Option<&str>, stream: bool) -> String {
     let base = base.trim_end_matches('/');
@@ -114,12 +121,18 @@ pub struct Target {
     pub asked: String,
 }
 
-/// A prepared HTTP client for a provider.
+/// A prepared HTTP client for a provider. The timeouts come from the
+/// provider: a hung vendor must not hold an agent for the default ten
+/// minutes, and a slow-but-working one must not be cut short.
 pub fn build_client(provider: &Provider) -> anyhow::Result<reqwest::Client> {
+    let total = provider.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let connect = provider
+        .connect_timeout_secs
+        .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS);
     let mut builder = reqwest::Client::builder()
         .user_agent(format!("local-router/{VERSION}"))
-        .timeout(Duration::from_secs(600))
-        .connect_timeout(Duration::from_secs(20));
+        .timeout(Duration::from_secs(total))
+        .connect_timeout(Duration::from_secs(connect));
     if let Some(proxy) = &provider.proxy {
         if !proxy.trim().is_empty() {
             let p = if proxy.starts_with("http") {
@@ -321,8 +334,72 @@ pub fn session_headers(
 
 /// A vendor's reply, either whole or streamed.
 pub enum UpstreamReply {
-    Whole { status: u16, body: Value },
-    Stream { status: u16, bytes: ByteStream },
+    Whole {
+        status: u16,
+        body: Value,
+        /// The vendor's own `Retry-After`, in seconds, when it sent one.
+        retry_after: Option<u64>,
+    },
+    Stream {
+        status: u16,
+        bytes: ByteStream,
+        retry_after: Option<u64>,
+    },
+}
+
+impl UpstreamReply {
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            UpstreamReply::Whole { retry_after, .. }
+            | UpstreamReply::Stream { retry_after, .. } => *retry_after,
+        }
+    }
+}
+
+/// Read a vendor's `Retry-After` header. Vendors send either a number of
+/// seconds or an HTTP date; both are honoured so an agent's retry storm
+/// stops for exactly as long as the vendor asked.
+pub fn retry_after_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<u64> {
+    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(secs);
+    }
+    let date = chrono::DateTime::parse_from_rfc2822(raw)
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw))
+        .ok()?;
+    let delta = date.with_timezone(&chrono::Utc) - now;
+    Some(delta.num_seconds().max(0) as u64)
+}
+
+/// Wait for the first byte of a stream, then put it back at the head.
+///
+/// A vendor that accepts the connection and never answers is the worst
+/// failure mode: the agent sees nothing until the total timeout fires.
+/// Before the first byte the response has not been committed to the caller,
+/// so a timeout here can still fail over to the next target. None means no
+/// separate first-byte deadline.
+pub async fn await_first_byte(
+    mut stream: ByteStream,
+    timeout: Option<Duration>,
+) -> Result<ByteStream, String> {
+    let Some(timeout) = timeout.filter(|d| !d.is_zero()) else {
+        return Ok(stream);
+    };
+    match tokio::time::timeout(timeout, stream.next()).await {
+        Ok(Some(Ok(first))) => {
+            let head = futures_util::stream::once(async move { Ok::<_, reqwest::Error>(first) });
+            Ok(Box::pin(head.chain(stream)))
+        }
+        Ok(Some(Err(err))) => Err(err.to_string()),
+        Ok(None) => Ok(Box::pin(futures_util::stream::empty())),
+        Err(_) => Err(format!(
+            "the upstream did not start streaming within {}s",
+            timeout.as_secs()
+        )),
+    }
 }
 
 /// Send a request to a vendor.
@@ -354,6 +431,7 @@ pub async fn send(
 
     let resp = req.send().await?;
     let status = resp.status().as_u16();
+    let retry_after = retry_after_from_headers(resp.headers(), chrono::Utc::now());
     let content_type = resp
         .headers()
         .get("content-type")
@@ -364,7 +442,11 @@ pub async fn send(
         stream && (200..300).contains(&status) && content_type.contains("event-stream");
     if really_streaming {
         let bytes: ByteStream = Box::pin(resp.bytes_stream());
-        Ok(UpstreamReply::Stream { status, bytes })
+        Ok(UpstreamReply::Stream {
+            status,
+            bytes,
+            retry_after,
+        })
     } else {
         let text = resp.text().await.unwrap_or_default();
         let parsed: Value = serde_json::from_str(&text)
@@ -372,6 +454,7 @@ pub async fn send(
         Ok(UpstreamReply::Whole {
             status,
             body: parsed,
+            retry_after,
         })
     }
 }
@@ -531,6 +614,69 @@ mod tests {
         assert_eq!(&both[..end], "a");
         assert_eq!(&both[next..], "b\r\n\r\n");
         assert_eq!(find_frame_end("no terminator here"), None);
+    }
+
+    #[tokio::test]
+    async fn first_byte_wait_puts_the_first_chunk_back() {
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from_static(b"one\n")),
+            Ok(bytes::Bytes::from_static(b"two\n")),
+        ];
+        let stream: ByteStream = Box::pin(futures_util::stream::iter(chunks));
+        let mut out = await_first_byte(stream, Some(Duration::from_secs(5)))
+            .await
+            .unwrap();
+        let mut joined = String::new();
+        while let Some(chunk) = out.next().await {
+            joined.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        assert_eq!(joined, "one\ntwo\n");
+    }
+
+    #[tokio::test]
+    async fn first_byte_wait_times_out_on_a_hung_stream() {
+        let pending: ByteStream = Box::pin(futures_util::stream::pending());
+        let err = match await_first_byte(pending, Some(Duration::from_millis(10))).await {
+            Ok(_) => panic!("a hung stream must time out"),
+            Err(err) => err,
+        };
+        assert!(err.contains("did not start streaming"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn no_first_byte_deadline_passes_the_stream_through() {
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            vec![Ok(bytes::Bytes::from_static(b"hi"))];
+        let stream: ByteStream = Box::pin(futures_util::stream::iter(chunks));
+        let mut out = await_first_byte(stream, None).await.unwrap();
+        assert_eq!(
+            out.next().await.unwrap().unwrap(),
+            bytes::Bytes::from_static(b"hi")
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let mut h = HeaderMap::new();
+        h.insert("retry-after", HeaderValue::from_static("120"));
+        assert_eq!(retry_after_from_headers(&h, chrono::Utc::now()), Some(120));
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut h = HeaderMap::new();
+        h.insert(
+            "retry-after",
+            HeaderValue::from_static("Thu, 01 Jan 2026 00:01:30 +0000"),
+        );
+        assert_eq!(retry_after_from_headers(&h, now), Some(90));
+        // A date in the past is a zero-second wait, never a negative one.
+        h.insert(
+            "retry-after",
+            HeaderValue::from_static("Wed, 31 Dec 2025 23:59:00 +0000"),
+        );
+        assert_eq!(retry_after_from_headers(&h, now), Some(0));
+        assert_eq!(retry_after_from_headers(&HeaderMap::new(), now), None);
     }
 
     #[test]

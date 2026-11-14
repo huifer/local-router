@@ -73,11 +73,13 @@ fn anthropic_request_parses() {
     assert_eq!(req.max_tokens, Some(100));
 
     match &req.messages[0].content[0] {
-        ContentBlock::Text { text } => assert_eq!(text, "hello"),
+        ContentBlock::Text { text, .. } => assert_eq!(text, "hello"),
         other => panic!("expected text, got {other:?}"),
     }
     match &req.messages[0].content[1] {
-        ContentBlock::Image { media_type, data } => {
+        ContentBlock::Image {
+            media_type, data, ..
+        } => {
             assert_eq!(media_type, "image/png");
             assert_eq!(data, "QUJD");
         }
@@ -648,4 +650,79 @@ fn a_stream_becomes_one_reply_again() {
         reply.stop_reason,
         Some(local_router::protocol::ir::StopReason::EndTurn)
     );
+}
+
+// ------------------------------------------------- prompt caching markers --
+// A Claude Code request marks the tail of its system prompt and the last
+// tool definition with `cache_control`. Dropping those markers makes the
+// upstream rebuild the whole prefix on every request — silently expensive.
+
+#[test]
+fn anthropic_cache_control_survives_a_round_trip() {
+    let raw = serde_json::json!({
+        "model": "mock/mock-small",
+        "max_tokens": 256,
+        "system": [
+            {"type": "text", "text": "you are helpful"},
+            {"type": "text", "text": "long reusable prefix",
+             "cache_control": {"type": "ephemeral"}}
+        ],
+        "tools": [
+            {"name": "calculator", "input_schema": {"type": "object"},
+             "cache_control": {"type": "ephemeral"}}
+        ],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello",
+                 "cache_control": {"type": "ephemeral"}}
+            ]}
+        ],
+    });
+    let req = anthropic::parse_request(&raw).unwrap();
+    assert_eq!(
+        req.system[1],
+        ContentBlock::Text {
+            text: "long reusable prefix".into(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }
+    );
+    assert_eq!(req.tools[0].cache_control, Some(CacheControl::ephemeral()));
+
+    let out = anthropic::format_request(&req, "upstream-model");
+    // The system prompt keeps its block structure so the marker survives.
+    let system = out["system"].as_array().expect("system must stay an array");
+    assert_eq!(system[1]["cache_control"]["type"], "ephemeral");
+    assert_eq!(system[0].get("cache_control"), None);
+    assert_eq!(out["tools"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        out["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    // A marker on a tool result is preserved too.
+    let with_result = anthropic::parse_request(&serde_json::json!({
+        "model": "m", "max_tokens": 10,
+        "messages": [{"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "42",
+             "cache_control": {"type": "ephemeral"}}
+        ]}],
+    }))
+    .unwrap();
+    let out = anthropic::format_request(&with_result, "upstream-model");
+    assert_eq!(
+        out["messages"][0]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+}
+
+#[test]
+fn anthropic_system_without_markers_stays_a_plain_string() {
+    let raw = serde_json::json!({
+        "model": "m",
+        "max_tokens": 10,
+        "system": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+        "messages": [{"role": "user", "content": "hi"}],
+    });
+    let req = anthropic::parse_request(&raw).unwrap();
+    let out = anthropic::format_request(&req, "upstream-model");
+    assert_eq!(out["system"], "a\n\nb");
 }

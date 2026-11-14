@@ -717,6 +717,8 @@ async fn a_group_alias_can_be_set_and_bad_ones_are_refused() {
             listed: true,
             alias: None,
             note: None,
+            scenarios: Default::default(),
+            max_price: None,
         });
     }
     let app = console(state.clone());
@@ -757,6 +759,9 @@ async fn a_group_alias_can_be_set_and_bad_ones_are_refused() {
     // The reserved prefix is refused too.
     assert_ne!(patch(r#"{"alias":"group/auto"}"#).await, StatusCode::OK);
 }
+
+// ---------------------------------------------------- usage windows --
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_schedule_can_be_set_and_bad_ones_are_refused() {
     let state = state_at("127.0.0.1").await;
@@ -828,3 +833,99 @@ async fn a_provider_schedule_can_be_set_and_bad_ones_are_refused() {
 }
 
 // ------------------------------------------- new control-plane fields --
+
+#[tokio::test(flavor = "multi_thread")]
+async fn provider_timeouts_and_model_map_patch_and_clear() {
+    let state = state_at("127.0.0.1").await;
+    {
+        let mut config = state.config.write().await;
+        config.providers.push(local_router::config::Provider {
+            id: "relay".into(),
+            name: "Relay".into(),
+            models: vec!["clean".into()],
+            keys: vec![ProviderKey::new("sk-relay".to_string())],
+            ..Default::default()
+        });
+    }
+    let app = console(state.clone());
+    let patch = |body: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/api/providers/relay")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3425")
+                    .header("origin", "http://127.0.0.1:3425")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    assert_eq!(
+        patch(r#"{"timeout_secs":90,"connect_timeout_secs":5,"first_byte_timeout_secs":15,"model_map":{"clean":"real-id"}}"#).await,
+        StatusCode::OK
+    );
+    {
+        let config = state.config.read().await;
+        let p = &config.providers[0];
+        assert_eq!(p.timeout_secs, Some(90));
+        assert_eq!(p.connect_timeout_secs, Some(5));
+        assert_eq!(p.first_byte_timeout_secs, Some(15));
+        assert_eq!(
+            p.model_map.get("clean").map(String::as_str),
+            Some("real-id")
+        );
+    }
+    // null clears, absent leaves alone.
+    assert_eq!(
+        patch(r#"{"model_map":null,"timeout_secs":null}"#).await,
+        StatusCode::OK
+    );
+    {
+        let config = state.config.read().await;
+        assert!(config.providers[0].model_map.is_empty());
+        assert_eq!(config.providers[0].timeout_secs, None);
+        assert_eq!(config.providers[0].connect_timeout_secs, Some(5));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_expiry_is_refused_and_a_good_one_is_stored() {
+    let state = state_at("127.0.0.1").await;
+    let app = console(state.clone());
+    let add = |body: &'static str| {
+        let app = app.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/caller-keys")
+                    .header("content-type", "application/json")
+                    .header("host", "127.0.0.1:3425")
+                    .header("origin", "http://127.0.0.1:3425")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        }
+    };
+    assert_eq!(
+        add(r#"{"name":"temp","expires_at":"tomorrow"}"#).await,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        add(r#"{"name":"temp","expires_at":"2030-01-01T00:00:00Z","models":["group/auto"]}"#).await,
+        StatusCode::OK
+    );
+    let keys = &state.config.read().await.caller_keys;
+    assert_eq!(keys.len(), 1);
+    assert_eq!(keys[0].models, vec!["group/auto".to_string()]);
+    assert!(keys[0].expires_at.is_some());
+}

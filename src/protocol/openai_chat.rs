@@ -77,6 +77,7 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                     .and_then(Value::as_str)
                     .map(|s| s.to_string()),
                 input_schema: schema,
+                cache_control: None,
             });
         }
     }
@@ -206,6 +207,7 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                     tool_use_id: tool_use_id.clone(),
                     content: vec![b],
                     is_error: false,
+                    cache_control: None,
                 })
                 .collect();
             req.messages.push(Message {
@@ -235,12 +237,14 @@ pub fn image_block(url: &str) -> ContentBlock {
             return ContentBlock::Image {
                 media_type: mime.to_string(),
                 data: b64.to_string(),
+                cache_control: None,
             };
         }
     }
     ContentBlock::Image {
         media_type: "image/url".to_string(),
         data: url.to_string(),
+        cache_control: None,
     }
 }
 
@@ -398,7 +402,7 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
     let mut messages = Vec::new();
 
     for block in &req.system {
-        if let ContentBlock::Text { text } = block {
+        if let ContentBlock::Text { text, .. } = block {
             messages.push(json!({"role": "system", "content": text}));
         }
     }
@@ -407,7 +411,7 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
         match m.role {
             Role::System => {
                 for b in &m.content {
-                    if let ContentBlock::Text { text } = b {
+                    if let ContentBlock::Text { text, .. } = b {
                         messages.push(json!({"role": "system", "content": text}));
                     }
                 }
@@ -422,7 +426,7 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
                 let mut tool_calls = Vec::new();
                 for b in &m.content {
                     match b {
-                        ContentBlock::Text { text: t } => text.push_str(t),
+                        ContentBlock::Text { text: t, .. } => text.push_str(t),
                         ContentBlock::Thinking { text: t, .. } => reasoning.push_str(t),
                         ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                             "id": id,
@@ -534,12 +538,14 @@ fn user_parts(content: &[ContentBlock]) -> Value {
     let mut parts = Vec::new();
     for b in content {
         match b {
-            ContentBlock::Text { text } => {
+            ContentBlock::Text { text, .. } => {
                 if !text.is_empty() {
                     parts.push(json!({"type": "text", "text": text}));
                 }
             }
-            ContentBlock::Image { media_type, data } => {
+            ContentBlock::Image {
+                media_type, data, ..
+            } => {
                 if media_type == "image/url" {
                     parts.push(json!({"type": "image_url", "image_url": {"url": data}}));
                 } else {
@@ -553,6 +559,7 @@ fn user_parts(content: &[ContentBlock]) -> Value {
                 media_type,
                 data,
                 name,
+                ..
             } => {
                 parts.push(json!({
                     "type": "text",
@@ -580,7 +587,7 @@ pub fn format_response(resp: &ChatResponse, model: &str) -> Value {
 
     for b in &resp.content {
         match b {
-            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Text { text: t, .. } => text.push_str(t),
             ContentBlock::Thinking { text: t, .. } => reasoning.push_str(t),
             ContentBlock::ToolUse { id, name, input } => tool_calls.push(json!({
                 "id": id,
@@ -1015,12 +1022,12 @@ mod tests {
         let data = image_block("data:image/png;base64,QUJD");
         assert!(matches!(
             &data,
-            ContentBlock::Image { media_type, data } if media_type == "image/png" && data == "QUJD"
+            ContentBlock::Image { media_type, data, .. } if media_type == "image/png" && data == "QUJD"
         ));
         let remote = image_block("https://cdn.example/cat.png");
         assert!(matches!(
             &remote,
-            ContentBlock::Image { media_type, data } if media_type == "image/url"
+            ContentBlock::Image { media_type, data, .. } if media_type == "image/url"
                 && data == "https://cdn.example/cat.png"
         ));
         // A data URL without the base64 marker stays whole.

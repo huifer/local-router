@@ -593,6 +593,18 @@ struct UpdateProvider {
     rpm: Option<Option<u64>>,
     #[serde(default, deserialize_with = "de_optional_optional")]
     tpm: Option<Option<u64>>,
+    /// Rename the vendor's real model ids to public ones. `null` clears
+    /// the whole map; absent leaves it alone.
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    model_map: Option<Option<BTreeMap<String, String>>>,
+    /// Per-provider timeouts in seconds. `null` (or 0) clears an override;
+    /// absent leaves it alone.
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    timeout_secs: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    connect_timeout_secs: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    first_byte_timeout_secs: Option<Option<u64>>,
     /// The provider's usage windows. `null` or `[]` clears them; absent
     /// leaves them alone. Bad windows are refused, not silently dropped.
     #[serde(default, deserialize_with = "de_optional_optional")]
@@ -631,6 +643,10 @@ async fn api_update_provider(
         header_order: None,
         rpm: None,
         tpm: None,
+        model_map: None,
+        timeout_secs: None,
+        connect_timeout_secs: None,
+        first_byte_timeout_secs: None,
         schedule: None,
     });
     state
@@ -683,6 +699,18 @@ async fn api_update_provider(
             }
             if let Some(v) = input.tpm {
                 p.tpm = v.filter(|n| *n > 0);
+            }
+            if let Some(v) = input.model_map {
+                p.model_map = v.unwrap_or_default();
+            }
+            if let Some(v) = input.timeout_secs {
+                p.timeout_secs = v.filter(|n| *n > 0);
+            }
+            if let Some(v) = input.connect_timeout_secs {
+                p.connect_timeout_secs = v.filter(|n| *n > 0);
+            }
+            if let Some(v) = input.first_byte_timeout_secs {
+                p.first_byte_timeout_secs = v.filter(|n| *n > 0);
             }
             // Usage windows: validate before they land, so a typo cannot
             // silently disable the provider's restriction.
@@ -1813,16 +1841,18 @@ async fn api_test_provider(
             Json(json!({"error": "the provider exposes no model"})),
         ));
     };
-    if state.cooldowns.provider_is_cooling(&id).await {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": "this provider is cooling down after a 429; try again shortly"})),
-        ));
-    }
     let test_key = provider.enabled_keys().next();
     let test_key_id = test_key
         .map(|key| key.id.clone())
         .unwrap_or_else(|| "session".into());
+    if state.cooldowns.account_is_cooling(&id, &test_key_id).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                json!({"error": "this provider key is cooling down after a 429; try again shortly"}),
+            ),
+        ));
+    }
     let test_limit = test_key
         .and_then(|key| key.max_concurrency)
         .or(provider.max_concurrency);
@@ -1847,9 +1877,7 @@ async fn api_test_provider(
         };
         request.messages.push(crate::protocol::ir::Message {
             role: crate::protocol::ir::Role::User,
-            content: vec![crate::protocol::ir::ContentBlock::Text {
-                text: "ping".into(),
-            }],
+            content: vec![crate::protocol::ir::ContentBlock::text("ping")],
             tool_call_id: None,
             name: None,
         });
@@ -1894,9 +1922,7 @@ async fn api_test_provider(
         };
         request.messages.push(crate::protocol::ir::Message {
             role: crate::protocol::ir::Role::User,
-            content: vec![crate::protocol::ir::ContentBlock::Text {
-                text: "ping".into(),
-            }],
+            content: vec![crate::protocol::ir::ContentBlock::text("ping")],
             tool_call_id: None,
             name: None,
         });
@@ -2069,6 +2095,12 @@ struct GroupInput {
     /// The weight of each member, for `weight` routing (member=weight).
     #[serde(default)]
     weights: Option<BTreeMap<String, u32>>,
+    /// Scenario routes (background / think / long_context).
+    #[serde(default)]
+    scenarios: Option<crate::config::Scenarios>,
+    /// Only try members whose price is at or below this USD/M tokens.
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    max_price: Option<Option<f64>>,
 }
 
 async fn api_add_group(
@@ -2096,6 +2128,8 @@ async fn api_add_group(
         listed: input.listed.unwrap_or(true),
         alias: input.alias.filter(|s| !s.trim().is_empty()),
         note: input.note,
+        scenarios: input.scenarios.unwrap_or_default(),
+        max_price: input.max_price.flatten(),
     };
     state
         .update(|config| {
@@ -2132,6 +2166,8 @@ async fn api_update_group(
         alias: None,
         note: None,
         weights: None,
+        scenarios: None,
+        max_price: None,
     });
     state
         .update(|config| {
@@ -2161,6 +2197,12 @@ async fn api_update_group(
             }
             if let Some(w) = input.weights {
                 g.weights = w;
+            }
+            if let Some(scen) = input.scenarios {
+                g.scenarios = scen;
+            }
+            if let Some(price) = input.max_price {
+                g.max_price = price.filter(|p| *p >= 0.0);
             }
             config.validate()?;
             Ok(())
@@ -2377,6 +2419,8 @@ async fn api_caller_keys(State(state): State<AppState>) -> Json<Value> {
                 "enabled": k.enabled,
                 "daily_tokens": k.daily_tokens,
                 "monthly_cost": k.monthly_cost,
+                "models": k.models,
+                "expires_at": k.expires_at,
             })
         })
         .collect();
@@ -2389,6 +2433,12 @@ struct CallerKeyInput {
     key: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
+    /// Optional model allow-list and expiry, for keys handed to remote
+    /// machines or temporary collaborators.
+    #[serde(default)]
+    models: Option<Vec<String>>,
+    #[serde(default)]
+    expires_at: Option<String>,
 }
 
 async fn api_add_caller_key(
@@ -2404,6 +2454,16 @@ async fn api_add_caller_key(
     let key = input
         .key
         .unwrap_or_else(|| format!("sk-local-router-{}", uuid::Uuid::new_v4().simple()));
+    // Fail early on a typo: a malformed expiry would otherwise create a
+    // key that is permanently refused (the auth check fails closed).
+    if let Some(raw) = &input.expires_at {
+        if chrono::DateTime::parse_from_rfc3339(raw).is_err() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "expires_at must be an RFC 3339 date"})),
+            ));
+        }
+    }
     state
         .update(|config| {
             config.caller_keys.push(crate::config::CallerKey {
@@ -2415,6 +2475,8 @@ async fn api_add_caller_key(
                 rpm: None,
                 tpm: None,
                 monthly_cost: None,
+                models: input.models.unwrap_or_default(),
+                expires_at: input.expires_at,
             });
             Ok::<(), String>(())
         })

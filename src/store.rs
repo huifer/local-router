@@ -90,8 +90,8 @@ impl Store {
              (time, model, provider, key_id, key_label, caller_key_id, caller_key_label, group_id, protocol,
               input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
               reasoning_tokens, latency_ms, status, ok, error, agent, session_id,
-              context, project, cost_usd, credits, priced)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
+              context, project, cost_usd, credits, priced, ttft_ms)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26)",
             rusqlite::params![
                 rec.time,
                 rec.model,
@@ -118,6 +118,7 @@ impl Store {
                 rec.cost_usd,
                 rec.credits,
                 rec.priced,
+                rec.ttft_ms.map(|n| n as i64),
             ],
         );
         if let Err(err) = result {
@@ -191,6 +192,23 @@ impl Store {
     }
 
     /// Every span since `since`, oldest first.
+    /// Delete usage records and trace spans older than the retention
+    /// cutoff (an RFC 3339 timestamp). Returns the rows removed. The JSONL
+    /// log is left alone — it is rotated by size already.
+    pub fn prune_older_than(&self, cutoff: &str) -> (usize, usize) {
+        let mut conn = self.conn.lock().expect("store lock");
+        let Some(conn) = conn.as_mut() else {
+            return (0, 0);
+        };
+        let usage = conn
+            .execute("DELETE FROM usage_records WHERE time < ?1", [cutoff])
+            .unwrap_or(0);
+        let spans = conn
+            .execute("DELETE FROM trace_spans WHERE started_at < ?1", [cutoff])
+            .unwrap_or(0);
+        (usage, spans)
+    }
+
     pub fn spans_since(&self, since: &str) -> Vec<Span> {
         self.query_spans(
             "SELECT * FROM trace_spans WHERE started_at >= ?1 ORDER BY started_at ASC",
@@ -411,7 +429,7 @@ pub struct AggregateRow {
 
 /// The columns the newest code writes. A database created by an older
 /// release may lack the later ones; each is added on open.
-const COLUMNS: [(&str, &str); 20] = [
+const COLUMNS: [(&str, &str); 21] = [
     ("provider", "TEXT NOT NULL DEFAULT ''"),
     ("key_id", "TEXT"),
     ("key_label", "TEXT"),
@@ -432,6 +450,7 @@ const COLUMNS: [(&str, &str); 20] = [
     ("credits", "REAL"),
     ("priced", "INTEGER NOT NULL DEFAULT 1"),
     ("ok", "INTEGER NOT NULL DEFAULT 1"),
+    ("ttft_ms", "INTEGER"),
 ];
 
 /// Create the table if it is not there yet, then add any column an older
@@ -619,6 +638,9 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         cache_write_tokens: row.get::<_, i64>("cache_write_tokens")?.max(0) as u64,
         reasoning_tokens: row.get::<_, i64>("reasoning_tokens")?.max(0) as u64,
         latency_ms: row.get::<_, i64>("latency_ms")?.max(0) as u64,
+        ttft_ms: row
+            .get::<_, Option<i64>>("ttft_ms")?
+            .map(|n| n.max(0) as u64),
         status: row.get::<_, i64>("status")?.max(0) as u16,
         ok: row.get::<_, i64>("ok")? != 0,
         error: row.get("error")?,
@@ -632,6 +654,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
         cost_usd: row.get("cost_usd")?,
         credits: row.get("credits")?,
         priced: row.get::<_, i64>("priced")? != 0,
+        retry_after_secs: None,
     })
 }
 
@@ -669,6 +692,8 @@ mod tests {
         let mut rec = record("workbuddy", "hy3", 100, 50);
         rec.cost_usd = Some(0.123);
         rec.credits = Some(1.5);
+        rec.ttft_ms = Some(240);
+        rec.ttft_ms = Some(240);
         rec.context = Some(ContextBreakdown {
             system_tokens: 10,
             tool_tokens: 20,
@@ -688,6 +713,8 @@ mod tests {
         assert_eq!(back.output_tokens, 50);
         assert_eq!(back.cost_usd, Some(0.123));
         assert_eq!(back.credits, Some(1.5));
+        assert_eq!(back.ttft_ms, Some(240));
+        assert_eq!(back.ttft_ms, Some(240));
         assert_eq!(back.session_id.as_deref(), Some("s-1"));
         assert_eq!(back.agent.as_deref(), Some("claude-code"));
         assert_eq!(back.caller_key_id.as_deref(), Some("caller-1"));
@@ -875,5 +902,20 @@ mod tests {
         let found = store.span_by_upstream_id("chatcmpl-1");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].span_id, "up_1");
+    }
+    #[test]
+    fn retention_prunes_only_old_rows() {
+        let store = store_at("retention");
+        let mut old = record("p", "m", 1, 1);
+        old.time = "2020-01-01T00:00:00Z".into();
+        store.record(&old);
+        let mut recent = record("p", "m", 1, 1);
+        recent.time = chrono::Utc::now().to_rfc3339();
+        store.record(&recent);
+        let (usage, _) = store.prune_older_than("2021-01-01T00:00:00Z");
+        assert_eq!(usage, 1);
+        let left = store.read_all();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].time, recent.time);
     }
 }

@@ -151,6 +151,7 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
             .map(|_| ProviderKey::new(format!("sk-{id}")))
             .collect(),
         models: models.iter().map(|m| m.to_string()).collect(),
+        model_map: Default::default(),
         auto_include: Vec::new(),
         catalog: None,
         headers: Default::default(),
@@ -168,6 +169,9 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        timeout_secs: None,
+        connect_timeout_secs: None,
+        first_byte_timeout_secs: None,
         schedule: Vec::new(),
         media_models: Vec::new(),
         media_paths: None,
@@ -429,6 +433,8 @@ async fn a_group_fails_over_to_the_next_member() {
         listed: true,
         alias: None,
         note: None,
+        scenarios: Default::default(),
+        max_price: None,
     });
     let world = world(config).await;
     let (status, body) = world
@@ -458,6 +464,8 @@ async fn a_group_of_dead_members_reports_the_error() {
         listed: true,
         alias: None,
         note: None,
+        scenarios: Default::default(),
+        max_price: None,
     });
     let world = world(config).await;
     let (status, body) = world
@@ -526,6 +534,8 @@ async fn a_rate_limited_key_reports_the_error() {
         listed: true,
         alias: None,
         note: None,
+        scenarios: Default::default(),
+        max_price: None,
     });
     let world = world(config).await;
     world.vendor.fail_with.store(429, Ordering::SeqCst);
@@ -960,6 +970,8 @@ async fn a_group_skips_the_closed_member_without_a_cooldown() {
         listed: true,
         alias: None,
         note: None,
+        scenarios: Default::default(),
+        max_price: None,
     });
     let world = world(config).await;
     let (status, body) = world

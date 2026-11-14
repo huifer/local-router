@@ -45,6 +45,10 @@ pub struct UsageRecord {
     /// How long the call took, in milliseconds.
     #[serde(default)]
     pub latency_ms: u64,
+    /// Time to first token, in milliseconds. Only a streaming reply has
+    /// one: it is the wait the agent actually feels before output starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
     /// The HTTP status the caller saw.
     #[serde(default)]
     pub status: u16,
@@ -81,6 +85,10 @@ pub struct UsageRecord {
     /// one whose model has no price on file.
     #[serde(default = "yes")]
     pub priced: bool,
+    /// Runtime only: the vendor's `Retry-After` for this attempt, in
+    /// seconds. It drives the cooldown, never the bill.
+    #[serde(skip)]
+    pub retry_after_secs: Option<u64>,
 }
 
 fn yes() -> bool {
@@ -130,6 +138,7 @@ impl UsageRecord {
             cache_write_tokens: 0,
             reasoning_tokens: 0,
             latency_ms: 0,
+            ttft_ms: None,
             status: 0,
             ok: true,
             error: None,
@@ -141,6 +150,7 @@ impl UsageRecord {
             cost_usd: None,
             credits: None,
             priced: true,
+            retry_after_secs: None,
         }
     }
 }
@@ -674,6 +684,7 @@ mod tests {
                     media_type: "text/plain".into(),
                     data: "a long attached file body".into(),
                     name: Some("notes.txt".into()),
+                    cache_control: None,
                 }],
                 tool_call_id: None,
                 name: None,

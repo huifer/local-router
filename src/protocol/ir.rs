@@ -5,6 +5,14 @@
 //! these types, and every upstream provider is answered by formatting these
 //! types back out. Anthropic Messages is the closest shape to a superset, so
 //! the block model below follows it.
+//!
+//! Two escape hatches keep translation lossless where it matters most:
+//!
+//! - `CacheControl` on content blocks carries Anthropic prompt-caching
+//!   breakpoints through the gateway untouched.
+//! - `ChatRequest.raw_request` keeps the caller's body bytes when the
+//!   inbound and upstream protocols are the same, so a same-shape relay
+//!   forwards the body verbatim instead of rebuilding it through the IR.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -66,11 +74,40 @@ pub enum Role {
     Tool,
 }
 
+/// An Anthropic prompt-caching breakpoint: `{"cache_control": {"type":
+/// "ephemeral"}}` on a content block, a system block, or a tool. The
+/// gateway carries it through translation untouched, so a caller's explicit
+/// caching markers survive a round trip through `provider/model` routing.
+/// Other protocols have no such marker (OpenAI and Gemini cache implicitly),
+/// so there the field is simply not written out.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CacheControl {
+    /// The marker type; today always `ephemeral`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Optional lifetime, e.g. `1h`, on markers that ask for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<String>,
+}
+
+impl CacheControl {
+    pub fn ephemeral() -> Self {
+        CacheControl {
+            kind: "ephemeral".into(),
+            ttl: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text {
         text: String,
+        /// A prompt-caching marker the caller put on this block. Preserved
+        /// when the reply goes back out in Anthropic's shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     /// A model's reasoning. `signature` is the opaque blob vendors use to
     /// validate that a thinking block was not tampered with.
@@ -91,11 +128,15 @@ pub enum ContentBlock {
         content: Vec<ContentBlock>,
         #[serde(default)]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     /// An inline image (base64 payload).
     Image {
         media_type: String,
         data: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     /// A file the user attached, base64 encoded.
     Document {
@@ -103,17 +144,30 @@ pub enum ContentBlock {
         data: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 
 impl ContentBlock {
     pub fn text(s: impl Into<String>) -> Self {
-        ContentBlock::Text { text: s.into() }
+        ContentBlock::Text {
+            text: s.into(),
+            cache_control: None,
+        }
+    }
+
+    /// The same block with a prompt-caching marker attached.
+    pub fn cached(s: impl Into<String>) -> Self {
+        ContentBlock::Text {
+            text: s.into(),
+            cache_control: Some(CacheControl::ephemeral()),
+        }
     }
 
     pub fn as_text(&self) -> Option<&str> {
         match self {
-            ContentBlock::Text { text } => Some(text),
+            ContentBlock::Text { text, .. } => Some(text),
             _ => None,
         }
     }
@@ -121,13 +175,16 @@ impl ContentBlock {
     /// The plain text of a block, for tools that only carry a string.
     pub fn plain_text(&self) -> String {
         match self {
-            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::Text { text, .. } => text.clone(),
             ContentBlock::Thinking { text, .. } => text.clone(),
-            ContentBlock::Image { media_type, data } => format!("[image {media_type}:{data}]"),
+            ContentBlock::Image {
+                media_type, data, ..
+            } => format!("[image {media_type}:{data}]"),
             ContentBlock::Document {
                 media_type,
                 data,
                 name,
+                ..
             } => {
                 format!(
                     "[document {media_type}:{data}{}]",
@@ -245,6 +302,9 @@ pub struct ToolDef {
     /// JSON Schema of the tool's parameters.
     #[serde(default)]
     pub input_schema: Value,
+    /// Anthropic prompt-caching marker on the tool definition itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 impl ToolDef {
@@ -253,6 +313,7 @@ impl ToolDef {
             name: name.into(),
             description,
             input_schema,
+            cache_control: None,
         }
     }
 }
@@ -293,6 +354,15 @@ pub struct ChatRequest {
     pub stop: Vec<String>,
     pub stream: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The caller's body, when the gateway saw it as raw JSON and no
+    /// protocol translation is needed (`caller protocol == upstream
+    /// protocol`). When present, the gateway forwards these bytes as the
+    /// upstream body — only the model name and the trace metadata are
+    /// patched in — so fields the IR does not model (`response_format`,
+    /// `seed`, penalties, vendor beta fields, …) survive the relay.
+    /// Always `None` after a cross-protocol parse.
+    #[allow(clippy::type_complexity)]
+    pub raw_request: Option<std::sync::Arc<serde_json::Map<String, Value>>>,
     /// Extra headers the caller sent that some vendors care about.
     pub extra_headers: Vec<(String, String)>,
     /// The caller's session id, when it sent one.
@@ -630,11 +700,13 @@ mod tests {
             ContentBlock::Image {
                 media_type: "image/png".into(),
                 data: "QUJD".into(),
+                cache_control: None,
             },
             ContentBlock::ToolResult {
                 tool_use_id: "t1".into(),
                 content: vec![ContentBlock::text("42")],
                 is_error: false,
+                cache_control: None,
             },
         ];
         let rendered: Vec<String> = blocks.iter().map(|b| b.plain_text()).collect();

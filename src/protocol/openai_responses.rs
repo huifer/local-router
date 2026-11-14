@@ -73,6 +73,7 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                             .get("parameters")
                             .cloned()
                             .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                        cache_control: None,
                     });
                 }
                 Some("web_search_preview") | Some("web_search") => {}
@@ -147,6 +148,7 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                                 tool_use_id: call_id.clone(),
                                 content: vec![ContentBlock::text(text)],
                                 is_error: false,
+                                cache_control: None,
                             }],
                             tool_call_id: Some(call_id),
                             name: None,
@@ -386,10 +388,12 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
                     .content
                     .iter()
                     .map(|b| match b {
-                        ContentBlock::Text { text } => {
+                        ContentBlock::Text { text, .. } => {
                             json!({"type": "input_text", "text": text})
                         }
-                        ContentBlock::Image { media_type, data } => {
+                        ContentBlock::Image {
+                            media_type, data, ..
+                        } => {
                             if media_type == "image/url" {
                                 json!({"type": "input_image", "image_url": data})
                             } else {
@@ -407,7 +411,7 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
             Role::Assistant => {
                 for b in &m.content {
                     match b {
-                        ContentBlock::Text { text } => {
+                        ContentBlock::Text { text, .. } => {
                             input.push(json!({
                                 "role": "assistant",
                                 "content": [{"type": "output_text", "text": text}],
@@ -508,7 +512,7 @@ pub fn format_response(resp: &ChatResponse, model: &str) -> Value {
 
     for b in &resp.content {
         match b {
-            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Text { text: t, .. } => text.push_str(t),
             ContentBlock::Thinking { text: t, .. } => reasoning.push_str(t),
             _ => {}
         }

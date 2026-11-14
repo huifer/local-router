@@ -36,17 +36,33 @@ pub struct RoutePlan {
 /// What the router remembers between requests.
 #[derive(Default)]
 struct RouterState {
-    /// How many times each model was asked for.
+    /// How many times each member was asked for.
     usage: HashMap<String, u64>,
+    /// The rolling latency and failure record of each group member. This
+    /// is what makes `smart` different from `usage`: a member that is fast
+    /// and healthy goes first, one that has been failing drops to the back.
+    stats: HashMap<String, MemberStats>,
     /// The cursor each group's rotation is at.
     rotate: HashMap<String, u64>,
-    /// Which target answered which session.
-    affinity: HashMap<String, String>,
+    /// Which target answered which session, and when it was last heard
+    /// from. Sessions age out — an agent that walks away must not cost
+    /// the gateway memory forever.
+    affinity: HashMap<String, (String, std::time::Instant)>,
+    /// Insertion order of the affinity map, so the oldest session falls
+    /// off first when the capacity is hit.
+    affinity_order: std::collections::VecDeque<String>,
     /// The last route of each session, so the routing view can say what
     /// happened. The oldest session falls off when the map is full.
     traces: HashMap<String, RouteTrace>,
     order: std::collections::VecDeque<String>,
 }
+
+/// The capacity of the session-affinity map. A unique session per request
+/// (a load test, a crawler) must not grow the map forever: past this many
+/// sessions the oldest ones are forgotten, and after an hour of silence
+/// an entry is dropped whenever the map is touched.
+const AFFINITY_CAPACITY: usize = 4_096;
+const AFFINITY_TTL: std::time::Duration = std::time::Duration::from_secs(3_600);
 
 /// The route one session last took.
 #[derive(Clone, serde::Serialize)]
@@ -69,6 +85,25 @@ pub struct PlanEntry {
     pub provider: String,
     pub model: String,
     pub key: String,
+}
+
+/// A rolling read on one member's health. All in milliseconds so the
+/// score is an integer and ties stay deterministic.
+#[derive(Default, Clone)]
+struct MemberStats {
+    /// Exponentially weighted latency of successful calls.
+    ewma_ms: u64,
+    /// Recent failures, forgiven one at a time on success.
+    failures: u32,
+}
+
+impl MemberStats {
+    /// Lower is better. A member we have never tried goes first (cold
+    /// start needs a sample); a failure costs three seconds of score.
+    fn score(&self) -> u64 {
+        self.ewma_ms
+            .saturating_add(u64::from(self.failures).saturating_mul(3_000))
+    }
 }
 
 /// The router's memory.
@@ -101,9 +136,40 @@ impl Router {
         self.state.lock().await.traces.get(session).cloned()
     }
 
-    pub async fn note_used(&self, model: &str) {
+    pub async fn note_used(&self, member: &str) {
         let mut state = self.state.lock().await;
-        *state.usage.entry(model.to_string()).or_insert(0) += 1;
+        *state.usage.entry(member.to_string()).or_insert(0) += 1;
+    }
+
+    /// Learn how one group member actually performed. Failed calls are
+    /// penalised without polluting the latency average (a fast 502 is not
+    /// a fast answer); successful calls refresh the EWMA and forgive one
+    /// past failure.
+    pub async fn note_outcome(&self, member: &str, latency_ms: u64, ok: bool) {
+        let mut state = self.state.lock().await;
+        let stats = state.stats.entry(member.to_string()).or_default();
+        if ok {
+            stats.ewma_ms = if stats.ewma_ms == 0 {
+                latency_ms
+            } else {
+                (stats.ewma_ms.saturating_mul(7) + latency_ms) / 8
+            };
+            stats.failures = stats.failures.saturating_sub(1);
+        } else {
+            stats.failures = (stats.failures + 1).min(16);
+        }
+    }
+
+    /// The health score a smart group would sort by, for tests and the
+    /// routing view.
+    pub async fn score_of(&self, member: &str) -> u64 {
+        self.state
+            .lock()
+            .await
+            .stats
+            .get(member)
+            .map(MemberStats::score)
+            .unwrap_or(0)
     }
 
     pub async fn usage_of(&self, model: &str) -> u64 {
@@ -118,18 +184,49 @@ impl Router {
 
     pub async fn note_affinity(&self, session: &str, target_key: &str) {
         let mut state = self.state.lock().await;
+        let now = std::time::Instant::now();
+        if !state.affinity.contains_key(session) {
+            state.affinity_order.push_back(session.to_string());
+        }
         state
             .affinity
-            .insert(session.to_string(), target_key.to_string());
+            .insert(session.to_string(), (target_key.to_string(), now));
+        // Bound the map by both capacity and age. Expired entries are only
+        // reclaimed on writes, which is where growth happens.
+        while state.affinity.len() > AFFINITY_CAPACITY {
+            let Some(oldest) = state.affinity_order.pop_front() else {
+                break;
+            };
+            state.affinity.remove(&oldest);
+        }
+        state
+            .affinity
+            .retain(|_, (_, seen)| now.duration_since(*seen) < AFFINITY_TTL);
+        let alive: std::collections::HashSet<String> = state.affinity.keys().cloned().collect();
+        state.affinity_order.retain(|id| alive.contains(id));
     }
 
     pub async fn affinity_of(&self, session: &str) -> Option<String> {
-        self.state.lock().await.affinity.get(session).cloned()
+        let mut state = self.state.lock().await;
+        let (target, seen) = state.affinity.get(session)?.clone();
+        if std::time::Instant::now().duration_since(seen) >= AFFINITY_TTL {
+            state.affinity.remove(session);
+            return None;
+        }
+        // A live session is refreshed, so capacity eviction keeps the
+        // conversations that are actually still running.
+        state.affinity.insert(
+            session.to_string(),
+            (target.clone(), std::time::Instant::now()),
+        );
+        Some(target)
     }
 
     /// Forget where a session last went, so the next request picks again.
     pub async fn clear_affinity(&self, session: &str) {
-        self.state.lock().await.affinity.remove(session);
+        let mut state = self.state.lock().await;
+        state.affinity.remove(session);
+        state.affinity_order.retain(|id| id != session);
     }
 
     /// Work out who should answer `requested`.
@@ -177,6 +274,15 @@ impl Router {
                 "the provider {provider_id} is turned off"
             )));
         }
+        // A group-only provider must be reached through a routing group:
+        // its models are hidden from the public catalog and cannot be
+        // named directly. This is the enforcement the config field and the
+        // console always advertised.
+        if provider.group_only {
+            return Err(ApiError::NotFound(format!(
+                "the provider {provider_id} is only reachable through a routing group"
+            )));
+        }
         if !provider.models.iter().any(|m| m == &model) {
             return Err(ApiError::NotFound(format!(
                 "the provider {provider_id} does not serve {model}"
@@ -206,7 +312,8 @@ impl Router {
     fn resolve_bare_model(config: &Config, id: &str) -> Result<(String, String), ApiError> {
         let mut found: Option<&str> = None;
         for provider in &config.providers {
-            if !provider.enabled || !provider.models.iter().any(|m| m == id) {
+            if !provider.enabled || provider.group_only || !provider.models.iter().any(|m| m == id)
+            {
                 continue;
             }
             if let Some(previous) = found {
@@ -252,6 +359,24 @@ impl Router {
             )));
         }
 
+        // A price ceiling is applied before ordering, so every routing
+        // mode sees only members the owner is willing to pay for. A model
+        // with no price on file is kept: an unknown cost is not proof of
+        // an expensive one.
+        if let Some(ceiling) = group.max_price.filter(|c| *c >= 0.0) {
+            members.retain(|member| {
+                crate::pricing::price_of(member)
+                    .map(|price| price.input + price.output <= ceiling)
+                    .unwrap_or(true)
+            });
+            if members.is_empty() {
+                return Err(ApiError::BadRequest(format!(
+                    "no member of the group {} costs ${ceiling:.2}/M tokens or less",
+                    group.id
+                )));
+            }
+        }
+
         // Order the members the way the group's routing says.
         let members = match group.routing {
             Routing::Rotate => {
@@ -264,7 +389,23 @@ impl Router {
                 out.rotate_left(offset);
                 out
             }
-            Routing::Usage | Routing::Smart => {
+            Routing::Smart => {
+                let state = self.state.lock().await;
+                let mut scored: Vec<(u64, usize, String)> = members
+                    .iter()
+                    .enumerate()
+                    .map(|(i, m)| {
+                        let health = state.stats.get(m).map(MemberStats::score).unwrap_or(0);
+                        // Usage only breaks ties, so a fast member is not
+                        // displaced just because it answered more often.
+                        let used = state.usage.get(m).copied().unwrap_or(0);
+                        (health + used.min(100), i, m.clone())
+                    })
+                    .collect();
+                scored.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+                scored.into_iter().map(|(_, _, m)| m).collect()
+            }
+            Routing::Usage => {
                 let state = self.state.lock().await;
                 let mut scored: Vec<(u64, usize, String)> = members
                     .iter()
@@ -383,6 +524,13 @@ fn expand_member(
 
 /// Every key of a provider that could serve a model.
 fn targets_for(provider: &Provider, model: &str, asked: &str) -> Vec<Target> {
+    // A public name may be an alias for the id the vendor knows.
+    let upstream_model = provider
+        .model_map
+        .get(model)
+        .map(String::as_str)
+        .unwrap_or(model)
+        .to_string();
     // A provider that authenticates with a local app's session holds no
     // key: it is one target, whose secret is filled in at request time.
     if provider.uses_session() {
@@ -390,10 +538,10 @@ fn targets_for(provider: &Provider, model: &str, asked: &str) -> Vec<Target> {
             provider_id: provider.id.clone(),
             provider_name: provider.name.clone(),
             key_id: "session".to_string(),
-            key_label: Some("登录态".to_string()),
+            key_label: Some("登录态".into()),
             max_concurrency: provider.max_concurrency,
             secret: String::new(),
-            model: model.to_string(),
+            model: upstream_model,
             protocol: provider.protocol,
             asked: asked.to_string(),
         }];
@@ -407,7 +555,7 @@ fn targets_for(provider: &Provider, model: &str, asked: &str) -> Vec<Target> {
             key_label: k.label.clone(),
             max_concurrency: k.max_concurrency.or(provider.max_concurrency),
             secret: k.key.clone(),
-            model: model.to_string(),
+            model: upstream_model.clone(),
             protocol: provider.protocol,
             asked: asked.to_string(),
         })

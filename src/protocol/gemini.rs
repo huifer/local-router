@@ -92,6 +92,7 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                             .get("parameters")
                             .cloned()
                             .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                        cache_control: None,
                     });
                 }
             }
@@ -172,6 +173,7 @@ fn parse_part(p: &Value) -> ContentBlock {
             tool_use_id: name.to_string(),
             content: vec![ContentBlock::text(text)],
             is_error: false,
+            cache_control: None,
         };
     }
     if let Some(inline) = p.get("inlineData").or_else(|| p.get("inline_data")) {
@@ -186,6 +188,7 @@ fn parse_part(p: &Value) -> ContentBlock {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            cache_control: None,
         };
     }
     ContentBlock::text(String::new())
@@ -299,10 +302,12 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
                 let mut parts = Vec::new();
                 for b in &m.content {
                     match b {
-                        ContentBlock::Text { text } => {
+                        ContentBlock::Text { text, .. } => {
                             parts.push(json!({"text": text}));
                         }
-                        ContentBlock::Image { media_type, data } => {
+                        ContentBlock::Image {
+                            media_type, data, ..
+                        } => {
                             if media_type == "image/url" {
                                 parts.push(json!({"text": format!("[image: {data}]")}));
                             } else {
@@ -322,7 +327,7 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
                 let mut parts = Vec::new();
                 for b in &m.content {
                     match b {
-                        ContentBlock::Text { text } => parts.push(json!({"text": text})),
+                        ContentBlock::Text { text, .. } => parts.push(json!({"text": text})),
                         ContentBlock::Thinking { text, .. } => {
                             parts.push(json!({"text": text, "thought": true}))
                         }
@@ -430,7 +435,7 @@ pub fn format_response(resp: &ChatResponse, model: &str) -> Value {
     let mut parts = Vec::new();
     for b in &resp.content {
         match b {
-            ContentBlock::Text { text } => parts.push(json!({"text": text})),
+            ContentBlock::Text { text, .. } => parts.push(json!({"text": text})),
             ContentBlock::Thinking { text, .. } => {
                 parts.push(json!({"text": text, "thought": true}))
             }

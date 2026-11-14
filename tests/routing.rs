@@ -20,6 +20,7 @@ fn provider(id: &str, models: &[&str], keys: usize) -> Provider {
             .map(|_| ProviderKey::new(format!("sk-{id}")))
             .collect(),
         models: models.iter().map(|m| m.to_string()).collect(),
+        model_map: Default::default(),
         auto_include: Vec::new(),
         catalog: None,
         headers: Default::default(),
@@ -37,6 +38,9 @@ fn provider(id: &str, models: &[&str], keys: usize) -> Provider {
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        timeout_secs: None,
+        connect_timeout_secs: None,
+        first_byte_timeout_secs: None,
         schedule: Vec::new(),
         media_models: Vec::new(),
         media_paths: None,
@@ -64,6 +68,8 @@ fn group(id: &str, models: &[&str], routing: Routing) -> Group {
         listed: true,
         alias: None,
         note: None,
+        scenarios: Default::default(),
+        max_price: None,
     }
 }
 
@@ -446,4 +452,249 @@ fn a_listed_alias_appears_in_the_model_catalog() {
     let ids = config.model_ids();
     assert!(ids.contains(&"group/auto".to_string()));
     assert!(ids.contains(&"local-router/auto".to_string()));
+}
+
+// --------------------------------------------------------- group_only --
+// The config field and console always advertised "only reachable through
+// a routing group". Enforced in both the direct plan and the catalog.
+
+#[tokio::test]
+async fn group_only_refuses_a_direct_model_name() {
+    let mut hidden = provider("hidden", &["m1"], 1);
+    hidden.group_only = true;
+    let config = config_with(vec![hidden], vec![]);
+    let router = Router::new();
+    let err = router
+        .plan(&config, "hidden/m1", None, true)
+        .await
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("only reachable through a routing group"));
+    // A bare name must not sneak past the restriction either.
+    let err = router.plan(&config, "m1", None, true).await.unwrap_err();
+    assert!(err.to_string().contains("not a model id"));
+}
+
+#[tokio::test]
+async fn group_only_still_answers_through_its_group() {
+    let mut hidden = provider("hidden", &["m1"], 1);
+    hidden.group_only = true;
+    let config = config_with(
+        vec![hidden],
+        vec![group("auto", &["hidden/m1"], Routing::Order)],
+    );
+    let router = Router::new();
+    let plan = router
+        .plan(&config, "group/auto", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets.len(), 1);
+    assert_eq!(plan.targets[0].provider_id, "hidden");
+}
+
+#[test]
+fn group_only_is_hidden_from_the_model_catalog() {
+    let mut hidden = provider("hidden", &["m1"], 1);
+    hidden.group_only = true;
+    let config = config_with(vec![hidden, provider("open", &["m2"], 1)], vec![]);
+    let ids = config.model_ids();
+    assert!(!ids.iter().any(|id| id.starts_with("hidden/")));
+    assert!(ids.contains(&"open/m2".to_string()));
+}
+
+// ------------------------------------------------------------- smart --
+// Smart is not "least used": it prefers the member that has actually been
+// fast and healthy, and pushes a failing one to the back.
+
+#[tokio::test]
+async fn smart_prefers_the_faster_healthy_member() {
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],
+        vec![group("g", &["a/m1", "b/m2"], Routing::Smart)],
+    );
+    let router = Router::new();
+    router.note_outcome("a/m1", 2_000, true).await;
+    router.note_outcome("b/m2", 200, true).await;
+    router.note_outcome("b/m2", 200, true).await;
+    let plan = router.plan(&config, "group/g", None, true).await.unwrap();
+    assert_eq!(plan.targets[0].provider_id, "b");
+}
+
+#[tokio::test]
+async fn smart_pushes_a_failing_member_to_the_back() {
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],
+        vec![group("g", &["a/m1", "b/m2"], Routing::Smart)],
+    );
+    let router = Router::new();
+    router.note_outcome("a/m1", 100, true).await;
+    router.note_outcome("b/m2", 100, false).await;
+    assert!(router.score_of("b/m2").await >= 3_000);
+    let plan = router.plan(&config, "group/g", None, true).await.unwrap();
+    assert_eq!(plan.targets[0].provider_id, "a");
+    // A success forgives one failure, so recovery is possible.
+    router.note_outcome("b/m2", 100, true).await;
+    assert!(router.score_of("b/m2").await < 3_000);
+}
+
+#[tokio::test]
+async fn an_untried_member_gets_a_first_chance() {
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],
+        vec![group("g", &["a/m1", "b/m2"], Routing::Smart)],
+    );
+    let router = Router::new();
+    router.note_outcome("a/m1", 5_000, true).await;
+    let plan = router.plan(&config, "group/g", None, true).await.unwrap();
+    assert_eq!(plan.targets[0].provider_id, "b");
+}
+
+// ----------------------------------------------------------- model_map --
+// A public name and the vendor's real id are different things.
+
+#[tokio::test]
+async fn model_map_sends_the_vendor_its_own_id() {
+    let mut p = provider("relay", &["clean-name"], 1);
+    p.model_map
+        .insert("clean-name".into(), "opaque-vendor-id-42".into());
+    let config = config_with(vec![p], vec![]);
+    let router = Router::new();
+    let plan = router
+        .plan(&config, "relay/clean-name", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets[0].model, "opaque-vendor-id-42");
+    assert_eq!(plan.targets[0].asked, "relay/clean-name");
+    // The public name is still the one in the catalog.
+    assert!(config.model_ids().contains(&"relay/clean-name".to_string()));
+}
+
+#[tokio::test]
+async fn model_map_applies_to_group_members_too() {
+    let mut p = provider("relay", &["clean-name"], 1);
+    p.model_map.insert("clean-name".into(), "real-id".into());
+    let config = config_with(
+        vec![p],
+        vec![group("auto", &["relay/clean-name"], Routing::Order)],
+    );
+    let router = Router::new();
+    let plan = router
+        .plan(&config, "group/auto", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets[0].model, "real-id");
+}
+
+#[test]
+fn model_map_validation_refuses_empty_and_prefixed_keys() {
+    let mut p = provider("relay", &["m"], 1);
+    p.model_map.insert("m".into(), "".into());
+    let config = config_with(vec![p.clone()], vec![]);
+    assert!(config.validate().is_err());
+    p.model_map.clear();
+    p.model_map.insert("relay/m".into(), "real".into());
+    let config = config_with(vec![p], vec![]);
+    assert!(config.validate().is_err());
+}
+
+// ----------------------------------------------------------- scenarios --
+// One group serves different request shapes with different members.
+
+#[test]
+fn scenarios_pick_by_specificity() {
+    use local_router::config::{choose_scenario, Scenarios};
+    let sc = Scenarios {
+        background: Some("group/cheap".into()),
+        think: Some("group/reason".into()),
+        long_context: Some("group/long".into()),
+        long_context_tokens: Some(50_000),
+    };
+    // A huge conversation wins even when it also wants reasoning.
+    assert_eq!(
+        choose_scenario(&sc, true, true, None, 80_000),
+        Some("long_context")
+    );
+    assert_eq!(
+        choose_scenario(&sc, true, true, None, 10_000),
+        Some("think")
+    );
+    // A cheap throwaway call: no tools, tiny output budget.
+    assert_eq!(
+        choose_scenario(&sc, false, false, Some(256), 1_000),
+        Some("background")
+    );
+    // An agentic call with tools is never background.
+    assert_eq!(choose_scenario(&sc, false, true, Some(256), 1_000), None);
+    // No configured scenario, no match.
+    assert_eq!(
+        choose_scenario(&Scenarios::default(), true, true, None, 80_000),
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_scenario_routes_the_group_elsewhere() {
+    let mut auto = group("auto", &["a/m1"], Routing::Order);
+    auto.scenarios.background = Some("group/cheap".into());
+    let cheap = group("cheap", &["b/m2"], Routing::Order);
+    let config = config_with(
+        vec![provider("a", &["m1"], 1), provider("b", &["m2"], 1)],
+        vec![auto, cheap],
+    );
+    let router = Router::new();
+    // The default member answers a normal request.
+    let plan = router
+        .plan(&config, "group/auto", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets[0].provider_id, "a");
+    // The scenario target answers when asked for directly (the gateway
+    // resolves the scenario before the plan).
+    let plan = router
+        .plan(&config, "group/cheap", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets[0].provider_id, "b");
+}
+
+// ---------------------------------------------------------- price cap --
+// A group can refuse members that cost more than its ceiling. Unknown
+// prices are kept: no price on file is not proof of an expensive model.
+
+#[tokio::test]
+async fn a_price_ceiling_drops_expensive_members() {
+    let mut g = group(
+        "budget",
+        &["cheap/gpt-4o-mini", "rich/claude-opus-4-5"],
+        Routing::Order,
+    );
+    g.max_price = Some(1.0); // $1/M input+output
+    let config = config_with(
+        vec![
+            provider("cheap", &["gpt-4o-mini"], 1),
+            provider("rich", &["claude-opus-4-5"], 1),
+        ],
+        vec![g],
+    );
+    let router = Router::new();
+    let plan = router
+        .plan(&config, "group/budget", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets.len(), 1);
+    assert_eq!(plan.targets[0].provider_id, "cheap");
+}
+
+#[tokio::test]
+async fn unpriced_members_survive_a_price_ceiling() {
+    let mut g = group("budget", &["custom/unknown"], Routing::Order);
+    g.max_price = Some(0.01);
+    let config = config_with(vec![provider("custom", &["unknown"], 1)], vec![g]);
+    let router = Router::new();
+    let plan = router
+        .plan(&config, "group/budget", None, true)
+        .await
+        .unwrap();
+    assert_eq!(plan.targets.len(), 1);
 }

@@ -1,6 +1,7 @@
 //! local-router: a local gateway that gives every coding agent every model.
 
 pub mod agents;
+pub mod alerts;
 pub mod config;
 pub mod dashboard;
 pub mod gateway;

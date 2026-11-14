@@ -1282,10 +1282,16 @@ async fn test_provider(
         .models
         .first()
         .context("the provider exposes no model")?;
-    if gateway::cooldown::provider_is_cooling(&provider.id).await {
+    let test_key_id = provider
+        .enabled_keys()
+        .next()
+        .map(|k| k.id.clone())
+        .unwrap_or_else(|| "session".into());
+    if gateway::cooldown::account_is_cooling(&provider.id, &test_key_id).await {
         anyhow::bail!(
-            "{} is cooling down after a 429; try again shortly",
-            provider.id
+            "{} key {} is cooling down after a 429; try again shortly",
+            provider.id,
+            test_key_id
         );
     }
     let started = std::time::Instant::now();
@@ -2286,6 +2292,8 @@ async fn group_cmd(cmd: GroupCmd) -> anyhow::Result<()> {
                 listed: true,
                 alias: None,
                 note: None,
+                scenarios: Default::default(),
+                max_price: None,
             });
             save_config(&config)?;
             println!("added the group {id}");

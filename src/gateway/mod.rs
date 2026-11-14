@@ -200,12 +200,25 @@ impl Gateway {
         provider_id: &str,
         provider: &Provider,
     ) -> anyhow::Result<reqwest::Client> {
+        // The timeouts are client-level settings, so changing them must
+        // rebuild the client rather than reuse a cached one.
+        let key = format!(
+            "{provider_id}:{}:{}:{}:{}",
+            provider
+                .timeout_secs
+                .unwrap_or(client::DEFAULT_TIMEOUT_SECS),
+            provider
+                .connect_timeout_secs
+                .unwrap_or(client::DEFAULT_CONNECT_TIMEOUT_SECS),
+            provider.first_byte_timeout_secs.unwrap_or(0),
+            provider.proxy.as_deref().unwrap_or(""),
+        );
         let mut cache = self.clients.lock().await;
-        if let Some(c) = cache.get(provider_id) {
+        if let Some(c) = cache.get(&key) {
             return Ok(c.clone());
         }
         let c = client::build_client(provider)?;
-        cache.insert(provider_id.to_string(), c.clone());
+        cache.insert(key, c.clone());
         Ok(c)
     }
 }
@@ -343,19 +356,31 @@ async fn list_models(State(g): State<Gateway>, headers: HeaderMap) -> Response {
     let mut data = Vec::new();
     let created = chrono::Utc::now().timestamp();
     for p in &config.providers {
-        if !p.enabled {
+        if !p.enabled || p.group_only {
             continue;
         }
         for m in &p.models {
-            data.push(json!({
-                "id": format!("{}/{}", p.id, m),
+            let public = format!("{}/{}", p.id, m);
+            let real = p.model_map.get(m).map(String::as_str).unwrap_or(m);
+            let price =
+                crate::pricing::price_of(real).or_else(|| crate::pricing::price_of(&public));
+            let mut entry = json!({
+                "id": public,
                 "object": "model",
                 "created": created,
                 "owned_by": p.id,
                 "display_name": format!("{} · {}", p.name, m),
                 "modalities": {"input": ["text"], "output": ["text"]},
                 "native_endpoints": ["/v1/chat/completions"],
-            }));
+            });
+            if let Some(price) = price {
+                entry["pricing"] = json!({
+                    "input_per_million_usd": price.input,
+                    "output_per_million_usd": price.output,
+                    "cache_read_per_million_usd": price.cache_read,
+                });
+            }
+            data.push(entry);
         }
         // The media models are listed too, so a client can find out which
         // model draws or films.
@@ -729,8 +754,11 @@ async fn authorized_caller(g: &Gateway, headers: &HeaderMap) -> Result<CallerIde
 }
 
 /// The caller key's own rate limits, when the config gives it any. The
-/// built-in identities (`default`, `env-default`) carry no limits.
-async fn caller_rate_limits(g: &Gateway, caller: &CallerIdentity) -> Result<(), String> {
+/// built-in identities (`default`, `env-default`) carry no limits. The
+/// second value is the wait the client should honour, surfaced as a
+/// `Retry-After` header so an agent can pace itself instead of blind-
+/// retrying into the same wall.
+async fn caller_rate_limits(g: &Gateway, caller: &CallerIdentity) -> Result<(), (String, u64)> {
     let key = {
         let config = g.state.config.read().await;
         config
@@ -746,10 +774,13 @@ async fn caller_rate_limits(g: &Gateway, caller: &CallerIdentity) -> Result<(), 
     match g
         .state
         .rate_limits
-        .check(&scope, key.rpm, key.tpm, key.daily_tokens)
+        .check(&scope, key.rpm, key.tpm, key.daily_tokens, key.monthly_cost)
     {
         rate_limit::Decision::Allow => Ok(()),
-        rate_limit::Decision::Limited { reason, .. } => Err(reason),
+        rate_limit::Decision::Limited {
+            reason,
+            retry_after_secs,
+        } => Err((reason, retry_after_secs)),
     }
 }
 
@@ -785,6 +816,9 @@ fn check_auth_identity(g: &Gateway, headers: &HeaderMap) -> Result<CallerIdentit
         .iter()
         .find(|k| k.enabled && k.key == presented)
     {
+        if key.is_expired(chrono::Utc::now()) {
+            return Err(ApiError::Unauthorized("that key has expired".into()));
+        }
         return Ok(CallerIdentity {
             id: key.id.clone(),
             label: key.name.clone(),
@@ -1477,9 +1511,25 @@ async fn handle(
         Err(e) => return error_response(&e),
     };
     // The caller key's own throttle, before any routing happens. A refused
-    // caller is refused outright: there is no other target to try.
-    if let Err(limits) = caller_rate_limits(&g, &caller).await {
-        return error_response(&ApiError::RateLimited(limits));
+    // caller is refused outright: there is no other target to try. The
+    // Retry-After header lets a well-behaved agent pace itself.
+    if let Err((reason, retry_after_secs)) = caller_rate_limits(&g, &caller).await {
+        let endpoint = g.state.config.read().await.settings.alert_webhook.clone();
+        g.state.alerts.emit(
+            endpoint.as_deref(),
+            "budget",
+            &format!("caller {} refused: {}", caller.id, reason),
+            &format!("budget:{}:{}", caller.id, reason),
+        );
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [
+                ("retry-after", retry_after_secs.to_string()),
+                ("x-ratelimit-scope", format!("caller:{}", caller.id)),
+            ],
+            Json(json!({"error": {"type": "rate_limit_error", "message": reason}})),
+        )
+            .into_response();
     }
     // The CLI or the web page may have changed the file.
     g.state.sync().await;
@@ -1517,6 +1567,11 @@ async fn handle(
     };
     request.caller_key_id = Some(caller.id);
     request.caller_key_label = Some(caller.label);
+    // Keep the caller's own JSON for a same-protocol relay: the IR models
+    // the common fields, and the rest (structured-output schemas, seed,
+    // prompt-caching markers, vendor beta switches) must not be lost.
+    // `upstream_body` only uses it when inbound == outbound protocol.
+    request.raw_request = value.as_object().map(|m| std::sync::Arc::new(m.clone()));
 
     // The agent's own session id, when it sent one: in the body like
     // Anthropic does, or a header like every other tool does.
@@ -1631,11 +1686,59 @@ async fn handle(
         )
     });
 
+    // Scenario routing: a group may send background / think / long-context
+    // requests to different members. Resolved before the plan so schedule
+    // filtering and the trace all see the final target list; the
+    // caller-visible model name stays what the caller asked for.
+    let scenario: Option<(&'static str, String)> = {
+        let config = g.state.config.read().await;
+        let group = config
+            .group_by_alias(&request.model)
+            .or_else(|| config.group(request.model.strip_prefix("group/").unwrap_or("")))
+            .filter(|g| !g.scenarios.is_empty());
+        match group {
+            Some(group) => {
+                let reasoning = !matches!(
+                    request.reasoning_effort,
+                    None | Some(crate::protocol::ir::ReasoningEffort::None)
+                );
+                crate::config::choose_scenario(
+                    &group.scenarios,
+                    reasoning,
+                    !request.tools.is_empty(),
+                    request.max_tokens,
+                    context.prompt_tokens,
+                )
+                .and_then(|name| {
+                    let target = match name {
+                        "background" => group.scenarios.background.clone(),
+                        "think" => group.scenarios.think.clone(),
+                        "long_context" => group.scenarios.long_context.clone(),
+                        _ => None,
+                    };
+                    target.map(|target| (name, target))
+                })
+            }
+            None => None,
+        }
+    };
+    if let Some((name, target)) = &scenario {
+        tracing::info!(
+            "{} matched the {} scenario and routes to {target}",
+            request.model,
+            name
+        );
+    }
+
     let (mut plan, send_agent_ua, masking) = {
         let config = g.state.config.read().await;
+        let planned_for = scenario
+            .as_ref()
+            .map(|(_, target)| target.as_str())
+            .unwrap_or(request.model.as_str());
         match g
             .router
-            .plan(&config, &request.model, session.as_deref(), has_history)
+            .plan(&config, planned_for, session.as_deref(), has_history)
             .await
         {
             Ok(p) => (
@@ -1663,6 +1766,23 @@ async fn handle(
 
     let asked = request.model.clone();
     let stream = request.stream;
+
+    // The caller key's model allow-list is checked before routing: a key
+    // given to one machine must not reach models it was never meant to.
+    {
+        let config = g.state.config.read().await;
+        if let Some(key) = config
+            .caller_keys
+            .iter()
+            .find(|k| k.enabled && Some(&k.id) == request.caller_key_id.as_ref())
+        {
+            if !key.allows_model(&asked) {
+                return error_response(&ApiError::Unauthorized(format!(
+                    "that key is not allowed to use {asked}"
+                )));
+            }
+        }
+    }
 
     // Targets outside their usage windows leave the plan before anything
     // else looks at it — the special session channels below pick their
@@ -1849,6 +1969,7 @@ async fn handle(
 
     let mut last_error: ApiError = ApiError::Upstream("no target could answer".into());
     for (index, target) in plan.targets.clone().into_iter().enumerate() {
+        let attempt_started = Instant::now();
         // Every attempt at a vendor hangs under this request's span.
         let link = TraceLink {
             context: trace_ctx.clone(),
@@ -1881,10 +2002,15 @@ async fn handle(
                 }
             }
         }
-        // A provider in its 429 cooldown is skipped without sending it
-        // anything: hammering the vendor that just said "slow down" only
-        // makes the limit last longer. The next target answers instead.
-        if g.cooldowns.provider_is_cooling(&target.provider_id).await {
+        // A provider (or one of its keys) in its 429 cooldown is skipped
+        // without sending it anything: hammering the vendor that just said
+        // "slow down" only makes the limit last longer. Stored keys are
+        // cooled individually, so an exhausted key does not park the rest
+        // of its pool.
+        if g.cooldowns
+            .account_is_cooling(&target.provider_id, &target.key_id)
+            .await
+        {
             last_error = ApiError::RateLimited(format!(
                 "the provider {} is cooling down after a 429; try again shortly",
                 target.provider_id
@@ -1922,6 +2048,7 @@ async fn handle(
             &rate_limit::provider_scope(&target.provider_id),
             provider.rpm,
             provider.tpm,
+            None,
             None,
         ) {
             last_error = ApiError::RateLimited(format!(
@@ -1970,11 +2097,22 @@ async fn handle(
         };
         match result {
             Ok(response) => {
-                g.router.note_used(&asked).await;
+                // The member name, not the requested name: a group's usage
+                // and health counters are keyed by `provider/model`.
+                g.router.note_used(&target.asked).await;
+                g.router
+                    .note_outcome(
+                        &target.asked,
+                        attempt_started.elapsed().as_millis() as u64,
+                        true,
+                    )
+                    .await;
                 // The provider answered: its past 429s are forgiven, so a
                 // single unlucky rate limit hours later starts at the
-                // short cooldown again.
-                g.cooldowns.clear(&target.provider_id, None).await;
+                // short cooldown again. Clear the key's own entry too.
+                g.cooldowns
+                    .clear(&target.provider_id, Some(&target.key_id))
+                    .await;
                 if let Some(session) = &session {
                     g.router.note_affinity(session, &target.key_id).await;
                     note_route_trace(
@@ -2014,17 +2152,45 @@ async fn handle(
                     // which vendor refused, and why the request moved on.
                     persist_span(&g.state, &g.sqlite, &upstream_span(&link, &rec));
                 }
-                // A rate limit puts the provider into a global cooldown:
-                // nothing is sent its way until it is over, so an agent's
-                // retries cannot keep poking a vendor that said stop.
+                // A rate limit cools only the key that hit it. The vendor's
+                // Retry-After decides how long; exponential backoff still
+                // applies when it would wait longer.
                 if matches!(err, ApiError::RateLimited(_)) {
-                    g.cooldowns.penalize(&target.provider_id, None).await;
+                    let retry_after = rec.retry_after_secs.map(std::time::Duration::from_secs);
+                    g.cooldowns
+                        .penalize_key(&target.provider_id, &target.key_id, retry_after)
+                        .await;
                     tracing::warn!(
-                        "{} answered 429 — cooling down before it is asked again",
-                        target.provider_id
+                        "{} key {} answered 429 — cooling down before it is asked again{}",
+                        target.provider_id,
+                        target.key_id,
+                        rec.retry_after_secs
+                            .map(|s| format!(" (Retry-After {s}s)"))
+                            .unwrap_or_default(),
+                    );
+                    let endpoint = g.state.config.read().await.settings.alert_webhook.clone();
+                    g.state.alerts.emit(
+                        endpoint.as_deref(),
+                        "cooldown",
+                        &format!(
+                            "{} key {} entered 429 cooldown{}",
+                            target.provider_id,
+                            target.key_id,
+                            rec.retry_after_secs
+                                .map(|s| format!(" for {s}s"))
+                                .unwrap_or_default(),
+                        ),
+                        &format!("cooldown:{}:{}", target.provider_id, target.key_id),
                     );
                 }
                 last_error = err;
+                g.router
+                    .note_outcome(
+                        &target.asked,
+                        attempt_started.elapsed().as_millis() as u64,
+                        false,
+                    )
+                    .await;
                 if !last_error.retryable() {
                     break;
                 }
@@ -2154,16 +2320,54 @@ fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::U
     // success and failure paths of every upstream attempt come through, and
     // only the attempt that actually saw tokens carries any.
     let tokens = rec.input_tokens.saturating_add(rec.output_tokens);
-    if tokens > 0 {
+    // Priced requests also feed the caller key's monthly USD budget. A
+    // scope with no configured limit has no window, so recording is a
+    // no-op for it (the same discipline as the token windows).
+    let cost = if rec.ok { rec.cost_usd } else { None };
+    if tokens > 0 || cost.is_some() {
         if !rec.provider.is_empty() {
             state
                 .rate_limits
-                .record(&rate_limit::provider_scope(&rec.provider), tokens);
+                .record(&rate_limit::provider_scope(&rec.provider), tokens, None);
         }
         if let Some(caller_id) = &rec.caller_key_id {
             state
                 .rate_limits
-                .record(&rate_limit::caller_scope(caller_id), tokens);
+                .record(&rate_limit::caller_scope(caller_id), tokens, cost);
+            // Soft budget warning at 80%, before the hard 429. Read the
+            // live config so a console change takes effect immediately.
+            if cost.is_some() {
+                let (limit, endpoint) = {
+                    let config = match state.config.try_read() {
+                        Ok(config) => config,
+                        Err(_) => return,
+                    };
+                    (
+                        config
+                            .caller_keys
+                            .iter()
+                            .find(|k| &k.id == caller_id && k.enabled)
+                            .and_then(|k| k.monthly_cost),
+                        config.settings.alert_webhook.clone(),
+                    )
+                };
+                if let Some(limit) = limit.filter(|l| *l > 0.0) {
+                    let spent = state
+                        .rate_limits
+                        .cost_this_month(&rate_limit::caller_scope(caller_id));
+                    if spent >= limit * 0.8 && spent < limit {
+                        let month = chrono::Utc::now().format("%Y-%m").to_string();
+                        state.alerts.emit(
+                            endpoint.as_deref(),
+                            "budget_warning",
+                            &format!(
+                                "caller {caller_id} has spent ${spent:.2} of its ${limit:.2} monthly budget (80%)"
+                            ),
+                            &format!("budget80:{caller_id}:{month}"),
+                        );
+                    }
+                }
+            }
         }
     }
     if let Some(store) = sqlite {
@@ -2285,14 +2489,33 @@ fn upstream_body(
     model: &str,
     trace: Option<&client::TraceHeaders>,
     trace_metadata: bool,
+    caller_protocol: Protocol,
 ) -> Value {
-    let mut body = match protocol {
+    // The caller spoke the same protocol the upstream speaks: forward the
+    // caller's own body instead of rebuilding it. The IR models the common
+    // fields, but a body can carry more than the IR knows (`response_format`
+    // with a JSON schema, `seed`, penalties, a vendor's beta switches,
+    // Anthropic prompt-caching breakpoints). Rebuilt bodies drop those;
+    // a relayed body keeps them. Only the model name changes, plus the
+    // trace metadata below.
+    let relayed = if protocol == caller_protocol {
+        request.raw_request.as_ref().map(|raw| {
+            let mut raw = (**raw).clone();
+            if raw.contains_key("model") {
+                raw.insert("model".into(), json!(model));
+            }
+            Value::Object(raw)
+        })
+    } else {
+        None
+    };
+    let mut body = relayed.unwrap_or_else(|| match protocol {
         Protocol::OpenAiChat => openai_chat::format_request(request, model),
         Protocol::OpenAiResponses => openai_responses::format_request(request, model),
         Protocol::Anthropic => anthropic::format_request(request, model),
         Protocol::Gemini => gemini::format_request(request, model),
         Protocol::QwenWork => openai_chat::format_request(request, model),
-    };
+    });
     // The Responses protocol keeps business metadata with the request, so a
     // vendor that records it can be read back into ours.
     if trace_metadata {
@@ -2307,7 +2530,16 @@ fn upstream_body(
                 if let Some(task) = &trace.task_id {
                     metadata.insert("task_id".into(), json!(task));
                 }
-                body["metadata"] = Value::Object(metadata);
+                match body.get_mut("metadata") {
+                    Some(Value::Object(existing)) => {
+                        for (key, value) in metadata {
+                            existing.insert(key, value);
+                        }
+                    }
+                    _ => {
+                        body["metadata"] = Value::Object(metadata);
+                    }
+                }
             }
         }
     }
@@ -2581,10 +2813,40 @@ pub(crate) fn mask_request_secrets(request: &mut ChatRequest) {
             .flat_map(|m| m.content.iter_mut()),
     ) {
         match block {
-            ContentBlock::Text { text } => *text = mask_secrets(text),
+            ContentBlock::Text { text, .. } => *text = mask_secrets(text),
             ContentBlock::ToolUse { input, .. } => mask_value_secrets(input),
             _ => {}
         }
+    }
+    // A same-protocol relay forwards the caller's body verbatim, so the
+    // mask has to be applied to the raw copy as well — otherwise a raw
+    // relay would silently bypass the secret masking the IR path gets.
+    // Word-level masking only: key-name heuristics would clobber legitimate
+    // fields such as `prompt_cache_key`.
+    if let Some(raw) = &mut request.raw_request {
+        let mut value = Value::Object((**raw).clone());
+        mask_raw_strings(&mut value);
+        if let Value::Object(masked) = value {
+            *raw = std::sync::Arc::new(masked);
+        }
+    }
+}
+
+/// Mask secret-looking words in every string of a raw request body.
+fn mask_raw_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => *s = mask_secrets(s),
+        Value::Array(items) => {
+            for item in items {
+                mask_raw_strings(item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                mask_raw_strings(item);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2710,7 +2972,7 @@ pub fn build_qwen_body(request: &ChatRequest, model: &str) -> crate::qwen::clien
         .system
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Text { text } => Some(text.clone()),
+            ContentBlock::Text { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -2719,7 +2981,7 @@ pub fn build_qwen_body(request: &ChatRequest, model: &str) -> crate::qwen::clien
         .iter()
         .map(|m| {
             let content: Vec<crate::qwen::client::QwenContent> = match m.content.as_slice() {
-                [ContentBlock::Text { text }] => {
+                [ContentBlock::Text { text, .. }] => {
                     vec![crate::qwen::client::QwenContent::Text(text.clone())]
                 }
                 [ContentBlock::Image { data, .. }] => {
@@ -2812,6 +3074,7 @@ async fn whole_attempt(
         &target.model,
         trace_meta.as_ref(),
         trace_metadata,
+        caller_protocol,
     );
     // A vendor that only answers streaming requests is asked for a stream
     // even when the caller wants one whole reply.
@@ -2846,9 +3109,12 @@ async fn whole_attempt(
             return Err((ApiError::Upstream(err.to_string()), rec));
         }
     };
+    // The vendor's own wait hint travels with the attempt, so a 429 can
+    // cool the key for exactly as long as the vendor asked.
+    rec.retry_after_secs = reply.retry_after();
     let (status, payload) = match reply {
-        UpstreamReply::Whole { status, body } => (status, body),
-        UpstreamReply::Stream { status, bytes } => {
+        UpstreamReply::Whole { status, body, .. } => (status, body),
+        UpstreamReply::Stream { status, bytes, .. } => {
             // The vendor only speaks streaming: fold the events back into
             // one reply for the caller.
             let events = collect_stream(bytes, target.protocol).await;
@@ -2958,6 +3224,7 @@ async fn stream_attempt(
         &target.model,
         trace_meta.as_ref(),
         trace_metadata,
+        caller_protocol,
     );
     if provider.stream_only {
         body["stream"] = json!(true);
@@ -2988,16 +3255,45 @@ async fn stream_attempt(
             return Err((ApiError::Upstream(err.to_string()), rec));
         }
     };
+    rec.retry_after_secs = reply.retry_after();
     match reply {
-        UpstreamReply::Stream { status, bytes } => {
+        UpstreamReply::Stream { status, bytes, .. } => {
             if !(200..300).contains(&status) {
-                return Err((
-                    ApiError::Upstream("the upstream refused the stream".into()),
-                    rec,
-                ));
+                // Defensive: `client::send` normally turns a non-2xx into
+                // a Whole reply, but keep the status and the vendor's text
+                // if a stream ever arrives with one.
+                let err = match status {
+                    401 | 403 => ApiError::Unauthorized(format!(
+                        "the upstream refused the stream (HTTP {status})"
+                    )),
+                    429 => ApiError::RateLimited(format!(
+                        "the upstream refused the stream (HTTP {status})"
+                    )),
+                    _ => ApiError::Upstream(format!(
+                        "the upstream refused the stream (HTTP {status})"
+                    )),
+                };
+                rec.status = status;
+                return Err((err, rec));
             }
             rec.status = status;
             crate::pricing::price_record(&mut rec);
+            // Before the first byte, nothing has reached the caller: a
+            // hung vendor can still be swapped for the next target.
+            let bytes = match client::await_first_byte(
+                bytes,
+                provider
+                    .first_byte_timeout_secs
+                    .map(std::time::Duration::from_secs),
+            )
+            .await
+            {
+                Ok(stream) => stream,
+                Err(err) => {
+                    rec.latency_ms = started.elapsed().as_millis() as u64;
+                    return Err((ApiError::Upstream(err), rec));
+                }
+            };
             let usage_path = g.state.usage_path();
             let record_usage = g.state.config.read().await.settings.record_usage;
             Ok(build_stream(
@@ -3014,7 +3310,7 @@ async fn stream_attempt(
                 link.cloned(),
             ))
         }
-        UpstreamReply::Whole { status, body } => {
+        UpstreamReply::Whole { status, body, .. } => {
             if !(200..300).contains(&status) {
                 return Err((
                     if status == 429 {
@@ -3050,7 +3346,7 @@ async fn stream_attempt(
             let mut text_open = false;
             for block in &parsed.content {
                 match block {
-                    ContentBlock::Text { text } => {
+                    ContentBlock::Text { text, .. } => {
                         if !text.is_empty() {
                             events.push(StreamEvent::ContentBlockStart {
                                 index,
@@ -3251,6 +3547,19 @@ fn events_to_stream(
         .unwrap()
 }
 
+/// Whether an event carries the first actual content (not the envelope).
+/// MessageStart and ContentBlockStart are framing; the clock stops when a
+/// token, a thought or a tool call actually arrives.
+fn first_content_event(ev: &StreamEvent) -> bool {
+    matches!(
+        ev,
+        StreamEvent::TextDelta { .. }
+            | StreamEvent::ThinkingDelta { .. }
+            | StreamEvent::ToolUseStart { .. }
+            | StreamEvent::ToolInputDelta { .. }
+    )
+}
+
 /// Turn a vendor's byte stream into the caller's event stream.
 #[allow(clippy::too_many_arguments)]
 fn build_stream(
@@ -3290,6 +3599,7 @@ fn build_stream(
         let mut renderer = make_renderer(caller_protocol, id.clone(), asked_model.clone());
         let mut events: Vec<StreamEvent> = Vec::new();
         let mut buffer = String::new();
+        let mut first_token_sent = false;
 
         while let Some(item) = upstream.next().await {
             let chunk = match item {
@@ -3307,6 +3617,11 @@ fn build_stream(
                 if let Some(value) = client::parse_frame(&frame) {
                     collector.push(&value, &mut events);
                     for ev in events.drain(..) {
+                        if !first_token_sent && first_content_event(&ev) {
+                            first_token_sent = true;
+                            guard.rec.ttft_ms =
+                                Some(started.elapsed().as_millis() as u64);
+                        }
                         guard.rec.note_usage(&ev);
                         for out in renderer(&ev) {
                             yield bytes::Bytes::from(out.encode());
@@ -3317,6 +3632,10 @@ fn build_stream(
         }
         collector.finish(&mut events);
         for ev in events.drain(..) {
+            if !first_token_sent && first_content_event(&ev) {
+                first_token_sent = true;
+                guard.rec.ttft_ms = Some(started.elapsed().as_millis() as u64);
+            }
             guard.rec.note_usage(&ev);
             for out in renderer(&ev) {
                 yield bytes::Bytes::from(out.encode());
@@ -3490,5 +3809,93 @@ mod tests {
         mask_request_secrets(&mut request);
         assert!(request.system[0].plain_text().contains("***MASKED***"));
         assert!(request.messages[0].text().contains("***MASKED***"));
+    }
+
+    // ---------------------------------------------- same-protocol relay --
+    // The IR only models the fields every protocol shares. When the caller
+    // and the upstream speak the same protocol, the caller's own body is
+    // forwarded, so structured outputs, seeds and beta switches survive.
+
+    #[test]
+    fn same_protocol_relay_keeps_unknown_fields_and_rewrites_the_model() {
+        let raw: serde_json::Map<String, Value> = serde_json::from_value(json!({
+            "model": "group/auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_schema", "json_schema": {"name": "answer"}},
+            "seed": 42,
+            "logprobs": true,
+        }))
+        .unwrap();
+        let request = ChatRequest {
+            raw_request: Some(std::sync::Arc::new(raw)),
+            ..ChatRequest::default()
+        };
+        let body = upstream_body(
+            &request,
+            Protocol::OpenAiChat,
+            "upstream-id",
+            None,
+            false,
+            Protocol::OpenAiChat,
+        );
+        assert_eq!(body["model"], "upstream-id");
+        assert_eq!(body["response_format"]["type"], "json_schema");
+        assert_eq!(body["seed"], 42);
+        assert_eq!(body["logprobs"], true);
+    }
+
+    #[test]
+    fn cross_protocol_falls_back_to_the_ir_body() {
+        let raw: serde_json::Map<String, Value> = serde_json::from_value(json!({
+            "model": "group/auto",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {"type": "json_object"},
+        }))
+        .unwrap();
+        let mut request = openai_chat::parse_request(&Value::Object(raw.clone())).unwrap();
+        request.raw_request = Some(std::sync::Arc::new(raw));
+        let body = upstream_body(
+            &request,
+            Protocol::Anthropic,
+            "upstream-id",
+            None,
+            false,
+            Protocol::OpenAiChat,
+        );
+        // Rebuilt in Anthropic's shape: no OpenAI-only field leaks through.
+        assert_eq!(body["model"], "upstream-id");
+        assert_eq!(body["max_tokens"], 8192);
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hi");
+    }
+
+    #[test]
+    fn relay_body_is_masked_like_the_ir_path() {
+        let raw: serde_json::Map<String, Value> = serde_json::from_value(json!({
+            "model": "group/auto",
+            "messages": [{"role": "user",
+                          "content": "my key is sk-abcdef1234567890abcdef keep it"}],
+            "prompt_cache_key": "session-42",
+        }))
+        .unwrap();
+        let mut request = ChatRequest {
+            raw_request: Some(std::sync::Arc::new(raw)),
+            ..ChatRequest::default()
+        };
+        mask_request_secrets(&mut request);
+        let body = upstream_body(
+            &request,
+            Protocol::OpenAiChat,
+            "upstream-id",
+            None,
+            false,
+            Protocol::OpenAiChat,
+        );
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("***MASKED***"));
+        // Word-level masking leaves legitimate fields alone.
+        assert_eq!(body["prompt_cache_key"], "session-42");
     }
 }

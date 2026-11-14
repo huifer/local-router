@@ -152,6 +152,13 @@ pub struct Provider {
     /// The model ids local-router exposes for this provider.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Rename on the way out: `{"public-name": "real-upstream-id"}`.
+    /// Without a map, a name in `models` is both what callers ask for and
+    /// what the vendor receives. With one, the public name is resolved to
+    /// the real id before the request is sent, so a relay's opaque model
+    /// ids can be given clean, stable local names.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_map: BTreeMap<String, String>,
     /// Glob patterns: a newly listed model matching one is exposed.
     #[serde(default)]
     pub auto_include: Vec<String>,
@@ -219,6 +226,20 @@ pub struct Provider {
     /// The most tokens per minute this provider may take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tpm: Option<u64>,
+    /// Total timeout for one upstream call, in seconds. None means the
+    /// built-in default (600s) — long enough for a slow model, but a hung
+    /// vendor can stall an agent for ten minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// TCP connection timeout, in seconds (default 20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connect_timeout_secs: Option<u64>,
+    /// How long to wait for the first streamed byte before giving up on
+    /// this target and failing over. None means no separate first-byte
+    /// deadline (the total timeout still applies). Applies only when the
+    /// stream has not started yet, so a slow-but-live reply is not cut.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_byte_timeout_secs: Option<u64>,
     /// Daily usage windows: the provider's models only serve inside them
     /// (e.g. a night-quota account at 22:00–08:00). Outside a window a
     /// group skips this provider without a cooldown; a direct request is
@@ -248,6 +269,7 @@ impl Default for Provider {
             gemini_base_url: None,
             keys: Vec::new(),
             models: Vec::new(),
+            model_map: BTreeMap::new(),
             auto_include: Vec::new(),
             catalog: None,
             headers: BTreeMap::new(),
@@ -265,6 +287,9 @@ impl Default for Provider {
             max_concurrency: None,
             rpm: None,
             tpm: None,
+            timeout_secs: None,
+            connect_timeout_secs: None,
+            first_byte_timeout_secs: None,
             schedule: Vec::new(),
             media_models: Vec::new(),
             media_paths: None,
@@ -396,6 +421,62 @@ pub struct Group {
     pub alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Scenario routes: the same group serves different request shapes
+    /// with different models. `background` catches cheap throwaway calls
+    /// (no tools, tiny output budget), `think` catches reasoning requests,
+    /// `long_context` catches conversations past a token threshold. The
+    /// value is another `group/id` or `provider/model`; the matched
+    /// scenario wins over the group's own member list.
+    #[serde(default, skip_serializing_if = "Scenarios::is_empty")]
+    pub scenarios: Scenarios,
+    /// Only try members whose input+output price is at or below this
+    /// number of USD per million tokens. Unpriced models are kept — the
+    /// gateway cannot prove they are expensive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_price: Option<f64>,
+}
+
+/// Per-scenario overrides for a group. Empty fields mean "no override".
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Scenarios {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub think: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context: Option<String>,
+    /// The token threshold `long_context` fires at (default 60_000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub long_context_tokens: Option<u64>,
+}
+
+impl Scenarios {
+    pub fn is_empty(&self) -> bool {
+        self.background.is_none() && self.think.is_none() && self.long_context.is_none()
+    }
+}
+
+/// Which scenario a request falls into, most specific first: a huge
+/// conversation is a long-context request even when it also wants
+/// reasoning; a reasoning request is never a background task.
+pub fn choose_scenario(
+    scenarios: &Scenarios,
+    reasoning: bool,
+    has_tools: bool,
+    max_tokens: Option<u32>,
+    prompt_tokens: u64,
+) -> Option<&'static str> {
+    let threshold = scenarios.long_context_tokens.unwrap_or(60_000);
+    if scenarios.long_context.is_some() && prompt_tokens >= threshold {
+        return Some("long_context");
+    }
+    if scenarios.think.is_some() && reasoning {
+        return Some("think");
+    }
+    if scenarios.background.is_some() && !has_tools && max_tokens.is_some_and(|max| max <= 512) {
+        return Some("background");
+    }
+    None
 }
 
 /// How to sign in to an upstream with a browser (OAuth 2.0, PKCE).
@@ -458,6 +539,50 @@ pub struct CallerKey {
     pub tpm: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub monthly_cost: Option<f64>,
+    /// Model allow-list. Empty means every model. Entries are exact ids
+    /// (`provider/model`, `group/id`) or a trailing-wildcard pattern
+    /// (`deepseek/*`, `group/*`). A key handed to another machine should
+    /// not be able to reach models it was never meant to use.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<String>,
+    /// RFC 3339 expiry; after this instant the key is refused. Absent
+    /// means it never expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+impl CallerKey {
+    /// Whether this key has expired at `now`. A malformed date is treated
+    /// as expired: a typo must fail closed, not disable the restriction.
+    pub fn is_expired(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        match &self.expires_at {
+            None => false,
+            Some(raw) => match chrono::DateTime::parse_from_rfc3339(raw) {
+                Ok(deadline) => now >= deadline.with_timezone(&chrono::Utc),
+                Err(_) => true,
+            },
+        }
+    }
+
+    /// Whether the requested model is on this key's allow-list. An empty
+    /// list means unrestricted; a trailing `*` matches a prefix.
+    pub fn allows_model(&self, requested: &str) -> bool {
+        model_allowed(&self.models, requested)
+    }
+}
+
+/// Allow-list matching, kept pure so the gateway and tests share one rule.
+pub fn model_allowed(patterns: &[String], requested: &str) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    patterns.iter().any(|p| {
+        let p = p.trim();
+        match p.strip_suffix('*') {
+            Some(prefix) => requested.starts_with(prefix),
+            None => p == requested,
+        }
+    })
 }
 
 /// The settings the web UI exposes.
@@ -494,6 +619,11 @@ pub struct Settings {
     /// request. The trace headers travel either way.
     #[serde(default)]
     pub trace_metadata: bool,
+    /// How many days of usage records and trace spans to keep. `None` (the
+    /// default) keeps everything; a daily prune deletes the rest so the
+    /// ledger cannot grow forever on a long-running machine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_days: Option<u64>,
     /// The user's locale for the web UI.
     pub locale: String,
     /// Origins a browser may call the gateway from. Empty means none:
@@ -509,6 +639,11 @@ pub struct Settings {
     /// (needs the `otlp` build feature; endpoint empty = off).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub otlp: Option<OtlpSettings>,
+    /// Where to POST short status alerts (ntfy / Slack / 飞书 webhook).
+    /// These are state events — a budget threshold, a provider cooldown,
+    /// a key rejected — never request logs or prompts. Empty means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_webhook: Option<String>,
 }
 
 /// The OTLP tracing sink. Active only with the `otlp` build feature;
@@ -541,10 +676,12 @@ impl Default for Settings {
             masking: false,
             record_usage: true,
             trace_metadata: false,
+            retention_days: None,
             locale: "zh-CN".to_string(),
             cors_origins: Vec::new(),
             workbuddy_auto_checkin: true,
             otlp: None,
+            alert_webhook: None,
         }
     }
 }
@@ -801,6 +938,8 @@ mod tests {
             listed: true,
             alias: None,
             note: None,
+            scenarios: Default::default(),
+            max_price: None,
         });
         config.caller_keys.push(CallerKey {
             id: "k1".into(),
@@ -811,6 +950,8 @@ mod tests {
             rpm: None,
             tpm: None,
             monthly_cost: None,
+            models: Vec::new(),
+            expires_at: None,
         });
         store.save(&config).unwrap();
 
@@ -888,6 +1029,17 @@ impl Config {
             if !ids.insert(p.id.clone()) {
                 return Err(format!("duplicate provider id: {}", p.id));
             }
+            for (public, real) in &p.model_map {
+                if public.trim().is_empty() || real.trim().is_empty() {
+                    return Err(format!("provider '{}' has an empty model_map entry", p.id));
+                }
+                if public.contains('/') {
+                    return Err(format!(
+                        "provider '{}' model_map key '{}' must be a bare model name, not provider/model",
+                        p.id, public
+                    ));
+                }
+            }
             for window in &p.schedule {
                 window
                     .validate()
@@ -964,7 +1116,7 @@ impl Config {
     pub fn model_ids(&self) -> Vec<String> {
         let mut out = Vec::new();
         for p in &self.providers {
-            if !p.enabled {
+            if !p.enabled || p.group_only {
                 continue;
             }
             for m in &p.models {
@@ -1093,6 +1245,8 @@ pub struct AppState {
     pub concurrency: crate::gateway::concurrency::Registry,
     /// Local rate limits (RPM/TPM/daily budget) shared by gateway and console.
     pub rate_limits: crate::gateway::rate_limit::Registry,
+    /// Short status alerts to a user-configured webhook.
+    pub alerts: crate::alerts::Alerts,
     /// The number of requests currently being processed by the gateway. A
     /// process-wide gauge that the `/metrics` endpoint reads out.
     pub in_flight: Arc<AtomicU64>,
@@ -1118,6 +1272,7 @@ impl AppState {
             cooldowns: crate::gateway::cooldown::Registry::default(),
             concurrency: crate::gateway::concurrency::Registry::default(),
             rate_limits: crate::gateway::rate_limit::Registry::default(),
+            alerts: crate::alerts::Alerts::default(),
             in_flight: Arc::new(AtomicU64::new(0)),
             started: chrono::Utc::now(),
             web_bind: Arc::new(tokio::sync::RwLock::new(web_bind)),
@@ -1222,6 +1377,7 @@ mod config_surface_tests {
                 max_concurrency: None,
             }],
             models: vec!["m".into()],
+            model_map: BTreeMap::from([("m".into(), "real-m".into())]),
             auto_include: vec!["m-*".into()],
             catalog: Some("c".into()),
             headers: BTreeMap::from([("x-a".to_string(), "1".to_string())]),
@@ -1239,6 +1395,9 @@ mod config_surface_tests {
             max_concurrency: Some(3),
             rpm: Some(60),
             tpm: Some(100000),
+            timeout_secs: Some(120),
+            connect_timeout_secs: Some(5),
+            first_byte_timeout_secs: Some(30),
             schedule: vec![crate::gateway::schedule::ScheduleWindow {
                 start: "22:00".into(),
                 end: "08:00".into(),
@@ -1258,6 +1417,8 @@ mod config_surface_tests {
             listed: false,
             alias: None,
             note: Some("n".into()),
+            scenarios: Default::default(),
+            max_price: None,
         });
         config.settings = Settings {
             gateway_port: 1234,
@@ -1282,6 +1443,8 @@ mod config_surface_tests {
             rpm: None,
             tpm: None,
             monthly_cost: Some(1.5),
+            models: Vec::new(),
+            expires_at: None,
         });
 
         let raw = serde_json::to_string(&config).unwrap();
@@ -1367,5 +1530,42 @@ mod precedence_tests {
         let out = std::mem::take(&mut settings).from_env();
         std::env::remove_var("LOCAL_ROUTER_GATEWAY_PORT");
         assert_eq!(out.gateway_port, 13556);
+    }
+    // ------------------------------------------- caller key ACL / expiry --
+    #[test]
+    fn model_allow_lists_support_exact_ids_and_wildcards() {
+        let patterns = vec!["deepseek/*".into(), "group/auto".into()];
+        assert!(model_allowed(&patterns, "deepseek/deepseek-chat"));
+        assert!(model_allowed(&patterns, "group/auto"));
+        assert!(!model_allowed(&patterns, "group/haochi"));
+        assert!(!model_allowed(&patterns, "openai/gpt-5"));
+        // An empty list means no restriction at all.
+        assert!(model_allowed(&[], "anything/at-all"));
+    }
+
+    #[test]
+    fn caller_key_expiry_fails_closed_on_bad_dates() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let mut key = CallerKey {
+            id: "k".into(),
+            name: "k".into(),
+            key: "sk".into(),
+            enabled: true,
+            daily_tokens: None,
+            rpm: None,
+            tpm: None,
+            monthly_cost: None,
+            models: Vec::new(),
+            expires_at: None,
+        };
+        assert!(!key.is_expired(now));
+        key.expires_at = Some("2026-02-01T00:00:00Z".into());
+        assert!(!key.is_expired(now));
+        key.expires_at = Some("2025-12-01T00:00:00Z".into());
+        assert!(key.is_expired(now));
+        key.expires_at = Some("not-a-date".into());
+        assert!(key.is_expired(now), "a malformed date must fail closed");
     }
 }

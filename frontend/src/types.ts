@@ -17,6 +17,12 @@ export interface Settings {
   cors_origins: string[];
   /** Claim the WorkBuddy account's daily check-in automatically. */
   workbuddy_auto_checkin: boolean;
+  /** Days of usage/trace records to keep; unset = keep forever. */
+  retention_days?: number | null;
+  /** Webhook for state alerts (budget / cooldown); never request logs. */
+  alert_webhook?: string | null;
+  /** OTLP collector settings, when the optional feature is built in. */
+  otlp?: { endpoint: string; service_name: string } | null;
 }
 
 export interface Status {
@@ -82,6 +88,12 @@ export interface Provider {
   rpm?: number | null;
   /** 本地限流：每分钟最多 token 数；空为不限。 */
   tpm?: number | null;
+  /** 上游总超时 / 连接超时 / 流式首字节超时（秒）；空为内置默认。 */
+  timeout_secs?: number | null;
+  connect_timeout_secs?: number | null;
+  first_byte_timeout_secs?: number | null;
+  /** {"对外名": "上游真实 id"}，只对发送时的 model 生效。 */
+  model_map?: Record<string, string>;
   /** 使用时段：每日时间窗口（如 22:00-08:00，跨午夜）；空为全天可用。 */
   schedule?: ScheduleWindow[];
   /** The models this provider offers for image and video work. */
@@ -122,6 +134,13 @@ export interface Group {
   /** 对外别名（provider/model 形态，如 local-router/auto）。 */
   alias?: string;
   note?: string;
+  /** 场景路由：按请求特征改用其他组/模型。 */
+  scenarios?: {
+    background?: string | null;
+    think?: string | null;
+    long_context?: string | null;
+    long_context_tokens?: number | null;
+  };
 }
 
 export interface ModelItem {
@@ -308,6 +327,10 @@ export interface CallerKey {
   enabled: boolean;
   daily_tokens?: number;
   monthly_cost?: number;
+  /** 模型白名单（精确 id 或尾通配符）；空为不限。 */
+  models?: string[];
+  /** RFC 3339 过期时间；空为永不过期。 */
+  expires_at?: string | null;
 }
 
 export interface WorkBuddyCredits {

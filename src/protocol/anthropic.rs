@@ -42,7 +42,8 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
         }
     }
 
-    // System prompt.
+    // System prompt. Caching markers on system blocks matter most: Claude
+    // Code marks the tail of its system prompt as a reusable prefix.
     match obj.get("system") {
         Some(Value::String(s)) => req.system.push(ContentBlock::text(s.clone())),
         Some(Value::Array(blocks)) => {
@@ -50,7 +51,11 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                 match b.get("type").and_then(Value::as_str).unwrap_or("text") {
                     "text" => {
                         if let Some(t) = b.get("text").and_then(Value::as_str) {
-                            req.system.push(ContentBlock::text(t));
+                            let block = ContentBlock::Text {
+                                text: t.to_string(),
+                                cache_control: read_cache_control(b),
+                            };
+                            req.system.push(block);
                         }
                     }
                     "cache_control" => {}
@@ -78,6 +83,7 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
                     .get("input_schema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                cache_control: read_cache_control(t),
             });
         }
     }
@@ -136,14 +142,47 @@ pub fn parse_request(v: &Value) -> ApiResult<ChatRequest> {
     Ok(req)
 }
 
+/// Read a prompt-caching marker from an Anthropic content/tool/system
+/// block. Claude Code puts `"cache_control": {"type": "ephemeral"}` on
+/// the last text block of the system prompt and on tool definitions; the
+/// marker must survive a relay or the upstream stops caching the prompt.
+fn read_cache_control(v: &Value) -> Option<CacheControl> {
+    let marker = v.get("cache_control")?;
+    let kind = marker
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("ephemeral");
+    Some(CacheControl {
+        kind: kind.to_string(),
+        ttl: marker
+            .get("ttl")
+            .and_then(Value::as_str)
+            .map(|s| s.to_string()),
+    })
+}
+
+/// Write a marker back, when the block carries one.
+fn write_cache_control(m: &mut Map<String, Value>, cache: &Option<CacheControl>) {
+    if let Some(cache) = cache {
+        let mut marker = Map::new();
+        marker.insert("type".into(), json!(cache.kind));
+        if let Some(ttl) = &cache.ttl {
+            marker.insert("ttl".into(), json!(ttl));
+        }
+        m.insert("cache_control".into(), Value::Object(marker));
+    }
+}
+
 fn parse_block(p: &Value) -> ContentBlock {
     match p.get("type").and_then(Value::as_str).unwrap_or("text") {
-        "text" => ContentBlock::text(
-            p.get("text")
+        "text" => ContentBlock::Text {
+            text: p
+                .get("text")
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
-        ),
+            cache_control: read_cache_control(p),
+        },
         "thinking" => ContentBlock::Thinking {
             text: p
                 .get("thinking")
@@ -186,6 +225,7 @@ fn parse_block(p: &Value) -> ContentBlock {
                     .to_string(),
                 content: inner,
                 is_error: p.get("is_error").and_then(Value::as_bool).unwrap_or(false),
+                cache_control: read_cache_control(p),
             }
         }
         "image" => {
@@ -201,7 +241,11 @@ fn parse_block(p: &Value) -> ContentBlock {
                 .or_else(|| source.get("url").and_then(Value::as_str))
                 .unwrap_or_default()
                 .to_string();
-            ContentBlock::Image { media_type, data }
+            ContentBlock::Image {
+                media_type,
+                data,
+                cache_control: read_cache_control(p),
+            }
         }
         "document" => {
             let source = p.get("source").cloned().unwrap_or(Value::Null);
@@ -220,6 +264,7 @@ fn parse_block(p: &Value) -> ContentBlock {
                     .get("title")
                     .and_then(Value::as_str)
                     .map(|s| s.to_string()),
+                cache_control: read_cache_control(p),
             }
         }
         _ => ContentBlock::text(String::new()),
@@ -293,14 +338,29 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
     body.insert("max_tokens".into(), json!(max));
 
     if !req.system.is_empty() {
-        let text: Vec<String> = req
-            .system
-            .iter()
-            .map(|b| b.plain_text())
-            .filter(|t| !t.is_empty())
-            .collect();
-        if !text.is_empty() {
-            body.insert("system".into(), json!(text.join("\n\n")));
+        // Keep the block structure when any system block carries a caching
+        // marker or is not plain text; a joined string would lose them.
+        let structured = req.system.iter().any(|b| match b {
+            ContentBlock::Text {
+                cache_control: Some(_),
+                ..
+            } => true,
+            ContentBlock::Text { .. } => false,
+            _ => true,
+        });
+        if structured {
+            let blocks: Vec<Value> = req.system.iter().map(format_block).collect();
+            body.insert("system".into(), Value::Array(blocks));
+        } else {
+            let text: Vec<String> = req
+                .system
+                .iter()
+                .map(|b| b.plain_text())
+                .filter(|t| !t.is_empty())
+                .collect();
+            if !text.is_empty() {
+                body.insert("system".into(), json!(text.join("\n\n")));
+            }
         }
     }
 
@@ -335,11 +395,15 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
             .tools
             .iter()
             .map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description.clone().unwrap_or_default(),
-                    "input_schema": t.input_schema.clone(),
-                })
+                let mut m = Map::new();
+                m.insert("name".into(), json!(t.name));
+                m.insert(
+                    "description".into(),
+                    json!(t.description.clone().unwrap_or_default()),
+                );
+                m.insert("input_schema".into(), t.input_schema.clone());
+                write_cache_control(&mut m, &t.cache_control);
+                Value::Object(m)
             })
             .collect();
         body.insert("tools".into(), Value::Array(tools));
@@ -376,7 +440,16 @@ pub fn format_request(req: &ChatRequest, model: &str) -> Value {
 
 fn format_block(b: &ContentBlock) -> Value {
     match b {
-        ContentBlock::Text { text } => json!({"type": "text", "text": text}),
+        ContentBlock::Text {
+            text,
+            cache_control,
+        } => {
+            let mut m = Map::new();
+            m.insert("type".into(), json!("text"));
+            m.insert("text".into(), json!(text));
+            write_cache_control(&mut m, cache_control);
+            Value::Object(m)
+        }
         ContentBlock::Thinking { text, signature } => {
             let mut m = Map::new();
             m.insert("type".into(), json!("thinking"));
@@ -396,6 +469,7 @@ fn format_block(b: &ContentBlock) -> Value {
             tool_use_id,
             content,
             is_error,
+            cache_control,
         } => {
             let inner: Vec<Value> = content.iter().map(format_block).collect();
             let mut m = Map::new();
@@ -412,22 +486,32 @@ fn format_block(b: &ContentBlock) -> Value {
             if *is_error {
                 m.insert("is_error".into(), json!(true));
             }
+            write_cache_control(&mut m, cache_control);
             Value::Object(m)
         }
-        ContentBlock::Image { media_type, data } => {
+        ContentBlock::Image {
+            media_type,
+            data,
+            cache_control,
+        } => {
             if media_type == "image/url" {
                 json!({"type": "text", "text": format!("[image: {data}]")})
             } else {
-                json!({
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": media_type, "data": data},
-                })
+                let mut m = Map::new();
+                m.insert("type".into(), json!("image"));
+                m.insert(
+                    "source".into(),
+                    json!({"type": "base64", "media_type": media_type, "data": data}),
+                );
+                write_cache_control(&mut m, cache_control);
+                Value::Object(m)
             }
         }
         ContentBlock::Document {
             media_type,
             data,
             name,
+            cache_control,
         } => {
             let mut m = Map::new();
             m.insert("type".into(), json!("document"));
@@ -438,6 +522,7 @@ fn format_block(b: &ContentBlock) -> Value {
             if let Some(n) = name {
                 m.insert("title".into(), json!(n));
             }
+            write_cache_control(&mut m, cache_control);
             Value::Object(m)
         }
     }

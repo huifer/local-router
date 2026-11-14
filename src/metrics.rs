@@ -86,6 +86,11 @@ pub fn record_latency(api: &str, seconds: f64) {
     histogram!("local_router_request_duration_seconds", "api" => api.to_string()).record(seconds);
 }
 
+/// Record time to first token for a streaming reply.
+pub fn record_ttft(api: &str, seconds: f64) {
+    histogram!("local_router_ttft_seconds", "api" => api.to_string()).record(seconds);
+}
+
 /// Record one persisted usage record as a request counter (and its tokens).
 ///
 /// One logical request may produce several records (one per upstream attempt
@@ -140,6 +145,19 @@ pub fn record_request(rec: &UsageRecord) {
             "provider" => provider.clone(),
         )
         .increment(rec.cache_read_tokens);
+    }
+    if let Some(cost) = rec.cost_usd.filter(|c| c.is_finite() && *c > 0.0) {
+        // Counters are integers: micro-dollars keep fractions without a
+        // float-typed counter. Divide by 1e6 in Grafana.
+        counter!(
+            "local_router_cost_micro_usd_total",
+            "api" => api.clone(),
+            "provider" => provider.clone(),
+        )
+        .increment((cost * 1_000_000.0).round() as u64);
+    }
+    if let Some(ttft) = rec.ttft_ms {
+        histogram!("local_router_ttft_seconds", "api" => api.clone()).record(ttft as f64 / 1000.0);
     }
 }
 
