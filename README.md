@@ -11,12 +11,17 @@ client that accepts a base URL — one routed, observable API.
 - **One Rust binary**: gateway, React console, and CLI.
 - **Protocol translation**: OpenAI Chat, OpenAI Responses, Anthropic Messages,
   and Gemini — any "inbound × upstream" combination, including streaming,
-  tools, reasoning blocks, token usage, and image/video endpoints.
+  tools, reasoning blocks, token usage, and image/video endpoints. When the
+  caller and the upstream speak the same protocol the body is relayed
+  verbatim, so structured-output schemas, seeds and Anthropic prompt-caching
+  breakpoints survive.
 - **Routing groups**: order / rotate / usage / smart / weight, with failover,
-  sticky sessions, nested groups, and multi-key rotation.
-- **Stability**: global 429 cooldown with exponential backoff, per-key
-  in-flight queueing, per-provider / per-caller RPM/TPM rate limits and daily
-  token budgets.
+  sticky sessions, nested groups, multi-key rotation, and scenario routes
+  (background / think / long-context requests go to different groups).
+- **Stability**: 429 cooldown that honours the vendor's `Retry-After` and
+  cools one API key instead of convicting the whole pool, per-key in-flight
+  queueing, per-provider / per-caller RPM/TPM limits, daily token and
+  monthly USD budgets, configurable timeouts with a first-byte deadline.
 - **Usage hours**: per-provider daily windows (e.g. a night-quota account at
   22:00–08:00, crossing midnight) — outside a window the provider is skipped
   without a cooldown, or refused with 429 + `Retry-After`.

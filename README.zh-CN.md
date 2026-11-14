@@ -10,11 +10,15 @@
 
 - **Rust 单二进制**：网关 + React 控制台 + CLI，一个文件跑起来
 - **四种协议互译**：OpenAI Chat / OpenAI Responses / Anthropic / Gemini，
-  任意「入口 × 上游」组合（流式、工具调用、思考块、token 用量、图片视频）
+  任意「入口 × 上游」组合（流式、工具调用、思考块、token 用量、图片视频）。
+  入站与上游同协议时请求体原样转发，`response_format`/json_schema、`seed`、
+  Anthropic `cache_control` 缓存断点等 IR 不建模的字段全部保真
 - **路由组**：order / rotate / usage / smart / weight，故障转移、会话粘性、
-  嵌套组、多 key 轮试
-- **稳定性**：上游 429 全局冷却（指数退避）、per-key 并发排队、
-  per-provider / per-caller 的 RPM/TPM 限流与日预算
+  嵌套组、多 key 轮试，以及场景路由（background / think / longContext
+  按请求特征分流到不同组）
+- **稳定性**：429 冷却尊重厂商 `Retry-After` 且只冷却出问题的那把 key，
+  per-key 并发排队、per-provider / per-caller 的 RPM/TPM 限流、日 token
+  与月美元双预算、可配超时 + 流式首字节超时（超时前可 failover）
 - **使用时段**：每个供应商可配每日时间窗口（如夜间包段账号
   22:00–次日 08:00，自动跨午夜）——窗口外组路由跳过该成员（不触发
   冷却），直连请求 429 + `Retry-After`

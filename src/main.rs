@@ -595,6 +595,7 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
     if settings.workbuddy_auto_checkin {
         start_auto_checkin();
     }
+    start_retention(state.clone());
 
     // `--port 0` lets the system pick a free port: handy when another
     // gateway (magpie, an older local-router) already holds 3435.
@@ -684,6 +685,33 @@ async fn shutdown() {
     // Flush any queued OTLP spans before the process exits.
     crate::telemetry::shutdown().await;
     println!("\nstopping");
+}
+
+/// Once a day, drop usage records and trace spans past the configured
+/// retention window. The check is one indexed DELETE; with no
+/// `retention_days` the task simply keeps sleeping. This is what keeps a
+/// long-running daemon's ledger from growing without bound.
+fn start_retention(state: config::AppState) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(86_400));
+        tick.tick().await; // the first tick is immediate; skip it
+        loop {
+            tick.tick().await;
+            let days = state.config.read().await.settings.retention_days;
+            let Some(days) = days.filter(|d| *d > 0) else {
+                continue;
+            };
+            let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
+            if let Some(store) = state.sqlite.clone() {
+                let (usage, spans) = store.prune_older_than(&cutoff);
+                if usage > 0 || spans > 0 {
+                    tracing::info!(
+                        "retention: removed {usage} usage records and {spans} trace spans older than {days} days"
+                    );
+                }
+            }
+        }
+    });
 }
 
 /// Claim the WorkBuddy account's daily check-in on a schedule, so the

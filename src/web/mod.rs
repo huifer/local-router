@@ -106,6 +106,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/caller-keys/{id}", delete(api_delete_caller_key))
         .route("/api/usage", get(api_usage))
+        .route("/api/usage/export", get(api_usage_export))
         .route("/api/traces", get(api_traces))
         .route("/api/traces/export", get(api_traces_export))
         .route("/api/traces/sessions", get(api_trace_sessions))
@@ -2518,6 +2519,21 @@ type UsageWindow = (i64, String);
 
 /// The shape the Usage page asks for: how far back, and in what money.
 fn usage_query(query: &BTreeMap<String, String>) -> UsageWindow {
+    // An explicit `from` (RFC 3339) wins over the canned periods, so an
+    // accountant can ask for exactly last month. Clamped to 100 years.
+    if let Some(from) = query.get("from") {
+        if let Ok(start) = chrono::DateTime::parse_from_rfc3339(from) {
+            let secs = (chrono::Utc::now() - start.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0);
+            let days = (secs / 86_400).min(36_500);
+            let currency = query
+                .get("currency")
+                .map(|s| s.to_ascii_lowercase())
+                .unwrap_or_else(|| "usd".to_string());
+            return (days, currency);
+        }
+    }
     let period = query.get("period").map(|s| s.as_str()).unwrap_or("7d");
     let days: i64 = match period {
         "today" | "24h" => 1,
@@ -2687,6 +2703,66 @@ fn filter_spans(spans: Vec<trace::Span>, query: &BTreeMap<String, String>) -> Ve
                 && keep(&project, span.project.as_deref())
         })
         .collect()
+}
+
+/// Export usage records as CSV for spreadsheets and reconciliation. The
+/// same period/`from` filters as `/api/usage`; a `to` bound is applied on
+/// the collected rows. Prompts are never part of the export.
+async fn api_usage_export(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>,
+) -> Response {
+    let (days, _) = usage_query(&query);
+    let cutoff = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let to = query.get("to").map(|s| s.as_str());
+    let records: Vec<usage::UsageRecord> = if let Some(store) = &state.sqlite {
+        store.all_since(&cutoff)
+    } else {
+        usage::read_all(&state.usage_path())
+            .into_iter()
+            .filter(|r| r.time.as_str() >= cutoff.as_str())
+            .collect()
+    };
+    let mut out = String::from(
+        "time,model,provider,key_id,caller_key_id,group,agent,session_id,protocol,status,ok,input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,ttft_ms,latency_ms,cost_usd,credits,priced,error\n",
+    );
+    for r in records {
+        if to.is_some_and(|end| r.time.as_str() > end) {
+            continue;
+        }
+        let field = |s: &str| trace::csv_field(s);
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
+            field(&r.time),
+            field(&r.model),
+            field(&r.provider),
+            field(r.key_id.as_deref().unwrap_or("")),
+            field(r.caller_key_id.as_deref().unwrap_or("")),
+            field(r.group.as_deref().unwrap_or("")),
+            field(r.agent.as_deref().unwrap_or("")),
+            field(r.session_id.as_deref().unwrap_or("")),
+            field(&r.protocol),
+            r.status,
+            r.ok,
+            r.input_tokens,
+            r.output_tokens,
+            r.cache_read_tokens,
+            r.cache_write_tokens,
+            r.reasoning_tokens,
+            r.ttft_ms.map(|n| n.to_string()).unwrap_or_default(),
+            r.latency_ms,
+            r.cost_usd.map(|n| n.to_string()).unwrap_or_default(),
+            r.credits.map(|n| n.to_string()).unwrap_or_default(),
+            r.priced,
+            field(r.error.as_deref().unwrap_or("")),
+        ));
+    }
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/csv; charset=utf-8")
+        .header("content-disposition", "attachment; filename=\"usage.csv\"")
+        .body(axum::body::Body::from(out))
+        .unwrap()
 }
 
 async fn api_usage(

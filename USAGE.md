@@ -405,6 +405,44 @@ caller key；一把都没有时**拒绝一切请求**。
 ——上游在另一台机器上时，主网关转发的模型名会去掉自己的前缀，对面收到的
 就是裸名（见「场景 M」）。
 
+### 2.5.2 场景路由、模型重定向与 key ACL
+
+**场景路由**（`Group.scenarios`）：一个组按请求特征把不同活儿交给不同模型。
+控制台 Groups 表单或 `POST/PATCH /api/groups` 传：
+
+```json
+"scenarios": {
+  "background": "group/cheap",
+  "think": "group/reason",
+  "long_context": "group/long",
+  "long_context_tokens": 60000
+}
+```
+
+判定顺序 `long_context`（prompt token ≥ 阈值，默认 60000）→ `think`
+（请求带推理开关）→ `background`（无 tools 且 `max_tokens ≤ 512`）。
+命中时用量与 trace 里记的仍是调用方最初写的名字。典型用途：把标题生成、
+compact 这类杂活送去便宜小模型，长上下文会话送去长上下文模型。
+
+**模型重定向**（`Provider.model_map`）：`PATCH /api/providers/{id}` 传
+`{"model_map": {"clean-name": "opaque-vendor-id"}}`。目录里是干净的对外名，
+发给上游的是真实 id；组成员写对外名也生效。`{"model_map": null}` 清除。
+
+**调用方 key 限制**：`POST /api/caller-keys` 可带 `models`（白名单，精确 id
+或尾通配如 `group/*`）与 `expires_at`（RFC 3339）。过期或访问白名单外的
+模型直接 401；格式非法的日期会被拒绝（fail closed），不是静默失效。
+`monthly_cost` 是**硬预算**：按 UTC 月累计 `cost_usd`，超限 429；到 80%
+时若配了 `settings.alert_webhook` 会发一次告警。
+
+**超时**：`PATCH /api/providers/{id}` 可设 `timeout_secs`、
+`connect_timeout_secs`、`first_byte_timeout_secs`（秒；`null` 清除）。
+首字节超时只作用于「还没把响应交给调用方」的阶段，超时后仍会 failover
+到组的下一个成员，不会把半截流丢给 agent。
+
+**同协议透传**：调用方与上游协议相同时，请求体原样转发（只改 model 和
+可选 trace 元数据）。这意味着结构化输出、缓存断点、厂商 beta 字段不会
+被翻译层丢掉；跨协议时仍走 IR，Anthropic 的 `cache_control` 也已建模保留。
+
 ### 2.6 开机自启（以后不用再手动启动）
 
 ```sh

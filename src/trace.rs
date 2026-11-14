@@ -731,8 +731,9 @@ pub fn to_csv(spans: &[Span]) -> String {
     out
 }
 
-/// Quote a csv field when it needs it.
-fn csv_field(value: &str) -> String {
+/// Quote a csv field when it needs it. Shared by the trace and usage
+/// exports so both escape commas and quotes the same way.
+pub fn csv_field(value: &str) -> String {
     if value.contains(',') || value.contains('"') || value.contains('\n') {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {

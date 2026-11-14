@@ -8,6 +8,43 @@
 
 ### Added
 
+- **功能面全量补齐**（对标 LiteLLM / Portkey / OpenRouter / Envoy / new-api /
+  claude-code-router 的审计落地）：
+  - **同协议原样转发**：入站与出站协议相同时，直接转发调用方的请求体，
+    只改 model 和可选的 trace 元数据。`response_format`/`json_schema`、
+    `seed`、penalty、厂商 beta 字段、Anthropic `cache_control` 断点全部
+    保真（此前被 IR 白名单静默丢弃，Claude Code 的显式缓存断点失效）。
+    跨协议仍走 IR，并在 IR 层为缓存断点加了 `CacheControl` 字段与回归测试。
+  - **尊重厂商 `Retry-After`**（秒数 / HTTP 日期）：冷却时长取
+    `max(厂商要求, 本地指数退避)`，上限一天。流式非 2xx 也带上状态码。
+  - **按 key 冷却**：一把 API key 的 429 不再连坐同一 provider 的其它
+    key；控制台/CLI 的 `provider test` 同步改为按 key 检查冷却。
+  - **真 smart 路由**：按每个成员的 EWMA 延迟 + 最近失败次数排序；
+    `Usage` 保持「最少使用」，并修好了它一直记录请求名而非成员名的 bug。
+  - **场景路由（`Group.scenarios`）**：`background` / `think` /
+    `long_context` 按请求特征（无 tools + 小 max_tokens / 推理开关 /
+    prompt token 阈值，默认 60k）改用其它组或模型。
+  - **`Provider.model_map`**：对外名 → 上游真实 id 的重定向，直连与组成员
+    都生效；控制台 PATCH 支持 `null` 清除。
+  - **超时可配**：`timeout_secs` / `connect_timeout_secs` /
+    `first_byte_timeout_secs`；首字节超时发生在响应提交给调用方之前，
+    因此仍可 failover 到下个目标（Envoy v1.1 的语义）。
+  - **纸面字段补齐**：`CallerKey.monthly_cost` 现在按月累计美元并硬 429；
+    `Provider.group_only` 现在真正拒绝直连、隐藏目录，裸名也不能绕过。
+  - **CallerKey 模型 ACL + 过期**：`models` 白名单（精确 / 尾通配）与
+    `expires_at`（RFC 3339，非法日期 fail closed）；创建 key 时校验日期。
+  - **限流响应带 `Retry-After` 与 `x-ratelimit-scope`**。
+  - **状态告警 webhook**：`settings.alert_webhook`，发预算耗尽/80% 预警、
+    provider 进入冷却等状态事件（**不发请求日志或 prompt**），15 分钟
+    / 24 小时去重、5s 超时 fire-and-forget，兼容 ntfy / Slack / 飞书。
+  - **TTFT（首 token 延迟）**：记录进 `usage.db`（自动加列迁移）、
+    `UsageRecord.ttft_ms`、`/api/usage/export` CSV，以及
+    `/metrics` 的 `local_router_ttft_seconds` 直方图；新增
+    `local_router_cost_micro_usd_total` 成本计数（微美元，整数 counter）。
+  - **数据留存**：`settings.retention_days` + 每日 `DELETE` 清理任务；
+    affinity map 增加 4096 容量上限与 1 小时 TTL。
+  - **`/api/usage/export`** CSV 导出与 `?from=<RFC3339>&to=` 任意区间查询。
+
 - **供应商使用时段（Provider.schedule）**：每个上游可配每日时间窗口，
   窗口外不参与服务——典型场景是夜间包段账号「每晚 22:00–次日 08:00」。
   结束早于开始即跨午夜，相等为全天；多个窗口取并集；`tz` 指定 IANA
@@ -21,6 +58,7 @@
   `/metrics` 新增 `local_router_schedules_closed` gauge 与
   `local_router_schedule_skipped_total` 计数。新增依赖 `chrono-tz`
   （IANA 时区）。
+
 - **组别名（Group.alias）**：路由组现在可以有一个 `provider/model` 形态的
   对外名字（如 `local-router/auto`），与 `group/<id>` 完全等价——模型目录、
   路由、账单里的组归因都认它。`listed: true` 的组，别名同样出现在

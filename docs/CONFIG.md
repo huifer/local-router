@@ -99,6 +99,10 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
   "header_order": [],
 
   "group_only": false,
+  "model_map": {},
+  "timeout_secs": null,
+  "connect_timeout_secs": null,
+  "first_byte_timeout_secs": null,
   "stream_only": false,
   "hold_when_exhausted": false,
   "media_models": [],
@@ -118,6 +122,11 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `rpm` / `tpm` | 本地限流：每分钟请求数 / token 数 | 只对配了限制的 provider 生效；触发时换下一个路由目标，**不**触发 429 冷却（本地限流不是厂商 429） |
 | `schedule` | 使用时段：每日时间窗口数组，空 = 全天可用 | `start`/`end` 为 `HH:MM` 墙钟；**结束早于开始表示跨午夜**（`22:00-08:00` = 今晚 22 点到明早 8 点），相等表示全天。`tz` 是 IANA 时区名（缺省本机时区）；`models` 空 = 全部模型，否则精确 id 或 `*` glob。多个窗口取**并集**。窗口外：组路由跳过该成员（不触发冷却），直连请求 429 + `Retry-After`（到窗口开始的秒数）；媒体（图像/视频）同样受限。热重载即时生效 |
 | `models` | **对外暴露的模型白名单**，也是**转发给上游的模型 id** | 路由到没列出的模型会 404；级联时外层可以直接写下游认识的 id（见 [examples/multi-machine](../examples/multi-machine/README.md)） |
+| `model_map` | 对外名 → 上游真实 id（`{"clean-name":"opaque-id-42"}`） | 解耦目录名与转发 id；直连和组成员都生效；`null` 清除。key 必须是裸模型名（不含 `/`），value 不能为空 |
+| `timeout_secs` | 一次上游调用的总超时（秒） | 默认 600；hang 住的上游不必拖 agent 十分钟 |
+| `connect_timeout_secs` | TCP 连接超时（秒） | 默认 20 |
+| `first_byte_timeout_secs` | 流式首字节超时（秒） | 默认关。超时发生在响应提交给调用方**之前**，所以仍能 failover 到下一个目标；慢但已在吐字的回复不会被切 |
+| `group_only` | 只允许通过路由组访问 | **已执行**：直连 `provider/model` 与裸名都被拒，模型目录也不列出它 |
 | `auto_include` | glob（只支持 `*`） | 刷新模型时匹配的自动并入 `models` |
 | `headers` | 每个请求都带的静态头 | 值里 `{version}`/`{platform}`/`{arch}` 会展开 |
 | `user_agent` | UA 模板 | 同样支持占位符；不设则按 `send_agent_user_agent` 透传 agent 的 |
@@ -126,7 +135,6 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `header_order` | 上游头发送顺序 | 纯提示，多数厂商不在乎 |
 | `stream_only` | 上游只收流式 | 网关会收流再拼成整段回复 |
 | `hold_when_exhausted` | 配额空了就不往这家发 | 默认关（有些账号 0 额度仍可用） |
-| `group_only` | 只允许通过路由组访问 | |
 | `media_models` | 这家能做图/视频的模型 | 会出现在 `/v1/models` 里 |
 | `media_paths` | 厂商自己的媒体路径 | 不设就走 OpenAI `/v1` 家族 |
 | `auth` | `"workbuddy"` / `"qwenwork"` | 用本机登录态，免 key |
@@ -160,6 +168,17 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `listed` | true/false | 组名是否出现在模型目录里（`group/mixed`） |
 | `alias` | 字符串，可选 | 对外别名，`provider/model` 形态（如 `local-router/auto`），与 `group/<id>` 等价；不能撞真模型 |
 | `models` | 成员 | 可以是 `provider/model`，也可以是 `group/别的组`（嵌套） |
+| `scenarios` | 可选对象 | **场景路由**：`background`（无 tools 且 `max_tokens ≤ 512`）/ `think`（带推理开关）/ `long_context`（prompt ≥ `long_context_tokens`，默认 60000）各自指向另一个 `group/id` 或 `provider/model`。优先级 long_context > think > background；命中时用量与 trace 仍记调用方最初的名字 |
+| `routing: smart` | — | 真·智能路由：按每个成员的 EWMA 延迟 + 近期失败惩罚排序；`usage` 才是「最少使用」 |
+
+```json
+"scenarios": {
+  "background": "group/cheap",
+  "think": "group/reason",
+  "long_context": "group/long",
+  "long_context_tokens": 60000
+}
+```
 
 ### 3.3 settings —— 全局设置
 
@@ -176,7 +195,9 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
   "trace_metadata": false,
   "locale": "zh-CN",
   "cors_origins": [],
-  "workbuddy_auto_checkin": true
+  "workbuddy_auto_checkin": true,
+  "retention_days": null,
+  "alert_webhook": null
 }
 ```
 
@@ -193,6 +214,8 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `locale` | 控制台语言 |
 | `cors_origins` | 允许哪些浏览器源跨域调网关（默认空 = 不允许） |
 | `workbuddy_auto_checkin` | 是否自动领 WorkBuddy 每日签到 |
+| `retention_days` | 保留多少天的 `usage.db` 用量与 trace（每日清理）；null/缺省 = 永不删除 |
+| `alert_webhook` | 状态告警 POST 地址（ntfy / Slack / 飞书自定义机器人）。只发预算、冷却等状态事件，**不发请求日志或 prompt**；发失败不影响请求 |
 
 > `web_port` / `web_addr` 是历史字段：控制台已与网关同端口，值被忽略，
 > 只是留着让老配置文件能读。
@@ -201,14 +224,17 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 
 ```json
 [{ "id": "k1", "name": "laptop", "key": "sk-…", "enabled": true,
-   "rpm": null, "tpm": null, "daily_tokens": null, "monthly_cost": null }]
+   "rpm": null, "tpm": null, "daily_tokens": null, "monthly_cost": null,
+   "models": [], "expires_at": null }]
 ```
 
 | 字段 | 含义 |
 | --- | --- |
-| `rpm` / `tpm` | 这把调用方 key 的本地限流（路由前硬 429，不入冷却） |
+| `rpm` / `tpm` | 这把调用方 key 的本地限流（路由前硬 429，带 `Retry-After`） |
 | `daily_tokens` | 每日 token 预算（UTC 零点翻日，硬限制） |
-| `monthly_cost` | 月度成本口径（仅记录/展示，当前不强制） |
+| `monthly_cost` | **月度美元预算**（UTC 月初翻月）：逐请求累计 `cost_usd`，超限硬 429；到 80% 且配了 webhook 会发一次告警 |
+| `models` | 模型白名单：精确 `provider/model` / `group/id`，或尾通配 `deepseek/*`；空 = 不限 |
+| `expires_at` | RFC 3339 过期时间，过期后 key 直接 401；格式非法同样拒绝（fail closed） |
 
 ---
 
