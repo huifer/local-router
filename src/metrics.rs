@@ -64,6 +64,18 @@ pub fn set_rate_limits(n: u64) {
     gauge!("local_router_rate_limits_active").set(n as f64);
 }
 
+/// Push the number of providers whose usage windows are closed right now.
+pub fn set_schedules_closed(n: u64) {
+    gauge!("local_router_schedules_closed").set(n as f64);
+}
+
+/// Count one target skipped because its usage window is closed. A local
+/// policy, not a vendor 429: no cooldown follows it.
+pub fn record_schedule_skipped(provider: &str) {
+    counter!("local_router_schedule_skipped_total", "provider" => provider.to_string())
+        .increment(1);
+}
+
 /// Count one request refused by a local rate limit.
 pub fn record_rate_limited(scope: &str) {
     counter!("local_router_rate_limited_total", "scope" => scope.to_string()).increment(1);

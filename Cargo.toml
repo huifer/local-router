@@ -91,6 +91,7 @@ md-5 = "0.11"
 hex = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
+chrono-tz = "0.10"
 
 [features]
 # OTLP tracing export is opt-in and hand-rolled (see src/telemetry.rs): no

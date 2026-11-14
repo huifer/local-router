@@ -65,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/providers/{id}/test", post(api_test_provider))
         .route("/api/cooldowns", get(api_cooldowns))
         .route("/api/rate-limits", get(api_rate_limits))
+        .route("/api/schedules", get(api_schedules))
         .route("/api/providers/{id}/oauth", post(api_oauth_start))
         .route("/api/providers/{id}/login", post(api_session_login_start))
         .route(
@@ -592,6 +593,10 @@ struct UpdateProvider {
     rpm: Option<Option<u64>>,
     #[serde(default, deserialize_with = "de_optional_optional")]
     tpm: Option<Option<u64>>,
+    /// The provider's usage windows. `null` or `[]` clears them; absent
+    /// leaves them alone. Bad windows are refused, not silently dropped.
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    schedule: Option<Option<Vec<crate::gateway::schedule::ScheduleWindow>>>,
 }
 
 /// Distinguishes "absent" (outer `None`, leaves the limit alone) from
@@ -626,6 +631,7 @@ async fn api_update_provider(
         header_order: None,
         rpm: None,
         tpm: None,
+        schedule: None,
     });
     state
         .update(|config| {
@@ -677,6 +683,15 @@ async fn api_update_provider(
             }
             if let Some(v) = input.tpm {
                 p.tpm = v.filter(|n| *n > 0);
+            }
+            // Usage windows: validate before they land, so a typo cannot
+            // silently disable the provider's restriction.
+            if let Some(v) = input.schedule {
+                let windows = v.unwrap_or_default();
+                for window in &windows {
+                    window.validate()?;
+                }
+                p.schedule = windows;
             }
             Ok(())
         })
@@ -1762,6 +1777,13 @@ async fn oauth_callback(
 
 async fn api_cooldowns(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"cooldowns": state.cooldowns.snapshot().await}))
+}
+
+/// The live usage windows: which providers are in service right now, and
+/// when the closed ones reopen.
+async fn api_schedules(State(state): State<AppState>) -> Json<Value> {
+    let config = state.config.read().await;
+    Json(json!({"schedules": crate::gateway::schedule::snapshot(&config, chrono::Utc::now())}))
 }
 
 /// The live windows of every local rate limit: how many requests and tokens

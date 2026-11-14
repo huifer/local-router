@@ -37,6 +37,7 @@ fn provider(id: &str, models: &[&str], keys: usize) -> Provider {
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        schedule: Vec::new(),
         media_models: Vec::new(),
         media_paths: None,
     }

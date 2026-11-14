@@ -15,6 +15,9 @@
   嵌套组、多 key 轮试
 - **稳定性**：上游 429 全局冷却（指数退避）、per-key 并发排队、
   per-provider / per-caller 的 RPM/TPM 限流与日预算
+- **使用时段**：每个供应商可配每日时间窗口（如夜间包段账号
+  22:00–次日 08:00，自动跨午夜）——窗口外组路由跳过该成员（不触发
+  冷却），直连请求 429 + `Retry-After`
 - **链路追踪**：每个会话与它的每次上游调用都记成 span 树
   （session → request → upstream），trace id 随请求下发到厂商，
   厂商自己的 request id 也留档可反查
@@ -74,6 +77,7 @@ local-router serve [--port N] [--addr A] [--lan] [--no-console]
 local-router daemon start|stop|status|logs|install     # 后台常驻 / 开机自启
 local-router provider add <preset|名字> --key sk-… [--url …] [--protocol anthropic]
 local-router provider list | rm | models | expose | media | test | key
+local-router provider schedule <id> --window 22:00-08:00   # 每日使用时段
 local-router models                                    # 对外模型目录
 local-router group add <名字> --models a/m1,b/m2 --routing order
 local-router usage [--period today] [--csv]            # 用量与账单

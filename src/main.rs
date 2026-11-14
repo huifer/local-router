@@ -451,6 +451,26 @@ enum ProviderCmd {
         #[arg(default_value = "")]
         template: String,
     },
+    /// Show or set the provider's daily usage windows (e.g. 22:00-08:00).
+    Schedule {
+        id: String,
+        /// A window as START-END, e.g. 22:00-08:00 (crosses midnight when
+        /// the end is before the start). Repeatable; several windows are
+        /// a union. Omit to show the current windows.
+        #[arg(long = "window", value_name = "START-END")]
+        windows: Vec<String>,
+        /// Restrict the windows to these models (exact id or * glob),
+        /// comma separated. Omit to cover every model.
+        #[arg(long, value_delimiter = ',')]
+        models: Vec<String>,
+        /// The IANA zone the wall-clock times are in (default: this
+        /// machine's local zone), e.g. Asia/Shanghai.
+        #[arg(long)]
+        tz: Option<String>,
+        /// Remove every window.
+        #[arg(long, conflicts_with = "windows")]
+        clear: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1093,6 +1113,60 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                     println!("{id} 的 UA 模板：{t}（{{version}}/{{platform}}/{{arch}} 会展开）")
                 }
                 None => println!("{id} 不再发送自定义 UA"),
+            }
+        }
+        ProviderCmd::Schedule {
+            id,
+            windows,
+            models,
+            tz,
+            clear,
+        } => {
+            let provider = config
+                .provider_mut(&id)
+                .with_context(|| format!("there is no provider called {id}"))?;
+            if clear {
+                provider.schedule.clear();
+                save_config(&config)?;
+                println!("{id} 的使用时段已清除（全天可用）");
+                return Ok(());
+            }
+            if windows.is_empty() {
+                if provider.schedule.is_empty() {
+                    println!("{id} 没有使用时段限制（全天可用）");
+                } else {
+                    println!("{id} 的使用时段：");
+                    for w in &provider.schedule {
+                        let scope = if w.models.is_empty() {
+                            "全部模型".to_string()
+                        } else {
+                            w.models.join(", ")
+                        };
+                        let zone = w.tz.as_deref().unwrap_or("本机时区");
+                        println!("  {}–{}  [{zone}]  {scope}", w.start, w.end);
+                    }
+                }
+                return Ok(());
+            }
+            let mut parsed = Vec::new();
+            for text in &windows {
+                let (start, end) = text.split_once('-').with_context(|| {
+                    format!("window '{text}' must look like START-END, e.g. 22:00-08:00")
+                })?;
+                let window = gateway::schedule::ScheduleWindow {
+                    start: start.trim().to_string(),
+                    end: end.trim().to_string(),
+                    tz: tz.clone(),
+                    models: models.clone(),
+                };
+                window.validate().map_err(|e| anyhow::anyhow!(e))?;
+                parsed.push(window);
+            }
+            provider.schedule = parsed;
+            save_config(&config)?;
+            println!("{id} 的使用时段已更新（{} 个窗口）", windows.len());
+            for text in &windows {
+                println!("  {text}");
             }
         }
     }

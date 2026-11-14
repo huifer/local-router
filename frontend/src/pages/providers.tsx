@@ -8,6 +8,8 @@ import type {
   ProviderAccount,
   ProviderAccountQuota,
   ProviderKey,
+  ScheduleRow,
+  ScheduleWindow,
 } from "@/types";
 import type { Preset } from "@/types";
 import { api, getPresets } from "@/api";
@@ -241,6 +243,7 @@ export default function ProvidersPage() {
                 <span className={provider.enabled ? "state-on" : "state-off"}>
                   {provider.enabled ? t("providers.active") : t("providers.paused")}
                 </span>
+                <ScheduleBadge providerId={provider.id} hasSchedule={Boolean(provider.schedule?.length)} />
               </div>
               <div className="flex min-h-14 flex-wrap content-start gap-1 py-3">
                 {provider.models.slice(0, 4).map((model) => (
@@ -497,6 +500,7 @@ function ProviderDetail({ provider, onClose, onChanged }: { provider: Provider |
               {!provider.auth ? (
                 <KeyList provider={provider} />
               ) : null}
+              <ScheduleEditor provider={provider} onChanged={onChanged} />
               <div className="border-t border-border p-4">
                 <div className="eyebrow mb-2">{t("providers.exposedModels")}</div>
                 <div className="flex flex-wrap gap-1.5">
@@ -630,6 +634,170 @@ function KeyList({ provider }: { provider: Provider }) {
 
 function DetailRow({ label, value }: { label: string; value: string }) {
   return <div className="grid grid-cols-[120px_1fr] gap-3 border-b border-border/60 py-2 last:border-b-0"><span className="eyebrow">{label}</span><span className="break-all font-mono text-[11px] text-muted-foreground">{value}</span></div>;
+}
+
+/** "2h 5m" / "45s" — the same coarse shape the gateway's skip reasons use. */
+function humanDuration(secs: number): string {
+  if (secs >= 3600) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  }
+  if (secs >= 60) return `${Math.floor(secs / 60)}m`;
+  return `${secs}s`;
+}
+
+/**
+ * The provider card's live usage-window state: nothing when the provider
+ * has no schedule, otherwise in-service / off-hours with the countdown.
+ * Polls the same live view the drawer edits against.
+ */
+function ScheduleBadge({ providerId, hasSchedule }: { providerId: string; hasSchedule: boolean }) {
+  const { t } = useT();
+  const [row, setRow] = useState<ScheduleRow | null>(null);
+  useEffect(() => {
+    if (!hasSchedule) {
+      setRow(null);
+      return;
+    }
+    let alive = true;
+    const load = async () => {
+      try {
+        const response = await api<{ schedules: ScheduleRow[] }>("/api/schedules");
+        if (alive) setRow(response.schedules.find((item) => item.provider === providerId) ?? null);
+      } catch {
+        // Advisory only; the card still works without it.
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 15000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, [providerId, hasSchedule]);
+  if (!hasSchedule) return null;
+  if (!row) return <span className="font-mono text-[10px] text-muted-foreground">{t("providers.schedule")}</span>;
+  if (row.active) {
+    return <span className="state-on">{t("providers.scheduleOpen")}</span>;
+  }
+  const soonest = row.windows
+    .map((w) => w.seconds_until_open)
+    .filter((s): s is number => typeof s === "number")
+    .sort((a, b) => a - b)[0];
+  return (
+    <span className="state-off" title={t("providers.schedule")}>
+      {t("providers.scheduleClosed")}
+      {soonest !== undefined ? ` · ${t("providers.scheduleOpensIn", { time: humanDuration(soonest) })}` : ""}
+    </span>
+  );
+}
+
+/**
+ * The usage-window editor: daily windows (an end before the start crosses
+ * midnight), an optional zone and model scope. Saving PATCHes the whole
+ * list; an empty list means always available.
+ */
+function ScheduleEditor({ provider, onChanged }: { provider: Provider; onChanged: () => Promise<void> }) {
+  const { t } = useT();
+  const [windows, setWindows] = useState<ScheduleWindow[]>([]);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setWindows((provider.schedule ?? []).map((w) => ({ ...w, models: [...w.models] })));
+  }, [provider]);
+
+  const setWindow = (index: number, patch: Partial<ScheduleWindow>) => {
+    setWindows((prev) => prev.map((w, i) => (i === index ? { ...w, ...patch } : w)));
+  };
+  const save = async () => {
+    setSaving(true);
+    try {
+      await api(`/api/providers/${encodeURIComponent(provider.id)}`, {
+        method: "PATCH",
+        body: {
+          schedule: windows.map((w) => ({
+            start: w.start.trim(),
+            end: w.end.trim(),
+            tz: w.tz?.trim() || null,
+            models: w.models.map((m) => m.trim()).filter(Boolean),
+          })),
+        },
+      });
+      toast.success(t("providers.scheduleSaved"));
+      await onChanged();
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="border-t border-border p-4">
+      <div className="eyebrow mb-1">{t("providers.schedule")}</div>
+      <p className="mb-3 font-mono text-[10px] leading-relaxed text-muted-foreground/70">{t("providers.scheduleHint")}</p>
+      <div className="grid gap-3">
+        {windows.map((window_, index) => (
+          <div key={index} className="grid gap-1.5 border border-border p-2.5">
+            <div className="flex items-center gap-1.5">
+              <Input
+                aria-label="start"
+                type="time"
+                value={window_.start}
+                onChange={(event) => setWindow(index, { start: event.currentTarget.value })}
+                className="h-7 w-28 font-mono text-[11px]"
+              />
+              <span className="font-mono text-[10px] text-muted-foreground">→</span>
+              <Input
+                aria-label="end"
+                type="time"
+                value={window_.end}
+                onChange={(event) => setWindow(index, { end: event.currentTarget.value })}
+                className="h-7 w-28 font-mono text-[11px]"
+              />
+              <Input
+                aria-label={t("providers.scheduleTz")}
+                placeholder="Asia/Shanghai"
+                value={window_.tz ?? ""}
+                onChange={(event) => setWindow(index, { tz: event.currentTarget.value })}
+                className="h-7 flex-1 font-mono text-[11px]"
+              />
+              <Button
+                variant="ghost"
+                size="sm"
+                aria-label={t("providers.scheduleRemove")}
+                onClick={() => setWindows((prev) => prev.filter((_, i) => i !== index))}
+              >
+                <X />
+              </Button>
+            </div>
+            <Input
+              aria-label={t("providers.scheduleModels")}
+              placeholder={t("providers.scheduleModels")}
+              value={window_.models.join(", ")}
+              onChange={(event) => setWindow(index, { models: event.currentTarget.value.split(",") })}
+              className="h-7 font-mono text-[11px]"
+            />
+          </div>
+        ))}
+        <div className="flex items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setWindows((prev) => [...prev, { start: "22:00", end: "08:00", tz: null, models: [] }])}
+          >
+            <Plus /> {t("providers.scheduleAdd")}
+          </Button>
+          <Button variant="default" size="sm" onClick={save} disabled={saving}>
+            {t("providers.scheduleSave")}
+          </Button>
+          {!windows.length ? (
+            <span className="font-mono text-[10px] text-muted-foreground">{t("providers.scheduleAllDay")}</span>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
 }
 
 

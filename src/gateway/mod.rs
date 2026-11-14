@@ -5,6 +5,7 @@ pub mod concurrency;
 pub mod cooldown;
 pub mod rate_limit;
 pub mod route;
+pub mod schedule;
 pub mod usage;
 
 use std::collections::{BTreeMap, HashMap};
@@ -305,6 +306,10 @@ async fn metrics(State(g): State<Gateway>, headers: HeaderMap) -> Response {
     metrics::set_in_flight(g.state.in_flight.load(Ordering::Relaxed));
     metrics::set_cooldowns(g.state.cooldowns.snapshot().await.len() as u64);
     metrics::set_rate_limits(g.state.rate_limits.snapshot().len() as u64);
+    let config = g.state.config.read().await;
+    let rows = schedule::snapshot(&config, chrono::Utc::now());
+    metrics::set_schedules_closed(rows.iter().filter(|r| !r.active).count() as u64);
+    drop(config);
     let body = metrics::render();
     (
         StatusCode::OK,
@@ -325,6 +330,7 @@ async fn status(State(g): State<Gateway>) -> Json<Value> {
         "groups": config.groups.len(),
         "models": config.model_ids().len(),
         "rate_limits": g.state.rate_limits.snapshot(),
+        "schedules": schedule::snapshot(&config, chrono::Utc::now()),
     }))
 }
 
@@ -1000,6 +1006,16 @@ async fn media_target(g: &Gateway, requested: &str) -> Result<Target, ApiError> 
             provider.id
         )));
     }
+    // Media work obeys the same usage windows as chat.
+    if let schedule::Verdict::Closed { seconds_until_open } =
+        schedule::verdict(&provider.schedule, &model, chrono::Utc::now())
+    {
+        return Err(ApiError::RateLimited(format!(
+            "the provider {} is outside its usage window; it opens in {}",
+            provider.id,
+            human_duration(seconds_until_open)
+        )));
+    }
     let secret = provider
         .enabled_keys()
         .next()
@@ -1615,7 +1631,7 @@ async fn handle(
         )
     });
 
-    let (plan, send_agent_ua, masking) = {
+    let (mut plan, send_agent_ua, masking) = {
         let config = g.state.config.read().await;
         match g
             .router
@@ -1647,6 +1663,87 @@ async fn handle(
 
     let asked = request.model.clone();
     let stream = request.stream;
+
+    // Targets outside their usage windows leave the plan before anything
+    // else looks at it — the special session channels below pick their
+    // target from the plan, so a closed provider must not be in it. The
+    // skip is a local policy, not a vendor 429: no cooldown follows.
+    let mut schedule_wait: Option<u64> = None;
+    {
+        let config = g.state.config.read().await;
+        if plan.targets.iter().any(|t| {
+            config
+                .provider(&t.provider_id)
+                .is_some_and(|p| !p.schedule.is_empty())
+        }) {
+            let now = chrono::Utc::now();
+            let mut kept = Vec::new();
+            for target in plan.targets.drain(..) {
+                let closed = config
+                    .provider(&target.provider_id)
+                    .filter(|p| !p.schedule.is_empty())
+                    .and_then(
+                        |p| match schedule::verdict(&p.schedule, &target.model, now) {
+                            schedule::Verdict::Closed { seconds_until_open } => {
+                                Some(seconds_until_open)
+                            }
+                            _ => None,
+                        },
+                    );
+                match closed {
+                    Some(secs) => {
+                        let reason = format!(
+                            "the provider {} is outside its usage window; it opens in {}",
+                            target.provider_id,
+                            human_duration(secs)
+                        );
+                        let link = TraceLink {
+                            context: trace_ctx.clone(),
+                            request_span_id: request_span.span_id.clone(),
+                            attempt: kept.len() as u32 + 1,
+                            upstream_model: target.model.clone(),
+                        };
+                        metrics::record_schedule_skipped(&target.provider_id);
+                        note_skipped(&g, &link, &target, &reason);
+                        schedule_wait =
+                            Some(schedule_wait.map_or(secs, |prev: u64| prev.min(secs)));
+                    }
+                    None => kept.push(target),
+                }
+            }
+            plan.targets = kept;
+        }
+    }
+    if plan.targets.is_empty() {
+        let reason = match schedule_wait {
+            Some(secs) => format!(
+                "every target is outside its usage window; the soonest opens in {}",
+                human_duration(secs)
+            ),
+            None => "no target could answer".to_string(),
+        };
+        if let Some(session) = &session {
+            note_route_trace(&g, session, &plan, &asked, None).await;
+        }
+        close_request_span(
+            &g,
+            &request_span,
+            request_started,
+            false,
+            429,
+            Some(reason.clone()),
+            recording,
+        );
+        let mut response = error_response(&ApiError::RateLimited(reason));
+        if let Some(secs) = schedule_wait {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        return response;
+    }
 
     // A QwenWork (千问办公) request is built and COSY-signed by the local
     // `qwen` module; it never travels the generic OpenAI path. Route it the
@@ -1799,6 +1896,24 @@ async fn handle(
                 "the provider is cooling down after a 429",
             );
             continue;
+        }
+        // The provider's usage windows. Outside them the provider is
+        // simply not in service: a local policy, not a vendor 429, so the
+        // skip must not start a cooldown — the next target answers.
+        if !provider.schedule.is_empty() {
+            if let schedule::Verdict::Closed { seconds_until_open } =
+                schedule::verdict(&provider.schedule, &target.model, chrono::Utc::now())
+            {
+                let reason = format!(
+                    "the provider {} is outside its usage window; it opens in {}",
+                    target.provider_id,
+                    human_duration(seconds_until_open)
+                );
+                last_error = ApiError::RateLimited(reason.clone());
+                metrics::record_schedule_skipped(&target.provider_id);
+                note_skipped(&g, &link, &target, &reason);
+                continue;
+            }
         }
         // The provider's own RPM/TPM throttle. It is a local limit, not a
         // vendor 429, so skipping the target must not start a cooldown: the
@@ -2055,6 +2170,23 @@ fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::U
         store.record(rec);
     }
     usage::record(&state.usage_path(), rec);
+}
+
+/// A coarse human duration for the skip reasons: "2h 5m", "45s".
+fn human_duration(secs: u64) -> String {
+    if secs >= 3600 {
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        if m > 0 {
+            format!("{h}h {m}m")
+        } else {
+            format!("{h}h")
+        }
+    } else if secs >= 60 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
 }
 
 /// Record an attempt that was never sent: the provider was skipped, so the

@@ -757,3 +757,74 @@ async fn a_group_alias_can_be_set_and_bad_ones_are_refused() {
     // The reserved prefix is refused too.
     assert_ne!(patch(r#"{"alias":"group/auto"}"#).await, StatusCode::OK);
 }
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_schedule_can_be_set_and_bad_ones_are_refused() {
+    let state = state_at("127.0.0.1").await;
+    {
+        let mut config = state.config.write().await;
+        config.providers.push(local_router::config::Provider {
+            id: "night".into(),
+            name: "Night".into(),
+            models: vec!["m1".into()],
+            keys: vec![ProviderKey::new("sk-night".to_string())],
+            ..Default::default()
+        });
+    }
+    let app = console(state.clone());
+    let patch = |body: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .method("PATCH")
+                        .uri("/api/providers/night")
+                        .header("content-type", "application/json")
+                        .header("host", "127.0.0.1:3425")
+                        .header("origin", "http://127.0.0.1:3425")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            response.status()
+        }
+    };
+    // A good overnight window sticks.
+    assert_eq!(
+        patch(r#"{"schedule":[{"start":"22:00","end":"08:00","tz":"Asia/Shanghai"}]}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(state.config.read().await.providers[0].schedule.len(), 1);
+
+    // A malformed time is refused and leaves the old value alone.
+    assert_ne!(
+        patch(r#"{"schedule":[{"start":"25:00","end":"08:00"}]}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(state.config.read().await.providers[0].schedule.len(), 1);
+
+    // An unknown zone is refused too.
+    assert_ne!(
+        patch(r#"{"schedule":[{"start":"22:00","end":"08:00","tz":"Mars/Olympus"}]}"#).await,
+        StatusCode::OK
+    );
+
+    // The live view reports the window.
+    let (status, body) = get(state.clone(), "/api/schedules").await;
+    assert_eq!(status, StatusCode::OK);
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let row = &value["schedules"][0];
+    assert_eq!(row["provider"], "night");
+    assert_eq!(row["windows"][0]["start"], "22:00");
+    assert_eq!(row["windows"][0]["end"], "08:00");
+
+    // null clears the schedule.
+    assert_eq!(patch(r#"{"schedule":null}"#).await, StatusCode::OK);
+    assert!(state.config.read().await.providers[0].schedule.is_empty());
+    let (_, body) = get(state, "/api/schedules").await;
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(value["schedules"].as_array().unwrap().is_empty());
+}
+
+// ------------------------------------------- new control-plane fields --

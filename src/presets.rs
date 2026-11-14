@@ -120,6 +120,7 @@ pub fn to_provider(preset: &Preset, key: Option<&str>) -> Provider {
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        schedule: Vec::new(),
         media_models: preset.media_models.clone(),
         media_paths: preset.media_paths.clone(),
     }
@@ -167,6 +168,7 @@ pub fn custom_provider(
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        schedule: Vec::new(),
         media_models: Vec::new(),
         media_paths: None,
     }

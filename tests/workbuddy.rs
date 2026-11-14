@@ -186,6 +186,7 @@ async fn the_workbuddy_provider_needs_no_key() {
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        schedule: Vec::new(),
         media_models: Vec::new(),
         media_paths: None,
     };

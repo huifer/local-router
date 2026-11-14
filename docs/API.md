@@ -96,9 +96,20 @@ provider 的 `models` 列表既是对外白名单，也是转发给上游的模�
 | `GET /api/models` · caller-keys · settings | 模型目录 / 调用方 key / 全局设置 |
 | `GET /api/cooldowns` | 当前 429 冷却状态 |
 | `GET /api/rate-limits` | 限流配置与窗口用量 |
-| `GET /api/usage?period=…` | 账单与明细；`requests_timeline[]` / `by_day[]` / 各维度均含完整 token 分列（见 [BILLING.md](BILLING.md)） |
+| `GET /api/schedules` | 使用时段的实时状态：每个配了 `schedule` 的 provider，各窗口是否开放、距下次开放秒数 |
+| `GET /api/usage?period=…` | 账单与明细；`requests_timeline[]` / `by_day[]` / 各维度均含完整 token 分列（见 [BILLING.md](BILLING.md)）。支持 `?from=<RFC3339>&to=<RFC3339>` 任意区间 |
+| `GET /api/usage/export?format=csv` | 用量记录 CSV 导出（含 `ttft_ms`、成本、缓存分列），可用 `period` / `from` / `to` 过滤；不含 prompt |
 | `GET /api/traces` · `/api/traces/{id}` · `/api/traces/sessions…` · `/api/traces/export` | 链路查询与导出（见 [TRACING.md](TRACING.md)） |
-| `GET /metrics` | Prometheus 文本指标（实时状态；长期账本仍是 `usage.db`，见 [BILLING.md](BILLING.md)） |
+| `GET /metrics` | Prometheus 文本指标（实时状态；长期账本仍是 `usage.db`，见 [BILLING.md](BILLING.md)）。含 `local_router_ttft_seconds` 首 token 延迟直方图、`local_router_cost_micro_usd_total` 成本计数（微美元） |
+
+**PATCH `/api/providers/{id}` 新增字段**：`timeout_secs` / `connect_timeout_secs` /
+`first_byte_timeout_secs`（秒，`null` 或 `0` 清除）、`model_map`
+（`{"对外名":"上游真实id"}`，`null` 清空）。`POST /api/caller-keys`
+支持 `models`（白名单）与 `expires_at`（RFC 3339，非法日期 400）。
+`POST/PATCH /api/groups` 支持 `scenarios` 场景路由对象。
+
+**429 响应**：调用方本地限流被拒时带 `Retry-After`（秒）与
+`x-ratelimit-scope`；厂商返回 `Retry-After` 时冷却时长按该值执行。
 
 ## 相关文档
 

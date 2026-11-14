@@ -168,6 +168,7 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        schedule: Vec::new(),
         media_models: Vec::new(),
         media_paths: None,
     }
@@ -871,4 +872,167 @@ async fn a_vendor_outside_the_openai_family_is_asked_where_it_lives() {
     assert_eq!(response.status().as_u16(), 200);
     let body: Value = response.json().await.unwrap();
     assert_eq!(body["status"], "queued");
+}
+
+// ---------------------------------------------------- usage windows --
+
+/// A window in UTC built around the current minute: it opens `offset`
+/// minutes from now and stays open an hour. Tests never depend on the
+/// machine's zone this way, and an "open" window cannot expire mid-test.
+fn utc_window(offset_minutes: i64) -> local_router::gateway::schedule::ScheduleWindow {
+    use chrono::{Timelike, Utc};
+    let now = Utc::now();
+    let minute_of_day = now.hour() as i64 * 60 + now.minute() as i64;
+    let start = (minute_of_day + offset_minutes).rem_euclid(1440);
+    let end = (start + 60).rem_euclid(1440);
+    local_router::gateway::schedule::ScheduleWindow {
+        start: format!("{:02}:{:02}", start / 60, start % 60),
+        end: format!("{:02}:{:02}", end / 60, end % 60),
+        tz: Some("UTC".into()),
+        models: Vec::new(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_window_refuses_a_direct_request_with_retry_after() {
+    let mut config = base_config();
+    // The window opens two hours from now: closed at the moment of the test.
+    config.providers[0].schedule = vec![utc_window(120)];
+    let world = world(config).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/v1/chat/completions", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .json(&json!({"model": "mock/mock-small", "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 429);
+    let retry_after: u64 = response
+        .headers()
+        .get("retry-after")
+        .expect("a closed window says when it reopens")
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(retry_after > 0 && retry_after <= 3 * 3600, "{retry_after}");
+    let body: Value = response.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("usage window"));
+    assert_eq!(
+        world.vendor_hits.load(Ordering::SeqCst),
+        0,
+        "a closed provider is never sent anything"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_open_window_serves_normally() {
+    let mut config = base_config();
+    // The window opened ten minutes ago and runs an hour: open right now.
+    config.providers[0].schedule = vec![utc_window(-10)];
+    let world = world(config).await;
+    let (status, _) = world
+        .post(
+            "/v1/chat/completions",
+            "local-router",
+            json!({"model": "mock/mock-small", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(world.vendor_hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_group_skips_the_closed_member_without_a_cooldown() {
+    let mut config = base_config();
+    config.providers[0].schedule = vec![utc_window(120)]; // closed
+    config.groups.push(Group {
+        id: "g".into(),
+        name: "g".into(),
+        models: vec!["mock/mock-small".into(), "antmock/claude-ish".into()],
+        routing: Routing::Order,
+        weights: Default::default(),
+        stays: Default::default(),
+        listed: true,
+        alias: None,
+        note: None,
+    });
+    let world = world(config).await;
+    let (status, body) = world
+        .post(
+            "/v1/chat/completions",
+            "local-router",
+            json!({"model": "group/g", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    // The closed member was never asked; the open one answered.
+    assert_eq!(world.vendor_hits.load(Ordering::SeqCst), 0);
+    assert!(body["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("anthropic"));
+
+    // The skip is a local policy, not a vendor 429: no cooldown started.
+    // The gateway's own status carries the live cooldown-free proof; the
+    // console API lives on the web router, not this one.
+    let (status, body) = world
+        .post(
+            "/v1/chat/completions",
+            "local-router",
+            json!({"model": "mock/mock-small", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    // Still refused by the window (not by a cooldown), and the vendor is
+    // still untouched: a cooldown would also refuse, but the message says
+    // which one it is.
+    assert_eq!(status, 429);
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("usage window"));
+    assert_eq!(world.vendor_hits.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_window_scoped_to_other_models_leaves_this_one_alone() {
+    let mut config = base_config();
+    let mut window = utc_window(120); // closed…
+    window.models = vec!["some-other-model".into()]; // …but only for that one
+    config.providers[0].schedule = vec![window];
+    let world = world(config).await;
+    let (status, _) = world
+        .post(
+            "/v1/chat/completions",
+            "local-router",
+            json!({"model": "mock/mock-small", "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+    assert_eq!(status, 200);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn media_work_obeys_the_usage_window_too() {
+    let mut config = base_config();
+    config.providers[0].media_models = vec!["mock-image".into()];
+    config.providers[0].schedule = vec![utc_window(120)];
+    let world = world(config).await;
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{}/v1/images/generations", world.gateway_addr))
+        .header("authorization", "Bearer local-router")
+        .json(&json!({"model": "mock/mock-image", "prompt": "a cat"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 429);
+    let body: Value = response.json().await.unwrap();
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("usage window"));
 }

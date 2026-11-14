@@ -257,6 +257,10 @@ local-router provider test deepseek             # 发一个真实请求测连通
 local-router provider key deepseek sk-第二个key  # 加一把 key（多 key 轮试）
 local-router provider concurrency deepseek <key-id|session> 4  # 单把 key 的最大同时请求数，超限排队；0 取消
 local-router provider limit deepseek --rpm 60 --tpm 100000  # 限流（0 关闭）；caller key 同理走控制台/PATCH
+local-router provider schedule deepseek                          # 看使用时段
+local-router provider schedule deepseek --window 22:00-08:00     # 只在每晚 22 点到次日 8 点用这家（跨午夜）
+local-router provider schedule deepseek --window 22:00-08:00 --tz Asia/Shanghai --models "gpt-*"  # 指定时区、只限部分模型
+local-router provider schedule deepseek --clear                  # 清除时段（全天可用）
 local-router provider rm deepseek
 
 # 请求头重写（某些中转/上游挑剔头的时候用）
@@ -303,6 +307,34 @@ local-router dashboard               # 终端仪表盘（q 退出）
 local-router group add backup --models 七牛云/qwen3-max,deepseek/deepseek-chat --routing order
 local-router group weights balanced "a/m1=3,b/m2=1"   # weight 模式的权重
 ```
+
+### 2.4.1 使用时段：某家只在特定时间用
+
+有些账号的额度只在特定时段有效（比如夜间包段）。给 provider 配
+**每日时间窗口**，窗口外这家就不参与服务：
+
+```sh
+# 每晚 22:00 到次日 08:00 才用这家（结束早于开始 = 跨午夜）
+local-router provider schedule night-owl --window 22:00-08:00
+
+# 多个窗口取并集；可指定时区、只限部分模型（* 通配）
+local-router provider schedule night-owl \
+  --window 22:00-08:00 --window 12:00-13:00 \
+  --tz Asia/Shanghai --models "gpt-*"
+
+local-router provider schedule night-owl          # 查看
+local-router provider schedule night-owl --clear  # 清除（全天可用）
+```
+
+行为与冷却/本地限流同一纪律：
+
+- **组路由**：窗口外的成员被跳过，换下一个成员；**不触发 429 冷却**，
+  trace 里留一条 skipped 记录说明原因。
+- **直连请求**：返回 429，带 `Retry-After`（距窗口开始的秒数）与说明。
+- 图像/视频同样受限；`/v1/models` 目录不变（时段是运行期策略）。
+- 控制台 Provider 抽屉里可视化编辑，卡片上实时显示「服务中 / 时段外 ·
+  2h 5m后开始」；`GET /api/schedules` 是同一份实时状态。
+- 配置热重载即时生效；字段说明见 [docs/CONFIG.md](docs/CONFIG.md)。
 
 ### 2.5 调用 API
 

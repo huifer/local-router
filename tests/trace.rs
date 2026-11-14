@@ -105,6 +105,7 @@ fn provider(base_url: String) -> Provider {
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        schedule: Vec::new(),
         media_models: Vec::new(),
         media_paths: None,
     }

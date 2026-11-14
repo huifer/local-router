@@ -8,6 +8,19 @@
 
 ### Added
 
+- **供应商使用时段（Provider.schedule）**：每个上游可配每日时间窗口，
+  窗口外不参与服务——典型场景是夜间包段账号「每晚 22:00–次日 08:00」。
+  结束早于开始即跨午夜，相等为全天；多个窗口取并集；`tz` 指定 IANA
+  时区（缺省本机），`models` 可只限部分模型（精确 id 或 `*` glob）。
+  窗口外：组路由跳过该成员（**不触发 429 冷却**，trace 留 skipped 记录），
+  直连请求 429 + `Retry-After`（到窗口开始的秒数）；图像/视频同样受限。
+  入口：控制台 Provider 抽屉的时段编辑器（卡片实时显示服务中/时段外与
+  倒计时）、`PATCH /api/providers/{id}` 的 `schedule` 字段（null 清除，
+  坏窗口拒绝不落盘）、CLI `provider schedule <id> --window 22:00-08:00
+  [--tz …] [--models …] [--clear]`、`GET /api/schedules` 实时状态、
+  `/metrics` 新增 `local_router_schedules_closed` gauge 与
+  `local_router_schedule_skipped_total` 计数。新增依赖 `chrono-tz`
+  （IANA 时区）。
 - **组别名（Group.alias）**：路由组现在可以有一个 `provider/model` 形态的
   对外名字（如 `local-router/auto`），与 `group/<id>` 完全等价——模型目录、
   路由、账单里的组归因都认它。`listed: true` 的组，别名同样出现在

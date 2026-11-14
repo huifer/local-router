@@ -82,6 +82,8 @@ export interface Provider {
   rpm?: number | null;
   /** 本地限流：每分钟最多 token 数；空为不限。 */
   tpm?: number | null;
+  /** 使用时段：每日时间窗口（如 22:00-08:00，跨午夜）；空为全天可用。 */
+  schedule?: ScheduleWindow[];
   /** The models this provider offers for image and video work. */
   media_models?: string[];
   /** For a session-backed provider: who is signed in. */
@@ -90,6 +92,25 @@ export interface Provider {
 
 export type Routing = "smart" | "order" | "rotate" | "usage" | "weight";
 export type Stays = "auto" | "session" | "turn" | "off" | "strict";
+
+/** 供应商的一个每日使用时段窗口。 */
+export interface ScheduleWindow {
+  /** 开始时间 HH:MM（按 tz 的墙钟）。 */
+  start: string;
+  /** 结束时间 HH:MM；早于开始表示跨午夜，相等表示全天。 */
+  end: string;
+  /** IANA 时区名；缺省为本机时区。 */
+  tz?: string | null;
+  /** 限制的模型（精确 id 或 * glob）；空为全部模型。 */
+  models: string[];
+}
+
+/** GET /api/schedules 的一行：某供应商的窗口与实时状态。 */
+export interface ScheduleRow {
+  provider: string;
+  windows: (ScheduleWindow & { open: boolean; seconds_until_open?: number })[];
+  active: boolean;
+}
 
 export interface Group {
   id: string;

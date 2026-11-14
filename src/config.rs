@@ -219,6 +219,12 @@ pub struct Provider {
     /// The most tokens per minute this provider may take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tpm: Option<u64>,
+    /// Daily usage windows: the provider's models only serve inside them
+    /// (e.g. a night-quota account at 22:00–08:00). Outside a window a
+    /// group skips this provider without a cooldown; a direct request is
+    /// refused with 429 and a Retry-After. Empty means always available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub schedule: Vec<crate::gateway::schedule::ScheduleWindow>,
     /// The models this provider offers for image and video work.
     #[serde(default)]
     pub media_models: Vec<String>,
@@ -259,6 +265,7 @@ impl Default for Provider {
             max_concurrency: None,
             rpm: None,
             tpm: None,
+            schedule: Vec::new(),
             media_models: Vec::new(),
             media_paths: None,
         }
@@ -881,6 +888,11 @@ impl Config {
             if !ids.insert(p.id.clone()) {
                 return Err(format!("duplicate provider id: {}", p.id));
             }
+            for window in &p.schedule {
+                window
+                    .validate()
+                    .map_err(|e| format!("provider '{}': {e}", p.id))?;
+            }
         }
         let mut gids = std::collections::HashSet::new();
         for g in &self.groups {
@@ -1227,6 +1239,12 @@ mod config_surface_tests {
             max_concurrency: Some(3),
             rpm: Some(60),
             tpm: Some(100000),
+            schedule: vec![crate::gateway::schedule::ScheduleWindow {
+                start: "22:00".into(),
+                end: "08:00".into(),
+                tz: Some("Asia/Shanghai".into()),
+                models: vec!["m".into()],
+            }],
             media_models: vec!["img".into()],
             media_paths: None,
         });

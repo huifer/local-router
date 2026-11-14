@@ -17,6 +17,9 @@ client that accepts a base URL — one routed, observable API.
 - **Stability**: global 429 cooldown with exponential backoff, per-key
   in-flight queueing, per-provider / per-caller RPM/TPM rate limits and daily
   token budgets.
+- **Usage hours**: per-provider daily windows (e.g. a night-quota account at
+  22:00–08:00, crossing midnight) — outside a window the provider is skipped
+  without a cooldown, or refused with 429 + `Retry-After`.
 - **Session traceability**: every session and every upstream call it makes are
   recorded as a span tree (session → request → upstream); the trace id travels
   downstream to the vendor, and the vendor's own request id is kept for
@@ -82,6 +85,7 @@ local-router serve [--port N] [--addr A] [--lan] [--no-console]
 local-router daemon start|stop|status|logs|install     # background / autostart
 local-router provider add <preset|name> --key sk-… [--url …] [--protocol anthropic]
 local-router provider list | rm | models | expose | media | test | key
+local-router provider schedule <id> --window 22:00-08:00   # daily usage hours
 local-router models                                    # exposed model catalog
 local-router group add <name> --models a/m1,b/m2 --routing order
 local-router usage [--period today] [--csv]            # usage and cost
