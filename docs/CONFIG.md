@@ -85,6 +85,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
   "max_concurrency": null,
   "rpm": null,
   "tpm": null,
+  "daily_tokens": null,
   "schedule": [
     { "start": "22:00", "end": "08:00", "tz": "Asia/Shanghai", "models": [] }
   ],
@@ -120,6 +121,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `keys` | 这个家的多把 key | 故障时逐把试 |
 | `max_concurrency` | provider 级最大同时请求数 | 单把 key 可用自己的 `max_concurrency` 覆盖；超限排队，`0`/null 不限 |
 | `rpm` / `tpm` | 本地限流：每分钟请求数 / token 数 | 只对配了限制的 provider 生效；触发时换下一个路由目标，**不**触发 429 冷却（本地限流不是厂商 429） |
+| `daily_tokens` | 每日 token 额度（UTC 自然日翻日） | `0` / `null` 不限；口径为 `total_tokens`（含缓存 token）。额度用尽后该 provider 的目标被跳过、换下一个成员，同样**不**触发 429 冷却。控制台用量页按 `usage.db` 显示已用 / 剩余，见 [BILLING.md](BILLING.md) |
 | `schedule` | 使用时段：每日时间窗口数组，空 = 全天可用 | `start`/`end` 为 `HH:MM` 墙钟；**结束早于开始表示跨午夜**（`22:00-08:00` = 今晚 22 点到明早 8 点），相等表示全天。`tz` 是 IANA 时区名（缺省本机时区）；`models` 空 = 全部模型，否则精确 id 或 `*` glob。多个窗口取**并集**。窗口外：组路由跳过该成员（不触发冷却），直连请求 429 + `Retry-After`（到窗口开始的秒数）；媒体（图像/视频）同样受限。热重载即时生效 |
 | `models` | **对外暴露的模型白名单**，也是**转发给上游的模型 id** | 路由到没列出的模型会 404；级联时外层可以直接写下游认识的 id（见 [examples/multi-machine](../examples/multi-machine/README.md)） |
 | `model_map` | 对外名 → 上游真实 id（`{"clean-name":"opaque-id-42"}`） | 解耦目录名与转发 id；直连和组成员都生效；`null` 清除。key 必须是裸模型名（不含 `/`），value 不能为空 |
@@ -214,7 +216,7 @@ local-router 的配置是**一个 JSON 文件 + 若干运行时文件**，没有
 | `locale` | 控制台语言 |
 | `cors_origins` | 允许哪些浏览器源跨域调网关（默认空 = 不允许） |
 | `workbuddy_auto_checkin` | 是否自动领 WorkBuddy 每日签到 |
-| `retention_days` | 保留多少天的 `usage.db` 用量与 trace（每日清理）；null/缺省 = 永不删除 |
+| `retention_days` | 保留多少天的 `usage.db` 用量、trace 与进程采样（每日清理）；null/缺省 = 永不删除 |
 | `alert_webhook` | 状态告警 POST 地址（ntfy / Slack / 飞书自定义机器人）。只发预算、冷却等状态事件，**不发请求日志或 prompt**；发失败不影响请求 |
 
 > `web_port` / `web_addr` 是历史字段：控制台已与网关同端口，值被忽略，

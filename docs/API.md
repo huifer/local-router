@@ -80,7 +80,7 @@ provider 的 `models` 列表既是对外白名单，也是转发给上游的模�
 | `GET /health` | 健康检查 |
 | `GET /v1/local-router/status` | 运行状态 |
 | `GET /v1/local-router/quotas` | 各上游额度窗口（路由视角） |
-| `GET /v1/local-router/usage?period=today\|24h\|7d\|30d\|all` | 用量汇总（含 `by_provider_key` / `by_caller_key`；`total_tokens` 与缓存、推理 token 分列，口径见 [BILLING.md](BILLING.md)） |
+| `GET /v1/local-router/usage?period=today\|24h\|7d\|30d\|all` | 用量汇总（含 `by_provider_key` / `by_caller_key`；`total_tokens` 与缓存、推理 token 分列；`per_provider[]` / 顶层带 TTFT 与速率（`tokens_per_sec` / `output_tokens_per_sec`）；`per_key[]` 按供应商 × 上游 key 拆分；`per_credential[]` 列出每个配置的 key / 账号，含消耗、成功率、费用、TTFT、占比与最近使用，空闲凭据也在内。口径见 [BILLING.md](BILLING.md)） |
 | `GET /v1/local-router/usage/requests?limit=N` | 逐请求明细（同样带 token 分列） |
 | `GET /v1/local-router/route` | 这次会路由到哪（带 `X-Session-ID` 可看粘性） |
 
@@ -97,10 +97,12 @@ provider 的 `models` 列表既是对外白名单，也是转发给上游的模�
 | `GET /api/cooldowns` | 当前 429 冷却状态 |
 | `GET /api/rate-limits` | 限流配置与窗口用量 |
 | `GET /api/schedules` | 使用时段的实时状态：每个配了 `schedule` 的 provider，各窗口是否开放、距下次开放秒数 |
-| `GET /api/usage?period=…` | 账单与明细；`requests_timeline[]` / `by_day[]` / 各维度均含完整 token 分列（见 [BILLING.md](BILLING.md)）。支持 `?from=<RFC3339>&to=<RFC3339>` 任意区间 |
+| `GET /api/usage?period=…` | 账单与明细；`requests_timeline[]` / `by_day[]` / 各维度均含完整 token 分列、TTFT 与 token/s 速率；`by_key_speed[]` 按供应商 × 上游 key 给出量与速率；`credentials[]` 按供应商 × API key / 账号给出完整账（token 分列、费用、成功率、TTFT p50/p95、`tok/s`、占该供应商比例、最近使用），并挂上厂商额度窗口 `quota` 与本地每日 token 额度 `budget`；空闲凭据也有行，所以每个供应商都有账可查。支持 `?from=<RFC3339>&to=<RFC3339>` 任意区间（见 [BILLING.md](BILLING.md)） |
 | `GET /api/usage/export?format=csv` | 用量记录 CSV 导出（含 `ttft_ms`、成本、缓存分列），可用 `period` / `from` / `to` 过滤；不含 prompt |
 | `GET /api/traces` · `/api/traces/{id}` · `/api/traces/sessions…` · `/api/traces/export` | 链路查询与导出（见 [TRACING.md](TRACING.md)） |
-| `GET /metrics` | Prometheus 文本指标（实时状态；长期账本仍是 `usage.db`，见 [BILLING.md](BILLING.md)）。含 `local_router_ttft_seconds` 首 token 延迟直方图、`local_router_cost_micro_usd_total` 成本计数（微美元） |
+| `GET /metrics` | Prometheus 文本指标（实时状态；长期账本仍是 `usage.db`，见 [BILLING.md](BILLING.md)）。含 `local_router_ttft_seconds` 首 token 延迟直方图（`api` + `provider` label，仅流式样本）、`local_router_cost_micro_usd_total` 成本计数（微美元），以及网关自身资源 gauge：`local_router_process_cpu_percent`（单核百分比）/ `local_router_process_resident_bytes`（RSS）/ `local_router_process_threads` / `local_router_requests_per_minute` |
+| `GET /api/system` | 网关进程自身的实时状态：CPU、RSS、线程、in-flight、累计请求/失败，以及 1m / 5m / 15m 滚动窗口的请求速率、延迟 p50/p95 与首 token p50（只统计成功应答） |
+| `GET /api/system/series?minutes=60` | 进程采样时间序列（来自 `usage.db` 的 `sys_samples`，重启不清零；10s 采样、按区间聚合到约 180 个点，`minutes` 上限 1440） |
 
 **PATCH `/api/providers/{id}` 新增字段**：`timeout_secs` / `connect_timeout_secs` /
 `first_byte_timeout_secs`（秒，`null` 或 `0` 清除）、`model_map`

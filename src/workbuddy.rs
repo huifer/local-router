@@ -649,25 +649,40 @@ pub fn session_of(name: &str) -> anyhow::Result<Session> {
     })
 }
 
+/// Renew one named account's token pair when it is about to expire.
+///
+/// The gateway picks the account once per attempt (so the ledger, the
+/// cooldown and the signed headers agree on who served the call) and then
+/// asks for that exact account's session here.
+pub async fn session_for(name: &str) -> anyhow::Result<Session> {
+    let session = session_of(name)?;
+    refresh_named(name, session).await
+}
+
+async fn refresh_named(name: &str, session: Session) -> anyhow::Result<Session> {
+    if !session.needs_refresh() {
+        return Ok(session);
+    }
+    match refresh(&session).await {
+        Ok(fresh) => {
+            let _ = persist_refreshed(name, &fresh);
+            Ok(fresh)
+        }
+        Err(err) => {
+            // A failed refresh is not fatal while the old token still works.
+            tracing::warn!("the WorkBuddy token of {name} could not be refreshed: {err}");
+            Ok(session)
+        }
+    }
+}
+
 /// A session of one of the accounts, in turn — so several WorkBuddy
 /// accounts share the traffic instead of one taking all of it. The token is
 /// renewed first when it is about to expire, like the single-account path.
 pub async fn session_rotating() -> anyhow::Result<(String, Session)> {
     let (name, session) = rotating_account()?;
-    if !session.needs_refresh() {
-        return Ok((name, session));
-    }
-    match refresh(&session).await {
-        Ok(fresh) => {
-            let _ = persist_refreshed(&name, &fresh);
-            Ok((name, fresh))
-        }
-        Err(err) => {
-            // A failed refresh is not fatal while the old token still works.
-            tracing::warn!("the WorkBuddy token could not be refreshed: {err}");
-            Ok((name, session))
-        }
-    }
+    let session = refresh_named(&name, session).await?;
+    Ok((name, session))
 }
 
 /// The next account's session, without renewing it.

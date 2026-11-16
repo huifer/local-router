@@ -36,6 +36,32 @@ local-router claude workbuddy/hy3        # 让 Claude Code 走 WorkBuddy
   （refresh token 经上游同一接口换发）。
 - **协议**：上游只接受流式请求（`POST /v2/chat/completions`）。调用方要
   整段回复时，网关收流后拼好再返回，所以四种入口协议都能用。
+- **多账号归因**：账号池按请求轮转，网关在路由时先选定账号 slot，把它的
+  名字写进账本 `key_id`（昵称服务端掩码）、429 冷却 key、并发限额、会话
+  粘性与 trace。因此 **Usage → 凭据** 能按账号分别看 token 消耗；
+  旧记录里统一记成 `session` 的是改之前的行为。
+- **限流等待时间**：上游说「多久以后再来」，网关就在发出下一个请求之前
+  把这段窗口用掉（不是只改错误文案）：
+  - HTTP 头：`Retry-After`（秒 / HTTP 日期）、`X-RateLimit-Reset` /
+    `RateLimit-Reset`（epoch 秒或毫秒、相对秒数、日期）；
+  - 错误体：WorkBuddy 用 `msg` / `retry_policy` / `displayMsg` 而不是
+    OpenAI 的 `error.message`，常见字段 `retryAfter` / `resetAt` /
+    `resetTime` / `retryAt` / `nextRetryTime` / `waitSeconds` 都能识别
+    （可嵌套在 `data` / `retry_policy` / `error` 里）；ISO 时间、
+    `YYYY-MM-DD HH:MM:SS`（按 UTC）、epoch 秒/毫秒、相对秒数都认。
+  - 解析出的时长进入 429 冷却（按 provider + key），期间路由直接跳过该
+    目标，`GET /api/cooldowns` 可看 `seconds_left`。上限 30 天防止畸形
+    时间把上游永久停掉，本地指数退避仍是下限；没给时间就退回 60s 起步。
+  - 错误文案现在保留上游 `msg` / `displayMsg.zh`，不再一律显示
+    `the vendor refused the request`。
+- **`hold_when_exhausted` + 自动停用**：额度接口另返回周期时间
+  （`CycleStartTime` / `CycleEndTime`），控制台 Quota 页显示为 `resets_at`。
+  打开 `hold_when_exhausted` 后（`PATCH /api/providers/{id}`），后台每
+  10 分钟检查一次：额度归零 → **直接把 provider 停用**
+  （`enabled=false`，`auto_disabled_at` 标记自动停用时间，webhook 告警
+  `quota-pause`）；额度恢复 → 自动启用并清掉标记（告警 `quota-resume`）。
+  手动停用不会被打开，手动启用会清掉标记；只对 workbuddy 类登录态
+  provider 生效。
 - **媒体**：图像 / 视频模型（如 `hunyuan-image-v3.0-art`、
   `kling-video-v3`）要用 `local-router provider media <id> <模型...>` 声明；
   WorkBuddy 把媒体放在 `/v2` 且视频一次生成完（无任务状态接口），
@@ -61,13 +87,16 @@ local-router claude qwenwork/qwen3-coder-plus
   有意不做。
 - **额度**：钱包分日常 / 月度 / 长期三个池，`local-router qwen credits` 与
   控制台 Quota 页可见。
+- **按账号统计**：多账号轮转时账本 `key_id` 记账号 slot（昵称掩码），
+  Usage → 凭据按账号拆分消耗并挂对应额度窗口。
 
 ## Trae CN
 
 Trae CN 是 Cloud-IDE 协议（`Cloud-IDE-JWT` 鉴权），不是普通 OpenAI 兼容
 上游，网关为它走专用通道。当前**只支持导入的会话**（从 Magpie 迁移过来的
 Cloud-IDE 登录态，存 `trae-session.json`），浏览器登录尚未接通——控制台
-点登录会明确提示。导入后的账号同样可列出、切换、删除，按账号轮转分摊。
+点登录会明确提示。导入后的账号同样可列出、切换、删除，按账号轮转分摊；账本 `key_id`
+记账号 slot（昵称掩码），Usage → 凭据可按账号看消耗。
 
 ## 环境变量
 

@@ -1,6 +1,6 @@
 //! The record of what each request cost.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -221,32 +221,488 @@ pub struct Totals {
     pub credits: f64,
     /// How many requests could not be priced at all.
     pub unpriced: u64,
+    /// Streaming replies that actually reported a first token. This is the
+    /// denominator for every TTFT number below: a non-streaming reply has no
+    /// first token to measure, so the average must not be read against
+    /// `requests`.
+    pub ttft_samples: u64,
+    /// Mean time to first token, in milliseconds (0 when no samples).
+    pub ttft_avg_ms: u64,
+    /// Median time to first token, in milliseconds.
+    pub ttft_p50_ms: Option<u64>,
+    /// 95th percentile time to first token, in milliseconds.
+    pub ttft_p95_ms: Option<u64>,
+    /// Sum of the successful requests' wall-clock durations, in
+    /// milliseconds. The denominator for `tokens_per_sec`.
+    pub latency_sum_ms: u64,
+    /// Sum of the streaming generation phase (request duration minus the
+    /// wait for the first token), in milliseconds. The denominator for
+    /// `output_tokens_per_sec`; only streaming replies contribute.
+    pub generation_ms: u64,
+    /// Billable tokens per second of request time. A whole-account
+    /// throughput, not a live rate: concurrent requests count as if they
+    /// ran back to back, which is what makes providers comparable.
+    pub tokens_per_sec: f64,
+    /// Output tokens per second of generation time (after the first
+    /// token). Zero until at least one streaming reply has a TTFT.
+    pub output_tokens_per_sec: f64,
+    /// Runtime only: the samples the percentiles are computed from. Never
+    /// serialized — the API exposes the finished numbers, not raw rows.
+    #[serde(skip)]
+    ttft_values: Vec<u64>,
+    /// Runtime only: output tokens from the same streaming replies that
+    /// contributed `generation_ms`, so the output rate's numerator and
+    /// denominator always cover the same replies.
+    #[serde(skip)]
+    generation_output: u64,
+}
+
+impl Totals {
+    /// Fold one record into the totals. Every aggregation (`totals`,
+    /// `group_by`, `by_day`) goes through this one method so their numbers
+    /// cannot drift apart — the cache-token bug came from three hand-written
+    /// copies of this loop.
+    fn note(&mut self, r: &UsageRecord) {
+        self.requests += 1;
+        if !r.ok {
+            self.failed += 1;
+            return;
+        }
+        self.input_tokens += r.input_tokens;
+        self.output_tokens += r.output_tokens;
+        self.cache_read_tokens += r.cache_read_tokens;
+        self.cache_write_tokens += r.cache_write_tokens;
+        self.reasoning_tokens += r.reasoning_tokens;
+        if let Some(usd) = r.cost_usd {
+            self.cost_usd += usd;
+        }
+        if let Some(credits) = r.credits {
+            self.credits += credits;
+        }
+        if !r.priced {
+            self.unpriced += 1;
+        }
+        if let Some(ms) = r.ttft_ms {
+            self.ttft_values.push(ms);
+            // The generation phase is everything after the first token.
+            self.generation_ms += r.latency_ms.saturating_sub(ms);
+            self.generation_output += r.output_tokens;
+        }
+        self.latency_sum_ms += r.latency_ms;
+    }
+
+    /// Turn the collected samples into the numbers the API returns.
+    fn finish(&mut self) {
+        self.ttft_samples = self.ttft_values.len() as u64;
+        if !self.ttft_values.is_empty() {
+            self.ttft_values.sort_unstable();
+            let sum: u64 = self.ttft_values.iter().sum();
+            // Round to the nearest millisecond rather than truncating.
+            self.ttft_avg_ms = (sum + self.ttft_samples / 2) / self.ttft_samples;
+            self.ttft_p50_ms = Some(percentile(&self.ttft_values, 0.50));
+            self.ttft_p95_ms = Some(percentile(&self.ttft_values, 0.95));
+        }
+        let billable = (self.input_tokens
+            + self.output_tokens
+            + self.cache_read_tokens
+            + self.cache_write_tokens) as f64;
+        self.tokens_per_sec = if self.latency_sum_ms > 0 {
+            billable / (self.latency_sum_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+        self.output_tokens_per_sec = if self.generation_ms > 0 {
+            self.generation_output as f64 / (self.generation_ms as f64 / 1000.0)
+        } else {
+            0.0
+        };
+    }
+}
+
+/// Nearest-rank percentile over a sorted slice.
+fn percentile(sorted: &[u64], p: f64) -> u64 {
+    let last = sorted.len() - 1;
+    let index = ((last as f64) * p).round() as usize;
+    sorted[index.min(last)]
+}
+
+/// One provider × upstream-key row: what that key served, and how fast.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeySpeedRow {
+    pub provider: String,
+    /// The upstream key's own id inside the provider.
+    pub key_id: String,
+    /// The key's label, when one was set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_label: Option<String>,
+    pub requests: u64,
+    pub failed: u64,
+    /// Input + output + cache read + cache write.
+    pub total_tokens: u64,
+    /// `total_tokens / request time`, across this key's successful calls.
+    pub tokens_per_sec: f64,
+    /// Output tokens per second of generation time; only streaming
+    /// replies count, so the denominator is `generation` samples.
+    pub output_tokens_per_sec: f64,
+    pub ttft_samples: u64,
+    pub ttft_avg_ms: u64,
+}
+
+/// Speed and volume per provider × upstream API key, newest period aside.
+/// Uses the same `Totals` math as every other dimension, so the rates and
+/// the TTFT numbers on this table can never disagree with the rest.
+pub fn by_provider_key(records: &[UsageRecord]) -> Vec<KeySpeedRow> {
+    let mut buckets: BTreeMap<(String, String), Vec<&UsageRecord>> = BTreeMap::new();
+    for r in records {
+        buckets
+            .entry((r.provider.clone(), r.key_id.clone().unwrap_or_default()))
+            .or_default()
+            .push(r);
+    }
+    buckets
+        .into_iter()
+        .map(|((provider, key_id), rows)| {
+            let owned: Vec<UsageRecord> = rows.into_iter().cloned().collect();
+            let t = totals(&owned);
+            let label = owned
+                .iter()
+                .find_map(|r| r.key_label.clone())
+                .filter(|s| !s.trim().is_empty());
+            KeySpeedRow {
+                provider,
+                key_label: label,
+                key_id,
+                requests: t.requests,
+                failed: t.failed,
+                total_tokens: t.input_tokens
+                    + t.output_tokens
+                    + t.cache_read_tokens
+                    + t.cache_write_tokens,
+                tokens_per_sec: t.tokens_per_sec,
+                output_tokens_per_sec: t.output_tokens_per_sec,
+                ttft_samples: t.ttft_samples,
+                ttft_avg_ms: t.ttft_avg_ms,
+            }
+        })
+        .collect()
+}
+
+/// One credential the config knows about: a stored API key, or one slot
+/// of a session-backed provider's account pool.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialSpec {
+    pub provider: String,
+    pub credential: String,
+    pub label: String,
+    /// `"key"` or `"account"`.
+    pub kind: String,
+    pub enabled: bool,
+}
+
+impl CredentialSpec {
+    /// Build the list from the live config: each stored API key of a
+    /// key-based provider, and each saved account slot of a session-backed
+    /// one. Names of people are masked here, the same way the quota panel
+    /// masks them, so no usage API returns a raw account nickname.
+    pub fn from_config(config: &crate::config::Config) -> Vec<Self> {
+        use crate::config::AuthKind;
+        let mut specs = Vec::new();
+        for provider in &config.providers {
+            let mut accounts: Vec<(String, String)> = Vec::new();
+            match provider.auth {
+                Some(AuthKind::WorkBuddy) => {
+                    if let Ok(pool) = crate::workbuddy::read_pool() {
+                        accounts = pool
+                            .accounts
+                            .into_iter()
+                            .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
+                            .collect();
+                    }
+                }
+                Some(AuthKind::QwenWork) => {
+                    if let Ok(pool) = crate::qwen::login::read_pool() {
+                        accounts = pool
+                            .accounts
+                            .into_iter()
+                            .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
+                            .collect();
+                    }
+                }
+                Some(AuthKind::TraeCn) => {
+                    if let Ok(pool) = crate::trae::read_pool() {
+                        accounts = pool
+                            .accounts
+                            .into_iter()
+                            .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
+                            .collect();
+                    }
+                }
+                _ => {}
+            }
+            if provider.uses_session() {
+                if accounts.is_empty() {
+                    // No signed-in account yet: still one row, so the
+                    // provider is visible instead of silently missing.
+                    specs.push(CredentialSpec {
+                        provider: provider.id.clone(),
+                        credential: "session".into(),
+                        label: "登录态".into(),
+                        kind: "account".into(),
+                        enabled: provider.enabled,
+                    });
+                    continue;
+                }
+                for (slot, holder) in accounts {
+                    specs.push(CredentialSpec {
+                        provider: provider.id.clone(),
+                        credential: slot.clone(),
+                        label: if holder.is_empty() { slot } else { holder },
+                        kind: "account".into(),
+                        enabled: provider.enabled,
+                    });
+                }
+                continue;
+            }
+            if provider.keys.is_empty() {
+                specs.push(CredentialSpec {
+                    provider: provider.id.clone(),
+                    credential: "default".into(),
+                    label: provider.name.clone(),
+                    kind: "key".into(),
+                    enabled: provider.enabled,
+                });
+                continue;
+            }
+            for key in &provider.keys {
+                let label = key
+                    .label
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| key.id.clone());
+                specs.push(CredentialSpec {
+                    provider: provider.id.clone(),
+                    credential: key.id.clone(),
+                    label,
+                    kind: "key".into(),
+                    enabled: provider.enabled && key.enabled && !key.key.trim().is_empty(),
+                });
+            }
+        }
+        specs
+    }
+}
+
+/// Token consumption and quality-of-service for one credential.
+///
+/// Configured credentials with no traffic in the period still get a row
+/// (all zeroes): every provider must have a visible accounting, not just
+/// the ones that happened to serve a request. A removed key of a still-
+/// configured provider gets its own inactive row; a provider that left the
+/// config entirely is aggregated into one "removed credentials" row so no
+/// consumption disappears without burying the table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialRow {
+    pub provider: String,
+    pub credential: String,
+    pub label: String,
+    pub kind: String,
+    pub enabled: bool,
+    /// Was there traffic for this credential in the period?
+    pub seen: bool,
+    pub requests: u64,
+    pub failed: u64,
+    pub success_rate: f64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reasoning_tokens: u64,
+    /// input + output + cache read + cache write (reasoning is a break-out
+    /// of output, never added twice).
+    pub total_tokens: u64,
+    pub cost_usd: f64,
+    pub credits: f64,
+    pub ttft_samples: u64,
+    pub ttft_avg_ms: u64,
+    pub ttft_p50_ms: Option<u64>,
+    pub ttft_p95_ms: Option<u64>,
+    pub tokens_per_sec: f64,
+    pub output_tokens_per_sec: f64,
+    pub last_seen: Option<String>,
+    /// This credential's share of its provider's billable tokens, 0..1.
+    pub share_of_provider: f64,
+}
+
+fn credential_id(r: &UsageRecord) -> String {
+    r.key_id.clone().unwrap_or_else(|| "default".to_string())
+}
+
+/// Turn one credential's rows into the row the console shows. Kept in one
+/// place so configured credentials, removed keys and the legacy aggregate
+/// for an unconfigured provider all report exactly the same numbers.
+fn finish_credential(
+    spec: CredentialSpec,
+    rows: &[&UsageRecord],
+    provider_totals: &BTreeMap<String, Totals>,
+) -> CredentialRow {
+    let owned: Vec<UsageRecord> = rows.iter().map(|r| (**r).clone()).collect();
+    let t = totals(&owned);
+    let total_tokens =
+        t.input_tokens + t.output_tokens + t.cache_read_tokens + t.cache_write_tokens;
+    let provider_tokens = provider_totals
+        .get(&spec.provider)
+        .map(|p| p.input_tokens + p.output_tokens + p.cache_read_tokens + p.cache_write_tokens)
+        .unwrap_or(0);
+    CredentialRow {
+        provider: spec.provider,
+        credential: spec.credential,
+        label: spec.label,
+        kind: spec.kind,
+        enabled: spec.enabled,
+        seen: !owned.is_empty(),
+        requests: t.requests,
+        failed: t.failed,
+        success_rate: if t.requests == 0 {
+            0.0
+        } else {
+            (t.requests - t.failed) as f64 / t.requests as f64
+        },
+        input_tokens: t.input_tokens,
+        output_tokens: t.output_tokens,
+        cache_read_tokens: t.cache_read_tokens,
+        cache_write_tokens: t.cache_write_tokens,
+        reasoning_tokens: t.reasoning_tokens,
+        total_tokens,
+        cost_usd: t.cost_usd,
+        credits: t.credits,
+        ttft_samples: t.ttft_samples,
+        ttft_avg_ms: t.ttft_avg_ms,
+        ttft_p50_ms: t.ttft_p50_ms,
+        ttft_p95_ms: t.ttft_p95_ms,
+        tokens_per_sec: t.tokens_per_sec,
+        output_tokens_per_sec: t.output_tokens_per_sec,
+        last_seen: owned
+            .iter()
+            .map(|r| r.time.as_str())
+            .max()
+            .map(str::to_string),
+        share_of_provider: if provider_tokens == 0 {
+            0.0
+        } else {
+            total_tokens as f64 / provider_tokens as f64
+        },
+    }
+}
+
+/// Every provider's credentials, with the same `Totals` math as the rest of
+/// the usage page. `specs` come from the live config; records supply the
+/// traffic and fill in credentials that are no longer configured.
+///
+/// A provider that is no longer in the config at all (a test stub, a removed
+/// upstream) is collapsed into ONE "removed credentials" row per provider:
+/// its consumption still shows up, but a benchmark that generated hundreds
+/// of random key ids cannot bury the real table.
+pub fn by_credential(records: &[UsageRecord], specs: &[CredentialSpec]) -> Vec<CredentialRow> {
+    let mut buckets: BTreeMap<(String, String), Vec<&UsageRecord>> = BTreeMap::new();
+    let mut providers: BTreeMap<String, Vec<&UsageRecord>> = BTreeMap::new();
+    for r in records {
+        let id = credential_id(r);
+        buckets.entry((r.provider.clone(), id)).or_default().push(r);
+        providers.entry(r.provider.clone()).or_default().push(r);
+    }
+    let provider_totals: BTreeMap<String, Totals> = providers
+        .iter()
+        .map(|(provider, rows)| {
+            let owned: Vec<UsageRecord> = rows.iter().map(|r| (**r).clone()).collect();
+            (provider.clone(), totals(&owned))
+        })
+        .collect();
+    let configured: BTreeSet<String> = specs.iter().map(|s| s.provider.clone()).collect();
+
+    // Start from the configured rows, then add any bucket the config does
+    // not know about FOR A CONFIGURED PROVIDER (a removed key, or the old
+    // pooled "session" rows). A BTreeMap keyed by the pair keeps the output
+    // stable and makes duplicate specs harmless.
+    let mut known: BTreeMap<(String, String), CredentialSpec> = BTreeMap::new();
+    for spec in specs {
+        known.insert(
+            (spec.provider.clone(), spec.credential.clone()),
+            spec.clone(),
+        );
+    }
+    for (key, rows) in &buckets {
+        if !configured.contains(&key.0) {
+            continue;
+        }
+        known.entry(key.clone()).or_insert_with(|| {
+            let label = if key.1 == "session" {
+                // Records written before account attribution: one pooled
+                // row for the whole provider, not a real account slot.
+                "登录态（旧记录）".to_string()
+            } else {
+                rows.iter()
+                    .find_map(|r| r.key_label.clone())
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or_else(|| key.1.clone())
+            };
+            CredentialSpec {
+                provider: key.0.clone(),
+                credential: key.1.clone(),
+                label,
+                kind: if key.1 == "session" {
+                    "account".to_string()
+                } else {
+                    "key".to_string()
+                },
+                enabled: false,
+            }
+        });
+    }
+
+    let mut out: Vec<CredentialRow> = known
+        .into_iter()
+        .map(|(key, spec)| {
+            let rows = buckets.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+            finish_credential(spec, rows, &provider_totals)
+        })
+        .collect();
+    // Providers that left the config: one aggregated row, not one per
+    // historical key. The totals are the provider's own, so nothing is lost.
+    for (provider, rows) in &providers {
+        if configured.contains(provider) {
+            continue;
+        }
+        let distinct = buckets.keys().filter(|(p, _)| p == provider).count();
+        out.push(finish_credential(
+            CredentialSpec {
+                provider: provider.clone(),
+                credential: "removed".into(),
+                label: format!("已移除的凭据（{distinct}）"),
+                kind: "key".into(),
+                enabled: false,
+            },
+            rows.as_slice(),
+            &provider_totals,
+        ));
+    }
+    // Busiest credential first inside each provider; providers themselves
+    // stay alphabetical so the table is easy to scan.
+    out.sort_by(|a, b| {
+        a.provider
+            .cmp(&b.provider)
+            .then(b.total_tokens.cmp(&a.total_tokens))
+            .then(a.credential.cmp(&b.credential))
+    });
+    out
 }
 
 /// Sum a set of records.
 pub fn totals(records: &[UsageRecord]) -> Totals {
     let mut t = Totals::default();
     for r in records {
-        t.requests += 1;
-        if !r.ok {
-            t.failed += 1;
-            continue;
-        }
-        t.input_tokens += r.input_tokens;
-        t.output_tokens += r.output_tokens;
-        t.cache_read_tokens += r.cache_read_tokens;
-        t.cache_write_tokens += r.cache_write_tokens;
-        t.reasoning_tokens += r.reasoning_tokens;
-        if let Some(usd) = r.cost_usd {
-            t.cost_usd += usd;
-        }
-        if let Some(credits) = r.credits {
-            t.credits += credits;
-        }
-        if !r.priced {
-            t.unpriced += 1;
-        }
+        t.note(r);
     }
+    t.finish();
     t
 }
 
@@ -254,28 +710,14 @@ pub fn totals(records: &[UsageRecord]) -> Totals {
 pub fn group_by(records: &[UsageRecord], key: fn(&UsageRecord) -> String) -> Vec<(String, Totals)> {
     let mut map: BTreeMap<String, Totals> = BTreeMap::new();
     for r in records {
-        let entry = map.entry(key(r)).or_default();
-        entry.requests += 1;
-        if !r.ok {
-            entry.failed += 1;
-            continue;
-        }
-        entry.input_tokens += r.input_tokens;
-        entry.output_tokens += r.output_tokens;
-        entry.cache_read_tokens += r.cache_read_tokens;
-        entry.cache_write_tokens += r.cache_write_tokens;
-        entry.reasoning_tokens += r.reasoning_tokens;
-        if let Some(usd) = r.cost_usd {
-            entry.cost_usd += usd;
-        }
-        if let Some(credits) = r.credits {
-            entry.credits += credits;
-        }
-        if !r.priced {
-            entry.unpriced += 1;
-        }
+        map.entry(key(r)).or_default().note(r);
     }
-    map.into_iter().collect()
+    map.into_iter()
+        .map(|(label, mut t)| {
+            t.finish();
+            (label, t)
+        })
+        .collect()
 }
 
 /// The records of one day, keyed by day.
@@ -288,28 +730,14 @@ pub fn by_day(records: &[UsageRecord]) -> Vec<(String, Totals)> {
     let mut map: BTreeMap<String, Totals> = BTreeMap::new();
     for r in records {
         let day = r.time.chars().take(10).collect::<String>();
-        let entry = map.entry(day).or_default();
-        entry.requests += 1;
-        if !r.ok {
-            entry.failed += 1;
-            continue;
-        }
-        entry.input_tokens += r.input_tokens;
-        entry.output_tokens += r.output_tokens;
-        entry.cache_read_tokens += r.cache_read_tokens;
-        entry.cache_write_tokens += r.cache_write_tokens;
-        entry.reasoning_tokens += r.reasoning_tokens;
-        if let Some(usd) = r.cost_usd {
-            entry.cost_usd += usd;
-        }
-        if let Some(credits) = r.credits {
-            entry.credits += credits;
-        }
-        if !r.priced {
-            entry.unpriced += 1;
-        }
+        map.entry(day).or_default().note(r);
     }
-    map.into_iter().collect()
+    map.into_iter()
+        .map(|(day, mut t)| {
+            t.finish();
+            (day, t)
+        })
+        .collect()
 }
 
 /// How a request's context window was filled, broken down by what put bytes
@@ -656,6 +1084,109 @@ mod tests {
         assert_eq!(day.reasoning_tokens, all.reasoning_tokens);
     }
 
+    #[test]
+    fn ttft_is_summarized_with_samples_and_percentiles_everywhere() {
+        let mut a = record();
+        a.time = "2026-10-26T08:00:00+00:00".into();
+        a.provider = "p1".into();
+        a.ttft_ms = Some(100);
+        let mut b = record();
+        b.time = "2026-10-26T09:00:00+00:00".into();
+        b.provider = "p1".into();
+        b.ttft_ms = Some(300);
+        let mut c = record();
+        c.time = "2026-10-26T10:00:00+00:00".into();
+        c.provider = "p2".into();
+        c.ttft_ms = Some(50);
+        // A non-streaming reply: counted in requests, never in TTFT.
+        let mut d = record();
+        d.time = "2026-10-26T11:00:00+00:00".into();
+        d.provider = "p2".into();
+        // A failed reply with a stray sample must not skew the speed.
+        let mut e = record();
+        e.time = "2026-10-26T12:00:00+00:00".into();
+        e.provider = "p2".into();
+        e.ok = false;
+        e.ttft_ms = Some(9999);
+
+        let all = totals(&[a.clone(), b.clone(), c.clone(), d.clone(), e.clone()]);
+        assert_eq!(all.requests, 5);
+        assert_eq!(all.ttft_samples, 3);
+        assert_eq!(all.ttft_avg_ms, 150); // (100 + 300 + 50) / 3
+        assert_eq!(all.ttft_p50_ms, Some(100));
+        assert_eq!(all.ttft_p95_ms, Some(300));
+
+        let by_provider = group_by(
+            &[a.clone(), b.clone(), c.clone(), d.clone(), e.clone()],
+            |r| r.provider.clone(),
+        );
+        let p1 = by_provider.iter().find(|(k, _)| k == "p1").unwrap();
+        assert_eq!(p1.1.ttft_samples, 2);
+        assert_eq!(p1.1.ttft_avg_ms, 200);
+        let p2 = by_provider.iter().find(|(k, _)| k == "p2").unwrap();
+        assert_eq!(p2.1.requests, 3);
+        assert_eq!(p2.1.ttft_samples, 1);
+        assert_eq!(p2.1.ttft_avg_ms, 50);
+
+        let days = by_day(&[a, b, c, d, e]);
+        let (_, day) = days.iter().find(|(d, _)| d == "2026-10-26").unwrap();
+        assert_eq!(day.ttft_samples, all.ttft_samples);
+        assert_eq!(day.ttft_avg_ms, all.ttft_avg_ms);
+        assert_eq!(day.ttft_p50_ms, all.ttft_p50_ms);
+        assert_eq!(day.ttft_p95_ms, all.ttft_p95_ms);
+    }
+
+    #[test]
+    fn no_ttft_samples_reports_none_instead_of_zero_percentiles() {
+        let all = totals(&[record()]);
+        assert_eq!(all.ttft_samples, 0);
+        assert_eq!(all.ttft_avg_ms, 0);
+        assert_eq!(all.ttft_p50_ms, None);
+        assert_eq!(all.ttft_p95_ms, None);
+    }
+
+    #[test]
+    fn speed_is_tokens_over_request_time_per_provider_key() {
+        // One streaming reply on key k1: 100 output tokens, 100ms to the
+        // first one, 2.0s of generation afterwards.
+        let mut a = record();
+        a.provider = "p1".into();
+        a.key_id = Some("k1".into());
+        a.key_label = Some("fast".into());
+        a.output_tokens = 100;
+        a.latency_ms = 2100;
+        a.ttft_ms = Some(100);
+        // A non-streaming reply on the same key: counts for volume and
+        // request time, but has no generation phase to measure.
+        let mut b = record();
+        b.provider = "p1".into();
+        b.key_id = Some("k1".into());
+        b.output_tokens = 300;
+        b.latency_ms = 3000;
+        // A second key on the same provider is a separate row.
+        let mut c = record();
+        c.provider = "p1".into();
+        c.key_id = Some("k2".into());
+        c.output_tokens = 10;
+        c.latency_ms = 1000;
+
+        let rows = by_provider_key(&[a, b, c]);
+        assert_eq!(rows.len(), 2);
+        let k1 = rows.iter().find(|r| r.key_id == "k1").unwrap();
+        assert_eq!(k1.requests, 2);
+        assert_eq!(k1.total_tokens, 400);
+        // 400 tokens over 5.1s of request time.
+        assert!((k1.tokens_per_sec - 400.0 / 5.1).abs() < 0.1);
+        // Output rate only counts the streaming sample: 100 over 2.0s.
+        assert!((k1.output_tokens_per_sec - 50.0).abs() < 0.1);
+        assert_eq!(k1.ttft_samples, 1);
+        assert_eq!(k1.key_label.as_deref(), Some("fast"));
+        let k2 = rows.iter().find(|r| r.key_id == "k2").unwrap();
+        assert_eq!(k2.total_tokens, 10);
+        assert_eq!(k2.ttft_samples, 0);
+        assert_eq!(k2.output_tokens_per_sec, 0.0);
+    }
+
     // ------------------------------------------------------- context --
 
     #[test]
@@ -716,6 +1247,140 @@ mod tests {
         assert_eq!(ctx.fill_ratio(), 1.0);
         ctx.window_tokens = 0;
         assert_eq!(ctx.fill_ratio(), 0.0);
+    }
+
+    // ------------------------------------------------- by_credential --
+
+    fn credential_rec(provider: &str, key: &str, tokens: u64, ok: bool) -> UsageRecord {
+        let mut r = record();
+        r.provider = provider.to_string();
+        r.key_id = Some(key.to_string());
+        r.input_tokens = tokens;
+        r.ok = ok;
+        r.status = if ok { 200 } else { 429 };
+        r.latency_ms = 1000;
+        r.cost_usd = Some(0.5);
+        r.time = "2026-11-14T10:00:00+00:00".to_string();
+        r
+    }
+
+    #[test]
+    fn credentials_include_configured_rows_with_no_traffic_and_unknown_rows() {
+        let records = vec![
+            credential_rec("alpha", "key-1", 100, true),
+            credential_rec("alpha", "key-2", 300, true),
+            credential_rec("alpha", "key-2", 0, false),
+            credential_rec("beta", "session", 50, true),
+            credential_rec("ghost", "old-key", 7, true),
+        ];
+        let specs = vec![
+            CredentialSpec {
+                provider: "alpha".into(),
+                credential: "key-1".into(),
+                label: "主密钥".into(),
+                kind: "key".into(),
+                enabled: true,
+            },
+            CredentialSpec {
+                provider: "alpha".into(),
+                credential: "key-2".into(),
+                label: "备用".into(),
+                kind: "key".into(),
+                enabled: true,
+            },
+            // Configured but idle: still a row, so every provider is visible.
+            CredentialSpec {
+                provider: "charlie".into(),
+                credential: "key-x".into(),
+                label: "unused".into(),
+                kind: "key".into(),
+                enabled: true,
+            },
+            CredentialSpec {
+                provider: "beta".into(),
+                credential: "session".into(),
+                label: "张*".into(),
+                kind: "account".into(),
+                enabled: true,
+            },
+        ];
+        let rows = by_credential(&records, &specs);
+        let idle = rows
+            .iter()
+            .find(|r| r.provider == "charlie")
+            .expect("an idle configured credential must still be listed");
+        assert!(!idle.seen);
+        assert_eq!(idle.total_tokens, 0);
+        assert_eq!(idle.requests, 0);
+        let ghost = rows
+            .iter()
+            .find(|r| r.provider == "ghost")
+            .expect("a removed key's traffic must not disappear");
+        assert!(!ghost.enabled);
+        assert_eq!(ghost.total_tokens, 7);
+        let k1 = rows.iter().find(|r| r.credential == "key-1").unwrap();
+        let k2 = rows.iter().find(|r| r.credential == "key-2").unwrap();
+        assert_eq!(k1.share_of_provider, 0.25);
+        assert_eq!(k2.share_of_provider, 0.75);
+        // A failed request counts as a request but carries no tokens.
+        assert_eq!(k2.requests, 2);
+        assert_eq!(k2.failed, 1);
+        assert_eq!(k2.success_rate, 0.5);
+        assert_eq!(k2.last_seen.as_deref(), Some("2026-11-14T10:00:00+00:00"));
+        // Busiest first inside a provider.
+        let alpha: Vec<&str> = rows
+            .iter()
+            .filter(|r| r.provider == "alpha")
+            .map(|r| r.credential.as_str())
+            .collect();
+        assert_eq!(alpha, vec!["key-2", "key-1"]);
+    }
+
+    #[test]
+    fn an_unconfigured_provider_collapses_into_one_row() {
+        // A load-test stub can leave hundreds of random key ids behind.
+        // They must not turn the console into 500 rows of noise.
+        let mut records = Vec::new();
+        for n in 0..40 {
+            records.push(credential_rec(
+                "benchmark-stub",
+                &format!("key-{n}"),
+                3,
+                true,
+            ));
+        }
+        let rows = by_credential(&records, &[]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].credential, "removed");
+        assert_eq!(rows[0].total_tokens, 120);
+        assert_eq!(rows[0].share_of_provider, 1.0);
+        assert!(!rows[0].enabled);
+    }
+
+    #[test]
+    fn credential_totals_use_the_billable_token_definition() {
+        let mut r = credential_rec("alpha", "key-1", 10, true);
+        r.output_tokens = 5;
+        r.cache_read_tokens = 100;
+        r.cache_write_tokens = 2;
+        r.reasoning_tokens = 4;
+        r.ttft_ms = Some(20);
+        let rows = by_credential(
+            &[r.clone()],
+            &[CredentialSpec {
+                provider: "alpha".into(),
+                credential: "key-1".into(),
+                label: "key-1".into(),
+                kind: "key".into(),
+                enabled: true,
+            }],
+        );
+        let row = &rows[0];
+        // Reasoning is a break-out of output, so 10+5+100+2 = 117.
+        assert_eq!(row.total_tokens, 117);
+        assert_eq!(row.ttft_samples, 1);
+        assert_eq!(row.ttft_p50_ms, Some(20));
+        assert_eq!(row.share_of_provider, 1.0);
     }
 
     #[test]

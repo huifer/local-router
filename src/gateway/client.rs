@@ -356,22 +356,130 @@ impl UpstreamReply {
     }
 }
 
-/// Read a vendor's `Retry-After` header. Vendors send either a number of
-/// seconds or an HTTP date; both are honoured so an agent's retry storm
-/// stops for exactly as long as the vendor asked.
+/// Read a vendor's pacing hint from its response headers.
+///
+/// The standard `Retry-After` carries delta seconds or an HTTP date. Many
+/// vendors instead send `x-ratelimit-reset` / `ratelimit-reset`, which is an
+/// absolute epoch timestamp (seconds or milliseconds) or a delta in seconds.
+/// All of them mean the same thing: do not ask this upstream again until then.
 pub fn retry_after_from_headers(
     headers: &reqwest::header::HeaderMap,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<u64> {
-    let raw = headers.get("retry-after")?.to_str().ok()?.trim();
-    if let Ok(secs) = raw.parse::<u64>() {
-        return Some(secs);
+    if let Some(raw) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
+        let raw = raw.trim();
+        if let Ok(secs) = raw.parse::<u64>() {
+            return Some(secs);
+        }
+        if let Some(secs) = wait_from_date(raw, now) {
+            return Some(secs);
+        }
     }
+    for name in ["x-ratelimit-reset", "ratelimit-reset", "x-rate-limit-reset"] {
+        let Some(raw) = headers.get(name).and_then(|v| v.to_str().ok()) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if let Ok(n) = raw.parse::<f64>() {
+            return Some(wait_from_number(n, now));
+        }
+        if let Some(secs) = wait_from_date(raw, now) {
+            return Some(secs);
+        }
+    }
+    None
+}
+
+/// A number is either an absolute epoch (seconds or milliseconds) or a
+/// relative wait in seconds. Small values are always relative, so a vendor
+/// saying "wait 30" is not mistaken for 1970.
+fn wait_from_number(n: f64, now: chrono::DateTime<chrono::Utc>) -> u64 {
+    if n > 1_000_000_000.0 {
+        let at = if n > 1e12 { n / 1000.0 } else { n };
+        (at - now.timestamp() as f64).max(0.0) as u64
+    } else {
+        n.max(0.0) as u64
+    }
+}
+
+/// Seconds from `now` until an RFC 2822 / RFC 3339 / `YYYY-MM-DD HH:MM:SS`
+/// timestamp. Dates without a zone are read as UTC.
+fn wait_from_date(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
     let date = chrono::DateTime::parse_from_rfc2822(raw)
         .or_else(|_| chrono::DateTime::parse_from_rfc3339(raw))
+        .map(|d| d.with_timezone(&chrono::Utc))
+        .or_else(|_| {
+            chrono::NaiveDateTime::parse_from_str(raw, "%Y-%m-%d %H:%M:%S").map(|d| d.and_utc())
+        })
         .ok()?;
-    let delta = date.with_timezone(&chrono::Utc) - now;
-    Some(delta.num_seconds().max(0) as u64)
+    Some((date - now).num_seconds().max(0) as u64)
+}
+
+/// Vendors that send no pacing header often put the wait — or an absolute
+/// reset time — in the error JSON instead. WorkBuddy, for one, answers
+/// `{"msg": ..., "retry_policy": {...}}`. Walk the shallow JSON tree for a
+/// known key and turn its value into seconds from now.
+///
+/// Only called for non-2xx whole replies, so a successful body's `created`
+/// timestamps can never be mistaken for a reset time.
+pub fn retry_after_from_body(body: &Value, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+    fn is_wait_key(key: &str) -> bool {
+        let k = key.to_ascii_lowercase().replace(['_', '-'], "");
+        [
+            "retryafter",
+            "retryafterseconds",
+            "retryafterms",
+            "retryat",
+            "retrytime",
+            "resetat",
+            "resettime",
+            "resetin",
+            "nextretrytime",
+            "nextavailabletime",
+            "availableat",
+            "limitreset",
+            "limitresettime",
+            "waitseconds",
+            "cooluntil",
+        ]
+        .contains(&k.as_str())
+    }
+
+    fn wait_value(value: &Value, now: chrono::DateTime<chrono::Utc>) -> Option<u64> {
+        match value {
+            Value::Number(n) => n.as_f64().map(|n| wait_from_number(n, now)),
+            Value::String(s) => {
+                let s = s.trim();
+                if let Ok(n) = s.parse::<f64>() {
+                    Some(wait_from_number(n, now))
+                } else {
+                    wait_from_date(s, now)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn walk(value: &Value, now: chrono::DateTime<chrono::Utc>, depth: u8) -> Option<u64> {
+        if depth > 5 {
+            return None;
+        }
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if is_wait_key(key) {
+                        if let Some(secs) = wait_value(child, now) {
+                            return Some(secs);
+                        }
+                    }
+                }
+                map.values().find_map(|child| walk(child, now, depth + 1))
+            }
+            Value::Array(items) => items.iter().find_map(|item| walk(item, now, depth + 1)),
+            _ => None,
+        }
+    }
+    walk(body, now, 0)
 }
 
 /// Wait for the first byte of a stream, then put it back at the head.
@@ -451,6 +559,15 @@ pub async fn send(
         let text = resp.text().await.unwrap_or_default();
         let parsed: Value = serde_json::from_str(&text)
             .unwrap_or_else(|_| serde_json::json!({"error": {"message": text}}));
+        // An error body is the other place a vendor states when its limit
+        // lifts. Only errors carry this: a success body has timestamps of
+        // its own that mean something else entirely.
+        let retry_after = retry_after.or_else(|| {
+            (400..600)
+                .contains(&status)
+                .then(|| retry_after_from_body(&parsed, chrono::Utc::now()))
+                .flatten()
+        });
         Ok(UpstreamReply::Whole {
             status,
             body: parsed,
@@ -677,6 +794,46 @@ mod tests {
         );
         assert_eq!(retry_after_from_headers(&h, now), Some(0));
         assert_eq!(retry_after_from_headers(&HeaderMap::new(), now), None);
+    }
+
+    #[test]
+    fn reset_headers_and_error_bodies_state_a_wait() {
+        use reqwest::header::{HeaderMap, HeaderValue};
+        let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let epoch = now.timestamp();
+
+        // Absolute epoch seconds and milliseconds, and a plain delta.
+        let mut h = HeaderMap::new();
+        h.insert(
+            "x-ratelimit-reset",
+            HeaderValue::from_str(&(epoch + 90).to_string()).unwrap(),
+        );
+        assert_eq!(retry_after_from_headers(&h, now), Some(90));
+        let mut h = HeaderMap::new();
+        h.insert(
+            "ratelimit-reset",
+            HeaderValue::from_str(&((epoch + 90) * 1000).to_string()).unwrap(),
+        );
+        assert_eq!(retry_after_from_headers(&h, now), Some(90));
+        let mut h = HeaderMap::new();
+        h.insert("x-ratelimit-reset", HeaderValue::from_static("30"));
+        assert_eq!(retry_after_from_headers(&h, now), Some(30));
+
+        // WorkBuddy-style nested error body: the wait is inside retry_policy.
+        let body = serde_json::json!({
+            "code": 42901,
+            "msg": "rate limited",
+            "retry_policy": {"retry": true, "retryAfter": 120},
+        });
+        assert_eq!(retry_after_from_body(&body, now), Some(120));
+        // An absolute wall-clock reset, nested under data.
+        let body = serde_json::json!({"data": {"resetTime": "2026-01-01 00:01:30"}});
+        assert_eq!(retry_after_from_body(&body, now), Some(90));
+        // No timing field: no invented wait.
+        let body = serde_json::json!({"msg": "rate limited", "code": 42901});
+        assert_eq!(retry_after_from_body(&body, now), None);
     }
 
     #[test]

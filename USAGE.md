@@ -170,12 +170,17 @@ curl -H "Authorization: Bearer local-router" http://127.0.0.1:3435/v1/models
 | **Providers** | 加/删上游、改 key、刷新模型列表、测连通性 |
 | **Models** | 所有对外暴露的模型（`provider/model`）一览 |
 | **Groups** | 路由组：成员、策略、粘性、列出与否 |
-| **Usage** | 用量：Overview / Sessions / Projects / Context / Quota / Bills |
+| **Usage** | 用量：Overview / Tokens / Credentials / Sessions / Projects / Context / Quota / Bills |
 | **Traces** | 链路追踪：一次任务 → 它的每次请求 → 每次上游调用 |
 | **Settings** | 端口、绑定地址、调用 key、遮蔽开关、caller key |
 
 **Usage 页的子页签**：
 
+- **Credentials**：按「供应商 × API key / 账号」的完整 token 账。每个配置
+  过的凭据都有一行（包括本期间没流量的），带 token 分列与构成条、费用、
+  请求/失败/成功率、`tok/s`、TTFT p50、占该供应商的比例、最近使用；登录态
+  账号还挂厂商额度窗口，配了 `daily_tokens` 的供应商显示今日已用/剩余进度。
+  可搜索、按 token/请求/最近排序、隐藏空闲凭据。
 - **Sessions**：按会话出账（标题取首个用户消息第一行）
 - **Projects**：按工作目录分组，可改名/配色/设预算/合并
 - **Context**：上下文窗口拆解（系统提示 / 工具定义 / 附件 / 对话各占多少 token）
@@ -257,6 +262,7 @@ local-router provider test deepseek             # 发一个真实请求测连通
 local-router provider key deepseek sk-第二个key  # 加一把 key（多 key 轮试）
 local-router provider concurrency deepseek <key-id|session> 4  # 单把 key 的最大同时请求数，超限排队；0 取消
 local-router provider limit deepseek --rpm 60 --tpm 100000  # 限流（0 关闭）；caller key 同理走控制台/PATCH
+local-router provider limit deepseek --daily-tokens 5000000  # 每日 token 额度（UTC 翻日，0 关闭）
 local-router provider schedule deepseek                          # 看使用时段
 local-router provider schedule deepseek --window 22:00-08:00     # 只在每晚 22 点到次日 8 点用这家（跨午夜）
 local-router provider schedule deepseek --window 22:00-08:00 --tz Asia/Shanghai --models "gpt-*"  # 指定时区、只限部分模型
@@ -541,6 +547,36 @@ curl $BASE/v1/videos -H "Authorization: Bearer $KEY" \
 ```sh
 local-router provider media workbuddy hunyuan-image-v3.0-art kling-video-v3
 ```
+
+### 2.10 网关自身监控：CPU / 内存 / 应答速率
+
+网关会以 10 秒为周期给自己采样：进程 CPU、常驻内存、线程数、进行中请求数，
+以及这个周期里完成了多少请求、失败多少、应答多快。数据落一份在内存环形队列
+（最近 6 小时），同时写入 `usage.db` 的 `sys_samples` 表——重启不清零，随
+`retention_days` 一起每日清理。
+
+- **可视化**：控制台「系统」页。两张图（CPU+内存、应答速率+延迟），
+  8 张实时卡片，1m / 5m / 15m 滚动窗口汇总表，范围可切 15m / 1h / 6h / 24h，
+  每 5 秒自动刷新。
+- **API**：`GET /api/system`（实时快照 + 窗口汇总），
+  `GET /api/system/series?minutes=60`（画图用的时间序列，自动聚合到约 180 个点）。
+- **Prometheus**：`/metrics` 新增
+  `local_router_process_cpu_percent`（单核百分比，top 口径，双核打满读 200）、
+  `local_router_process_resident_bytes`（RSS）、
+  `local_router_process_threads`、`local_router_requests_per_minute`。
+
+口径说明：**CPU 是单核百分比**（乘以核数才是整机占用比）；**延迟分位数只统计
+成功应答**——一次 600 秒超时是失败计数，不是最慢的应答；TTFT 仍只来自流式
+响应（见 docs/BILLING.md 的口径页）。
+
+```sh
+curl http://127.0.0.1:3435/api/system | python3 -m json.tool
+curl "http://127.0.0.1:3435/api/system/series?minutes=360"
+curl -s http://127.0.0.1:3435/metrics | grep local_router_process
+```
+
+监控有两条现成路径：短周期排障看控制台「系统」页；长期留存交给
+`examples/monitoring/` 里的 Prometheus + Grafana 栈抓 `/metrics`。
 
 ---
 
@@ -1036,6 +1072,10 @@ local-router serve --lan
 ### 8.4 可观测性出口
 
 - **Prometheus**：`/metrics`（实时状态与速率；长期账本仍是 usage.db）。
-  现成的监控栈见 `examples/monitoring/`。
+  现成的监控栈见 `examples/monitoring/`。网关自身的 CPU / 内存 / 线程 /
+  每分钟请求数也在里面（`local_router_process_*`），跨机抓取即可对比。
+- **进程采样**：`/api/system`（快照）与 `/api/system/series`（历史），
+  样本存 `sys_samples` 表，跟随 `retention_days` 清理；控制台「系统」页
+  就是这两组数据的可视化。
 - **OTLP**（需 `build --features otlp`）：`settings.otlp.endpoint` 指向收集器，
   把 `session → request → upstream` span 树发过去。默认构建不含此代码。

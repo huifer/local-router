@@ -69,6 +69,23 @@ pub fn set_schedules_closed(n: u64) {
     gauge!("local_router_schedules_closed").set(n as f64);
 }
 
+/// Push the gateway's own process readings, as the sampler measured them.
+///
+/// CPU is percent of one core (`top` semantics), so a busy gateway reading
+/// `200` is using two cores. `local_router_process_resident_bytes` is the
+/// RSS, not a virtual size: it is the number that grows when something
+/// leaks.
+pub fn set_process(cpu_pct: f64, rss_bytes: u64, threads: u32) {
+    gauge!("local_router_process_cpu_percent").set(cpu_pct);
+    gauge!("local_router_process_resident_bytes").set(rss_bytes as f64);
+    gauge!("local_router_process_threads").set(threads as f64);
+}
+
+/// Push the six-sample (one minute) request rate the sampler measured.
+pub fn set_requests_per_minute(n: f64) {
+    gauge!("local_router_requests_per_minute").set(n);
+}
+
 /// Count one target skipped because its usage window is closed. A local
 /// policy, not a vendor 429: no cooldown follows it.
 pub fn record_schedule_skipped(provider: &str) {
@@ -86,9 +103,19 @@ pub fn record_latency(api: &str, seconds: f64) {
     histogram!("local_router_request_duration_seconds", "api" => api.to_string()).record(seconds);
 }
 
-/// Record time to first token for a streaming reply.
-pub fn record_ttft(api: &str, seconds: f64) {
-    histogram!("local_router_ttft_seconds", "api" => api.to_string()).record(seconds);
+/// Record time to first token for one streaming reply.
+///
+/// `provider` is an open label (see the cardinality policy above): the whole
+/// point of this histogram is comparing how fast each vendor starts talking.
+/// It only receives samples from replies that actually streamed, so the
+/// per-provider quantiles are per-provider *streaming* latencies.
+pub fn record_ttft(api: &str, provider: &str, seconds: f64) {
+    histogram!(
+        "local_router_ttft_seconds",
+        "api" => api.to_string(),
+        "provider" => provider.to_string(),
+    )
+    .record(seconds);
 }
 
 /// Record one persisted usage record as a request counter (and its tokens).
@@ -146,6 +173,15 @@ pub fn record_request(rec: &UsageRecord) {
         )
         .increment(rec.cache_read_tokens);
     }
+    if rec.cache_write_tokens > 0 {
+        counter!(
+            "local_router_tokens_total",
+            "kind" => "cache_write".to_string(),
+            "api" => api.clone(),
+            "provider" => provider.clone(),
+        )
+        .increment(rec.cache_write_tokens);
+    }
     if let Some(cost) = rec.cost_usd.filter(|c| c.is_finite() && *c > 0.0) {
         // Counters are integers: micro-dollars keep fractions without a
         // float-typed counter. Divide by 1e6 in Grafana.
@@ -157,7 +193,7 @@ pub fn record_request(rec: &UsageRecord) {
         .increment((cost * 1_000_000.0).round() as u64);
     }
     if let Some(ttft) = rec.ttft_ms {
-        histogram!("local_router_ttft_seconds", "api" => api.clone()).record(ttft as f64 / 1000.0);
+        record_ttft(&api, &provider, ttft as f64 / 1000.0);
     }
 }
 
@@ -200,9 +236,51 @@ mod tests {
         );
         let line = out
             .lines()
-            .find(|l| l.starts_with("local_router_requests_total"))
+            .find(|l| {
+                l.starts_with("local_router_requests_total") && l.contains("provider=\"openai\"")
+            })
             .expect("request counter line");
         let value: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
         assert!(value >= 2, "expected at least 2 attempts, got {value}");
+    }
+
+    #[tokio::test]
+    async fn a_priced_request_reaches_the_micro_usd_cost_counter() {
+        install();
+        let mut rec = UsageRecord::new("glm-4.7", "openai_chat");
+        rec.provider = "zhipu".to_string();
+        rec.status = 200;
+        rec.cost_usd = Some(0.25);
+        record_request(&rec);
+
+        let out = render();
+        let line = out
+            .lines()
+            .find(|l| l.starts_with("local_router_cost_micro_usd_total{"))
+            .expect("cost counter vanished from /metrics");
+        let value: u64 = line.rsplit(' ').next().unwrap().parse().unwrap();
+        assert_eq!(value, 250_000);
+    }
+
+    #[tokio::test]
+    async fn a_streaming_reply_reaches_the_ttft_histogram_per_provider() {
+        install();
+        // A streaming reply carries a measured first token; it must show up
+        // in `/metrics` labeled by provider, not just by api.
+        let mut rec = UsageRecord::new("glm-4.7", "openai_chat");
+        rec.provider = "zhipu".to_string();
+        rec.status = 200;
+        rec.ttft_ms = Some(56);
+        record_request(&rec);
+
+        let out = render();
+        assert!(
+            out.contains("local_router_ttft_seconds"),
+            "streaming reply did not reach the TTFT histogram:\n{out}"
+        );
+        assert!(
+            out.contains("provider=\"zhipu\""),
+            "TTFT histogram lost the provider label:\n{out}"
+        );
     }
 }

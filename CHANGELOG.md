@@ -8,6 +8,23 @@
 
 ### Added
 
+- **每个供应商 × 每把 API key / 每个账号的 token 消耗额度统计**：
+  - 新增 `credentials[]`（`/api/usage`）与 `per_credential[]`
+    （`/v1/local-router/usage`）：按 `(provider, key_id)` 分桶，复用同一套
+    `Totals` 口径，带 token 分列、费用、成功率、TTFT avg/p50/p95、`tok/s`、
+    占该供应商比例与最近使用；**空闲凭据也列出**，账本里已删除的 key 也保留，
+    已整体移除的供应商合并成一行，所以每个供应商都有账可查且表格不被
+    历史测试桩淹没。登录态供应商按账号池 slot 拆行并挂厂商额度窗口。
+  - 控制台新增 **Usage → 凭据** 页：按供应商分组、token 构成条、每日 token
+    额度与厂商额度进度条、搜索/排序/隐藏空闲。
+  - `Provider.daily_tokens`：每日 token 额度（UTC 翻日，PATCH / CLI
+    `provider limit --daily-tokens` / provider 卡片均可设），本地策略跳过目标、
+    不触发 429 冷却；计数口径含缓存 token。
+  - **登录态账号可归因**：WorkBuddy 轮换账号在路由时选定并写进 target，账本、
+    429 冷却、并发限额、affinity 与 trace 都指向真正签名这次请求的账号；
+    QwenWork / Trae CN 同样记账号 slot（昵称服务端掩码），不再一律记成
+    `session`。`persist_usage` 的限流计数补齐缓存 token。
+
 - **功能面全量补齐**（对标 LiteLLM / Portkey / OpenRouter / Envoy / new-api /
   claude-code-router 的审计落地）：
   - **同协议原样转发**：入站与出站协议相同时，直接转发调用方的请求体，
@@ -265,8 +282,84 @@
     瓶颈是账本落库的单锁串行路径（关掉后 13–19.5k rps，5–7×）；百万请求零
     错误零警告。复现步骤见文档 §6。
 
+### Added
+
+- **网关自身监控：CPU / 内存 / 应答速率（持续采样 + 可视化）**：进程内
+  10 秒采样器（`src/sysmon.rs`，getrusage + /proc 或 proc_pidinfo）记录
+  单核百分比 CPU、RSS、线程数、进行中请求，以及每窗口的完成请求数、
+  失败数、延迟 p50/p95（只计成功应答）与首 token p50。内存环形队列留
+  6 小时，同时落 `usage.db` 新表 `sys_samples`（重启不清零，随
+  `retention_days` 清理）。出口：控制台新增「系统」页（CPU+内存、速率+延迟
+  两张图，范围 15m–24h，8 张实时卡片与 1m/5m/15m 窗口表，5s 自动刷新）；
+  `GET /api/system` 与 `GET /api/system/series?minutes=…`；`/metrics` 新增
+  `local_router_process_cpu_percent` / `local_router_process_resident_bytes` /
+  `local_router_process_threads` / `local_router_requests_per_minute`。
+  流式成功路径也喂了采样器（与上一条 metrics 分裂修复同根）。
+- **每供应商 × 每 API key 的 token 速率**：两个口径随每个维度一起返回——
+  `tokens_per_sec`（总 token ÷ 请求耗时合计，并发按串行计以便横向比较）
+  与 `output_tokens_per_sec`（输出 ÷ 生成耗时，生成耗时 = 请求耗时 −
+  首 token 等待，仅流式样本）。控制台 Token 页新增「每供应商 × 每 API
+  密钥的 token 速率」表（`/api/usage` 的 `by_key_speed[]`，网关侧
+  `/v1/local-router/usage` 的 `per_key[]`）；口径见 docs/BILLING.md。
+- **额度耗尽自动停用**：打开 `hold_when_exhausted` 后，后台每 10 分钟
+  检查一次 workbuddy 类登录态 provider 的额度：归零 → 直接
+  `enabled=false`（`auto_disabled_at` 标记，webhook `quota-pause`），
+  额度窗口恢复 → 自动启用（`quota-resume`）。手动停用不会被自动打开，
+  手动启用会清掉标记；决策状态机有单测。
+- **按供应商 token 速率进 TUI dashboard**：BY PLATFORM / BY DAY 行改为
+  全口径 token（含缓存读写）并带 TTFT（`52ms/n8` 形式，样本数为分母）；
+  SQL 聚合（`AggregateRow`）补 `COUNT(ttft_ms)` 与平均 TTFT，JSONL 退路
+  复用同一套 `Totals` 聚合，两条路径口径一致。
+
 ### Fixed
 
+- **账本漏账：专用通道的整段回复没有用量记录，流式回复不进额度窗口**：
+  - QwenWork / Trae CN 在调用方要 `stream=false` 时只写了 trace span，
+    **完全不写 usage 记录**——这两家的整段回复在 `credentials[]`、
+    `usage.db`、metrics、sysmon 里凭空消失。现在两条专用通道的成功 /
+    失败路径都走 `persist_usage`（含定价、HTTP 状态、账号 slot、延迟）。
+  - 两条专用通道的成功记录 `status` 恒为 0，失败记录也没有状态码；
+    现在成功 200、限流 429、其它上游错误 502。
+  - **流式成功走 `UsageGuard::finish`，从不经过 `persist_usage`**，因此
+    RPM/TPM、每日 token 额度、caller key 的月度预算从来没算过流式请求
+    （而 agent 几乎全是流式）。抽出 `record_usage_windows()` 供两个账本
+    出口共用：整段回复 / 失败走 `persist_usage`，流式回复走
+    `UsageGuard::finish`，口径与缓存 token 计数完全一致。
+  - 回归测试：`tests/qwen.rs` 验证 QwenWork 整段 + 流式两次请求都落账
+    （status 200、10 token/次、预算窗口累计 20）；`tests/gateway.rs`
+    验证流式回复把 8 token 写进 `provider:mock` 的当日额度窗口。
+
+- **上游给的限流时间没有被用来停请求**：此前只认 HTTP 头 `Retry-After`
+  （秒 / HTTP 日期），而 WorkBuddy 这类上游的错误体是
+  `{"msg", "retry_policy", "displayMsg"}`——网关连错误文案都因为只找
+  `error.message` 而丢成 `the vendor refused the request`，更没有等待时间。
+  现在额外识别 `X-RateLimit-Reset` / `RateLimit-Reset`（epoch 秒或毫秒、
+  相对秒数、日期）与错误体里的 `retryAfter` / `resetAt` / `resetTime` /
+  `retryAt` / `nextRetryTime` / `waitSeconds`（含嵌套、ISO、
+  `YYYY-MM-DD HH:MM:SS`），解析出的时长直接进入 429 冷却，冷却期间路由
+  在发请求前就跳过该目标；冷却上限从 1 天放宽到 30 天（仍防畸形值），
+  错误文案保留上游 `msg` / `displayMsg.zh`。实测 mock 上游回
+  `retry_policy.retryAfter=120` 时冷却为 119s、第二次请求上游计数不增。
+- **`hold_when_exhausted` 可用 PATCH 在线改**：额度归零期间完全不发请求
+  的开关此前只能改配置文件；现在
+  `PATCH /api/providers/{id} {"hold_when_exhausted": true}` 即时生效
+  （热重载）。额度接口另返回周期时间（`CycleStartTime` / `CycleEndTime`），
+  控制台 Quota 页显示为 `resets_at`——那是额度刷新时间，不是 429 的等待
+  时间；想按它停请求就用这个开关。
+- **流式成功请求整体绕过 `/metrics`**：`UsageGuard::finish()`（流式成功
+  路径）直接写账本，不走 `persist_usage`，而请求 / token 计数与 TTFT
+  直方图全部挂在 `persist_usage` 上——结果账本里 zhipu 804 条 2xx，
+  `/metrics` 里 0 条；`local_router_ttft_seconds` 直方图挂在一条
+  `ttft_ms` 恒为 None 的路径上，实际永远收不到样本。现在流式成功也
+  喂 metrics（两条写库路径互斥，不会重复计数）。
+- **TTFT（首 token 延迟）按维度可查**：`Totals` 新增 `ttft_samples` /
+  `ttft_avg_ms` / `ttft_p50_ms` / `ttft_p95_ms`，`totals` / `group_by` /
+  `by_day` 三处聚合统一走同一个折叠函数（顺带消除口径漂移）；
+  `/api/usage` 与 `/v1/local-router/usage` 的每个维度都带这四个字段；
+  控制台 Token 页新增「按供应商」表（请求 / token / TTFT 并列，含
+  「只有流式响应才有首 token」的分母提示）。`/metrics` 的 TTFT 直方图
+  补上 `provider` label（基数策略本就允许），并补齐缺失的
+  `cache_write` token 计数。更新后需重启 daemon 生效。
 - **按天账单漏算缓存 token**：`usage::by_day` 之前只累加输入/输出，把
   cache_read / cache_write / reasoning（及 unpriced 计数）全丢了——缓存密集
   的 agent 里按天曲线因此只有真值的一半上下，与总账对不上。现在与
@@ -306,6 +399,13 @@
   进程可读写——**注意：同一台机器上的其它用户也能读到这些密钥**。
 - **预设文案**：`WorkBuddy` / `QwenWork` 的名字去掉「用本机登录态」后缀
   （现在是浏览器登录），提示文案改为「(无需 key，使用浏览器登录)」。
+- **账本落库改为攒批写入**：`usage.db` 的写路径从「每请求一条 INSERT、
+  共用一把互斥锁串行提交」改为**独立 writer 线程 + 有界队列攒批**（≤128
+  行或每 100 ms 一批，单事务提交）。读写连接分离，WAL 下读不阻塞写。
+  这是此前默认配置下吞吐封顶（~2.5–3k rps）的唯一瓶颈，落库移出请求
+  热路径后预期大幅提升。读路径（控制台、CLI、测试）自带 `flush()`
+  语义：读之前先等队列提交完成，写完即读的可见性不变；网关请求路径
+  只入队、不等待。
 
 ## [0.1.1] - 2026-10-27
 

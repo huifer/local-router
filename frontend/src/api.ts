@@ -7,6 +7,8 @@ import type {
   Provider,
   Settings,
   Status,
+  SystemSnapshot,
+  SystemSeries,
   TraceDetail,
   TraceSessionDetail,
   TraceSessionsData,
@@ -83,6 +85,10 @@ export const getGroups = () => api<{ groups: Group[] }>("/api/groups");
 export const getModels = () => api<{ models: ModelItem[] }>("/api/models");
 export const getPresets = () => api<{ presets: PresetGroup[] }>("/api/presets");
 export const getUsage = (period = "7d") => api<UsageData>(`/api/usage?period=${period}`);
+/** The gateway's own vitals: CPU, memory, threads and answer-rate windows. */
+export const getSystem = () => api<SystemSnapshot>("/api/system");
+export const getSystemSeries = (minutes = 60) =>
+  api<SystemSeries>(`/api/system/series?minutes=${minutes}`);
 export const getTraces = (period = "7d") => api<TracesData>(`/api/traces?period=${period}`);
 export const getTrace = (id: string) =>
   api<TraceDetail>(`/api/traces/${encodeURIComponent(id)}`);

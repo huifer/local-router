@@ -1,6 +1,7 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { NavLink, Outlet, useLocation } from "react-router";
 import {
+  Activity,
   ArrowUpRight,
   AudioLines,
   Cpu,
@@ -24,6 +25,7 @@ const nav = [
   { to: "/models", key: "nav.models", icon: Layers },
   { to: "/groups", key: "nav.groups", icon: AudioLines },
   { to: "/usage", key: "nav.usage", icon: KeyRound },
+  { to: "/system", key: "nav.system", icon: Activity },
   { to: "/traces", key: "nav.traces", icon: GitBranch },
   { to: "/settings", key: "nav.settings", icon: Settings2 },
 ] as const;
@@ -34,6 +36,7 @@ const titleKeys: Record<string, string> = {
   "/models": "nav.models",
   "/groups": "nav.groups",
   "/usage": "nav.usage",
+  "/system": "nav.system",
   "/traces": "nav.traces",
   "/settings": "nav.settings",
 };

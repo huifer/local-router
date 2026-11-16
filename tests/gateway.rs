@@ -166,9 +166,11 @@ fn provider(id: &str, port: u16, models: &[&str], keys: usize) -> Provider {
         chat_path: None,
         stream_only: false,
         hold_when_exhausted: false,
+        auto_disabled_at: None,
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        daily_tokens: None,
         timeout_secs: None,
         connect_timeout_secs: None,
         first_byte_timeout_secs: None,
@@ -182,6 +184,8 @@ struct World {
     gateway_addr: String,
     vendor: Vendor,
     vendor_hits: Arc<AtomicUsize>,
+    /// The gateway's shared state, so tests can inspect live windows.
+    state: AppState,
 }
 
 /// Start both vendors and the gateway on free ports, with one configuration.
@@ -230,7 +234,7 @@ async fn world(config: Config) -> World {
     store.save(&config).unwrap();
     let state = AppState::load(store).await.unwrap();
 
-    let app = gateway::router(gateway::Gateway::new(state));
+    let app = gateway::router(gateway::Gateway::new(state.clone()));
     tokio::spawn(async move {
         axum::serve(gateway_listener, app).await.unwrap();
     });
@@ -241,6 +245,7 @@ async fn world(config: Config) -> World {
         gateway_addr: format!("http://127.0.0.1:{gateway_port}"),
         vendor,
         vendor_hits,
+        state,
     }
 }
 
@@ -1047,4 +1052,37 @@ async fn media_work_obeys_the_usage_window_too() {
         .as_str()
         .unwrap()
         .contains("usage window"));
+}
+
+/// A streaming reply ends in `UsageGuard::finish`, which is a different
+/// ledger sink from `persist_usage`. The rate-limit / daily budget windows
+/// must learn its tokens too, or a token budget would only ever count
+/// non-streaming calls (and agents almost always stream).
+#[tokio::test(flavor = "multi_thread")]
+async fn streaming_replies_feed_the_daily_token_budget() {
+    let mut config = base_config();
+    config.providers[0].daily_tokens = Some(1000);
+    let world = world(config).await;
+    let out = world
+        .stream(
+            "/v1/chat/completions",
+            "local-router",
+            json!({
+                "model": "mock/mock-small",
+                "stream": true,
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+        )
+        .await;
+    assert!(
+        out.contains("data:"),
+        "the caller must get an SSE stream: {out}"
+    );
+    let rows = world.state.rate_limits.snapshot();
+    let row = rows
+        .iter()
+        .find(|r| r.scope == "provider:mock")
+        .expect("the daily budget creates a provider window");
+    assert_eq!(row.tokens_today, 8, "{rows:?}");
+    assert_eq!(row.tokens_in_window, 8, "{rows:?}");
 }

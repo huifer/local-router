@@ -182,7 +182,7 @@ export default function ProvidersPage() {
   };
   const setProviderLimit = async (
     provider: AppData["providers"][number],
-    field: "rpm" | "tpm",
+    field: "rpm" | "tpm" | "daily_tokens",
     raw: string,
   ) => {
     const value = raw.trim() ? Math.max(0, Number.parseInt(raw, 10) || 0) : 0;
@@ -282,6 +282,17 @@ export default function ProvidersPage() {
                     className="h-7 w-14 border border-input bg-background px-1.5 text-center font-mono text-[10px]"
                   />
                   <span className="font-mono text-[9px] text-muted-foreground">{t("providers.tpm")}</span>
+                  <input
+                    aria-label={t("providers.dailyTokens")}
+                    title={t("providers.dailyTokensHint")}
+                    type="number"
+                    min="0"
+                    placeholder="∞"
+                    defaultValue={provider.daily_tokens ?? ""}
+                    onBlur={(event) => void setProviderLimit(provider, "daily_tokens", event.currentTarget.value)}
+                    className="h-7 w-16 border border-input bg-background px-1.5 text-center font-mono text-[10px]"
+                  />
+                  <span className="font-mono text-[9px] text-muted-foreground">{t("providers.dailyTokens")}</span>
                 </div>
                 <Button variant="destructive" size="sm" onClick={() => remove(provider)}>
                   {t("providers.remove")}

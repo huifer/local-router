@@ -213,6 +213,11 @@ pub struct Provider {
     /// window, and holding them would break working requests.
     #[serde(default)]
     pub hold_when_exhausted: bool,
+    /// When the quota hold above paused this provider on its own (RFC 3339).
+    /// A manual enable clears it; a manual disable never sets it, so the
+    /// automatic resume only ever undoes its own pause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_disabled_at: Option<String>,
     /// Maximum in-flight requests for this provider. Stored API keys can
     /// override it individually; session-backed providers use it as a
     /// provider-level fallback.
@@ -226,6 +231,12 @@ pub struct Provider {
     /// The most tokens per minute this provider may take.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tpm: Option<u64>,
+    /// A daily token budget for the whole provider (UTC midnight rollover).
+    /// Unlike `tpm`, this is an allowance of volume, not a rate: exceeding
+    /// it skips the provider until the next UTC day. It is a local policy,
+    /// so it never starts a 429 cooldown. None means unlimited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_tokens: Option<u64>,
     /// Total timeout for one upstream call, in seconds. None means the
     /// built-in default (600s) — long enough for a slow model, but a hung
     /// vendor can stall an agent for ten minutes.
@@ -284,9 +295,11 @@ impl Default for Provider {
             chat_path: None,
             stream_only: false,
             hold_when_exhausted: false,
+            auto_disabled_at: None,
             max_concurrency: None,
             rpm: None,
             tpm: None,
+            daily_tokens: None,
             timeout_secs: None,
             connect_timeout_secs: None,
             first_byte_timeout_secs: None,
@@ -1247,6 +1260,9 @@ pub struct AppState {
     pub rate_limits: crate::gateway::rate_limit::Registry,
     /// Short status alerts to a user-configured webhook.
     pub alerts: crate::alerts::Alerts,
+    /// The gateway's own CPU, memory and answer-rate sampler. The console's
+    /// System page and `/metrics` read it; the sampler task feeds it.
+    pub sys: Arc<crate::sysmon::Monitor>,
     /// The number of requests currently being processed by the gateway. A
     /// process-wide gauge that the `/metrics` endpoint reads out.
     pub in_flight: Arc<AtomicU64>,
@@ -1265,10 +1281,12 @@ impl AppState {
         let config = store.load()?;
         let mtime = store.mtime();
         let web_bind = config.settings.web_addr.clone();
+        let sqlite = crate::store::Store::shared();
         Ok(AppState {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             store,
-            sqlite: crate::store::Store::shared(),
+            sys: Arc::new(crate::sysmon::Monitor::new(sqlite.clone())),
+            sqlite,
             cooldowns: crate::gateway::cooldown::Registry::default(),
             concurrency: crate::gateway::concurrency::Registry::default(),
             rate_limits: crate::gateway::rate_limit::Registry::default(),
@@ -1392,9 +1410,11 @@ mod config_surface_tests {
             chat_path: Some("/v2/chat".into()),
             stream_only: true,
             hold_when_exhausted: true,
+            auto_disabled_at: None,
             max_concurrency: Some(3),
             rpm: Some(60),
             tpm: Some(100000),
+            daily_tokens: None,
             timeout_secs: Some(120),
             connect_timeout_secs: Some(5),
             first_byte_timeout_secs: Some(30),

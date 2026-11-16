@@ -76,7 +76,7 @@ export interface Provider {
   /** 上游头的发送顺序（提示性的）。 */
   header_order?: string[];
   /** Where the credential comes from; a local app's login session. */
-  auth?: "workbuddy" | "qwenwork";
+  auth?: "workbuddy" | "qwenwork" | "trae_cn";
   chat_path?: string;
   /** The upstream only answers streaming requests. */
   stream_only?: boolean;
@@ -88,6 +88,8 @@ export interface Provider {
   rpm?: number | null;
   /** 本地限流：每分钟最多 token 数；空为不限。 */
   tpm?: number | null;
+  /** 每日 token 额度（UTC 零点翻日）；空为不限。 */
+  daily_tokens?: number | null;
   /** 上游总超时 / 连接超时 / 流式首字节超时（秒）；空为内置默认。 */
   timeout_secs?: number | null;
   connect_timeout_secs?: number | null;
@@ -186,6 +188,82 @@ export interface UsageTotals {
   cost_usd: number;
   credits: number;
   unpriced: number;
+  /** Streaming replies with a measured first token — the TTFT denominator. */
+  ttft_samples: number;
+  /** Mean TTFT in ms (0 when no samples). */
+  ttft_avg_ms: number;
+  ttft_p50_ms?: number | null;
+  ttft_p95_ms?: number | null;
+  /** Total tokens per second of request time. */
+  tokens_per_sec: number;
+  /** Output tokens per second of generation time (streaming samples only). */
+  output_tokens_per_sec: number;
+}
+
+export interface KeySpeedRow {
+  provider: string;
+  key_id: string;
+  key_label?: string;
+  requests: number;
+  failed: number;
+  total_tokens: number;
+  tokens_per_sec: number;
+  output_tokens_per_sec: number;
+  ttft_samples: number;
+  ttft_avg_ms: number;
+}
+
+/** One upstream API key or session account, with its consumption and quota. */
+export interface CredentialRow {
+  provider: string;
+  credential: string;
+  label: string;
+  /** `"key"` (stored API key) or `"account"` (browser-login session). */
+  kind: string;
+  enabled: boolean;
+  /** Was there traffic in the selected period? */
+  seen: boolean;
+  requests: number;
+  failed: number;
+  success_rate: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  reasoning_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+  credits: number;
+  ttft_samples: number;
+  ttft_avg_ms: number;
+  ttft_p50_ms?: number | null;
+  ttft_p95_ms?: number | null;
+  tokens_per_sec: number;
+  output_tokens_per_sec: number;
+  last_seen?: string | null;
+  share_of_provider: number;
+  provider_name?: string;
+  provider_enabled?: boolean;
+  /** Provider-level daily token budget, when configured. */
+  budget?: {
+    limit: number;
+    used: number;
+    remaining: number;
+    used_pct: number;
+    exhausted: boolean;
+  } | null;
+  /** Vendor quota window, when this account reports one. */
+  quota?: {
+    used: number;
+    remaining: number;
+    capacity: number;
+    unit: string;
+    display: string;
+    window: string;
+    windows: number;
+    resets_at?: string | null;
+    error?: string | null;
+  } | null;
 }
 
 export interface UsageRecord {
@@ -307,6 +385,9 @@ export interface UsageData {
   by_agent: [string, UsageTotals][];
   by_key: [string, UsageTotals][];
   by_provider_key: [string, UsageTotals][];
+  by_key_speed?: KeySpeedRow[];
+  /** Every configured key/account, including idle ones. */
+  credentials?: CredentialRow[];
   by_caller_key: [string, UsageTotals][];
   by_project: [string, UsageTotals][];
   by_session: SessionRow[];
@@ -509,4 +590,58 @@ export interface TraceDetail {
   spans: TraceSpan[];
   tree: TraceNode[];
   summary: TraceSummary[];
+}
+
+// ---- system vitals -------------------------------------------------------
+
+/** The gateway's own CPU / memory / answer-rate picture, right now. */
+export interface SystemSummary {
+  label: string;
+  seconds: number;
+  requests: number;
+  errors: number;
+  rps: number;
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
+  latency_avg_ms: number | null;
+  ttft_p50_ms: number | null;
+}
+
+export interface SystemSnapshot {
+  now: number;
+  started: string;
+  uptime_secs: number;
+  interval_secs: number;
+  sampling: boolean;
+  cores: number;
+  cpu_pct: number;
+  rss_bytes: number;
+  threads: number;
+  in_flight: number;
+  total_requests: number;
+  total_errors: number;
+  windows: SystemSummary[];
+}
+
+/** One bucket of the vitals series, ready for a chart. */
+export interface SystemPoint {
+  t: number;
+  cpu_pct: number;
+  rss_bytes: number;
+  threads: number;
+  in_flight: number;
+  requests: number;
+  errors: number;
+  rps: number;
+  latency_p50_ms: number | null;
+  latency_p95_ms: number | null;
+  ttft_p50_ms: number | null;
+}
+
+export interface SystemSeries {
+  minutes: number;
+  bucket_secs: number;
+  interval_secs: number;
+  sampling: boolean;
+  points: SystemPoint[];
 }

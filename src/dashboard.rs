@@ -101,8 +101,12 @@ struct Totals {
     failed: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
     cost_usd: f64,
     credits: f64,
+    ttft_samples: i64,
+    ttft_avg_ms: i64,
 }
 
 #[derive(Default)]
@@ -110,8 +114,51 @@ struct DayRow {
     requests: i64,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
     cost_usd: f64,
-    credits: f64,
+    ttft_samples: i64,
+    ttft_avg_ms: i64,
+}
+
+/// The billable volume, the same four fields the Usage page adds up.
+fn billable(row: &DayRow) -> i64 {
+    row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens
+}
+
+/// `avg ms / n samples`, or a dash when nothing streamed in this bucket.
+fn ttft_label(samples: i64, avg_ms: i64) -> String {
+    if samples > 0 {
+        format!("{avg_ms}ms/n{samples}")
+    } else {
+        "—".to_string()
+    }
+}
+
+fn from_aggregate(row: &store::AggregateRow) -> DayRow {
+    DayRow {
+        requests: row.requests,
+        input_tokens: row.input_tokens,
+        output_tokens: row.output_tokens,
+        cache_read_tokens: row.cache_read_tokens,
+        cache_write_tokens: row.cache_write_tokens,
+        cost_usd: row.cost_usd.unwrap_or_default(),
+        ttft_samples: row.ttft_samples,
+        ttft_avg_ms: row.ttft_avg_ms,
+    }
+}
+
+fn from_totals(t: &gateway::usage::Totals) -> DayRow {
+    DayRow {
+        requests: t.requests as i64,
+        input_tokens: t.input_tokens as i64,
+        output_tokens: t.output_tokens as i64,
+        cache_read_tokens: t.cache_read_tokens as i64,
+        cache_write_tokens: t.cache_write_tokens as i64,
+        cost_usd: t.cost_usd,
+        ttft_samples: t.ttft_samples as i64,
+        ttft_avg_ms: t.ttft_avg_ms as i64,
+    }
 }
 
 fn collect(sqlite: &Option<store::Store>) -> Snapshot {
@@ -136,6 +183,14 @@ fn collect(sqlite: &Option<store::Store>) -> Snapshot {
             failed: totals_row.as_ref().map(|r| r.failed).unwrap_or(0),
             input_tokens: totals_row.as_ref().map(|r| r.input_tokens).unwrap_or(0),
             output_tokens: totals_row.as_ref().map(|r| r.output_tokens).unwrap_or(0),
+            cache_read_tokens: totals_row
+                .as_ref()
+                .map(|r| r.cache_read_tokens)
+                .unwrap_or(0),
+            cache_write_tokens: totals_row
+                .as_ref()
+                .map(|r| r.cache_write_tokens)
+                .unwrap_or(0),
             cost_usd: totals_row
                 .as_ref()
                 .and_then(|r| r.cost_usd)
@@ -144,38 +199,18 @@ fn collect(sqlite: &Option<store::Store>) -> Snapshot {
                 .as_ref()
                 .and_then(|r| r.credits)
                 .unwrap_or_default(),
+            ttft_samples: totals_row.as_ref().map(|r| r.ttft_samples).unwrap_or(0),
+            ttft_avg_ms: totals_row.as_ref().map(|r| r.ttft_avg_ms).unwrap_or(0),
         };
         let by_day = sqlite
             .by_day_since(&since)
             .into_iter()
-            .map(|row| {
-                (
-                    row.day.clone().unwrap_or_default(),
-                    DayRow {
-                        requests: row.requests,
-                        input_tokens: row.input_tokens,
-                        output_tokens: row.output_tokens,
-                        cost_usd: row.cost_usd.unwrap_or_default(),
-                        credits: row.credits.unwrap_or_default(),
-                    },
-                )
-            })
+            .map(|row| (row.day.clone().unwrap_or_default(), from_aggregate(&row)))
             .collect();
         let by_provider = sqlite
             .by_provider_since(&since)
             .into_iter()
-            .map(|row| {
-                (
-                    row.label.clone().unwrap_or_default(),
-                    DayRow {
-                        requests: row.requests,
-                        input_tokens: row.input_tokens,
-                        output_tokens: row.output_tokens,
-                        cost_usd: row.cost_usd.unwrap_or_default(),
-                        credits: row.credits.unwrap_or_default(),
-                    },
-                )
-            })
+            .map(|row| (row.label.clone().unwrap_or_default(), from_aggregate(&row)))
             .collect();
         let recent = sqlite.recent(&since, 8);
         (totals, by_day, by_provider, recent, "SQLITE")
@@ -184,43 +219,33 @@ fn collect(sqlite: &Option<store::Store>) -> Snapshot {
             .into_iter()
             .filter(|r| r.time.as_str() >= since.as_str())
             .collect();
-        let totals_row = gateway::usage::totals(&records);
+        // The SQL path counts successful rows only. Keep the JSONL fallback
+        // on the same set and let `usage::Totals` do every aggregation, so
+        // cache tokens and TTFT cannot drift between the two stores.
+        let ok: Vec<_> = records.iter().filter(|r| r.ok).cloned().collect();
+        let totals_row = gateway::usage::totals(&ok);
         let totals = Totals {
             requests: totals_row.requests as i64,
-            failed: totals_row.failed as i64,
+            failed: 0,
             input_tokens: totals_row.input_tokens as i64,
             output_tokens: totals_row.output_tokens as i64,
+            cache_read_tokens: totals_row.cache_read_tokens as i64,
+            cache_write_tokens: totals_row.cache_write_tokens as i64,
             cost_usd: totals_row.cost_usd,
             credits: totals_row.credits,
+            ttft_samples: totals_row.ttft_samples as i64,
+            ttft_avg_ms: totals_row.ttft_avg_ms as i64,
         };
-        let mut by_day_map: std::collections::BTreeMap<String, DayRow> = Default::default();
-        let mut by_provider_map: std::collections::BTreeMap<String, DayRow> = Default::default();
-        for r in &records {
-            if !r.ok {
-                continue;
-            }
-            let day = r.time.chars().take(10).collect::<String>();
-            let row = by_day_map.entry(day).or_default();
-            row.requests += 1;
-            row.input_tokens += r.input_tokens as i64;
-            row.output_tokens += r.output_tokens as i64;
-            row.cost_usd += r.cost_usd.unwrap_or(0.0);
-            row.credits += r.credits.unwrap_or(0.0);
-            let row = by_provider_map.entry(r.provider.clone()).or_default();
-            row.requests += 1;
-            row.input_tokens += r.input_tokens as i64;
-            row.output_tokens += r.output_tokens as i64;
-            row.cost_usd += r.cost_usd.unwrap_or(0.0);
-            row.credits += r.credits.unwrap_or(0.0);
-        }
+        let by_day = gateway::usage::by_day(&ok)
+            .into_iter()
+            .map(|(day, t)| (day, from_totals(&t)))
+            .collect();
+        let by_provider = gateway::usage::group_by(&ok, |r| r.provider.clone())
+            .into_iter()
+            .map(|(name, t)| (name, from_totals(&t)))
+            .collect();
         let recent = records.iter().rev().take(8).cloned().collect();
-        (
-            totals,
-            by_day_map.into_iter().collect(),
-            by_provider_map.into_iter().collect(),
-            recent,
-            "JSONL",
-        )
+        (totals, by_day, by_provider, recent, "JSONL")
     };
 
     let settings = &config.settings;
@@ -289,8 +314,14 @@ fn render(out: &mut impl Write, s: &Snapshot, tick: u64) -> anyhow::Result<()> {
 
     // Totals.
     body.push_str(&format!(
-        "│ {DIM}WINDOW{RESET}  7d · requests {:>5} · failed {:>3} · in {:>10} · out {:>10}\n",
-        s.totals.requests, s.totals.failed, s.totals.input_tokens, s.totals.output_tokens
+        "│ {DIM}WINDOW{RESET}  7d · requests {:>5} · failed {:>3} · tok {:>10} · ttft {}\n",
+        s.totals.requests,
+        s.totals.failed,
+        s.totals.input_tokens
+            + s.totals.output_tokens
+            + s.totals.cache_read_tokens
+            + s.totals.cache_write_tokens,
+        ttft_label(s.totals.ttft_samples, s.totals.ttft_avg_ms)
     ));
     body.push_str(&format!(
         "│ {DIM}SPEND {RESET}  ${:<10.4} credits {:<12.1} storage {}\n",
@@ -311,12 +342,16 @@ fn render(out: &mut impl Write, s: &Snapshot, tick: u64) -> anyhow::Result<()> {
         .unwrap_or(1)
         .max(1);
     for (name, row) in s.by_provider.iter().take(6) {
-        let bar_width = width.saturating_sub(46).max(8);
+        let bar_width = width.saturating_sub(58).max(8);
         let filled = (row.requests as f64 / max_requests as f64 * bar_width as f64) as usize;
         let bar = format!("{GREEN}{}{RESET}", "█".repeat(filled.min(bar_width)));
         body.push_str(&format!(
-            "│   {:<16} {:>6} req {:>7} in {:>7} out ${:<9.4} {bar}\n",
-            name, row.requests, row.input_tokens, row.output_tokens, row.cost_usd
+            "│   {:<16} {:>6} req {:>9} tok ${:<8.3} ttft {:>10} {bar}\n",
+            name,
+            row.requests,
+            billable(row),
+            row.cost_usd,
+            ttft_label(row.ttft_samples, row.ttft_avg_ms)
         ));
     }
     body.push_str(&format!("├{}┤\n", line('─')));
@@ -331,12 +366,14 @@ fn render(out: &mut impl Write, s: &Snapshot, tick: u64) -> anyhow::Result<()> {
         .unwrap_or(1)
         .max(1);
     for (day, row) in s.by_day.iter().rev().take(5) {
-        let bar_width = width.saturating_sub(46).max(8);
+        let bar_width = width.saturating_sub(58).max(8);
         let filled = (row.requests as f64 / max_day as f64 * bar_width as f64) as usize;
         let bar = format!("{CYAN}{}{RESET}", "▇".repeat(filled.min(bar_width)));
         body.push_str(&format!(
-            "│   {day}  {:>5} req {:>7} in {:>7} out ${:<9.4} {bar}\n",
-            row.requests, row.input_tokens, row.output_tokens, row.cost_usd
+            "│   {day}  {:>5} req {:>9} tok ${:<8.3} {bar}\n",
+            row.requests,
+            billable(row),
+            row.cost_usd
         ));
     }
     body.push_str(&format!("├{}┤\n", line('─')));
@@ -410,6 +447,10 @@ mod tests {
                 output_tokens: 49,
                 cost_usd: 0.25,
                 credits: 3.5,
+                ttft_samples: 8,
+                ttft_avg_ms: 52,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             },
             by_day: vec![(
                 "2026-10-26".into(),
@@ -418,7 +459,7 @@ mod tests {
                     input_tokens: 77,
                     output_tokens: 49,
                     cost_usd: 0.25,
-                    credits: 3.5,
+                    ..Default::default()
                 },
             )],
             by_provider: vec![(
@@ -428,7 +469,9 @@ mod tests {
                     input_tokens: 77,
                     output_tokens: 49,
                     cost_usd: 0.25,
-                    credits: 3.5,
+                    ttft_samples: 8,
+                    ttft_avg_ms: 52,
+                    ..Default::default()
                 },
             )],
             recent: Vec::new(),
@@ -446,6 +489,11 @@ mod tests {
         assert!(text.contains("mock"));
         assert!(text.contains("8"));
         assert!(text.contains("SQLITE"));
+        // The per-provider line and the headline both carry first-token
+        // speed with its sample denominator.
+        assert!(text.contains("52ms/n8"));
+        // Tokens are the billable four-field total, not just in/out.
+        assert!(text.contains("126 tok"));
         // The screen is positioned, then the cursor is hidden while drawing.
         assert!(text.starts_with("\x1b[H\x1b[2J"));
     }

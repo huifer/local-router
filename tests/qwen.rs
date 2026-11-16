@@ -816,6 +816,9 @@ async fn the_gateway_routes_a_qwenwork_provider_through_the_signed_path() {
         ..Default::default()
     };
     provider.base_url = Some("https://gateway.qwenwork.cn".into());
+    // A budget makes the rate-limit window observable, so the test can
+    // prove the whole-reply path fed it.
+    provider.daily_tokens = Some(1000);
     config.providers.push(provider);
     let store = Arc::new(Store::at(home.join("config.json")));
     // Write the config through the store so load() reads what we built.
@@ -825,6 +828,7 @@ async fn the_gateway_routes_a_qwenwork_provider_through_the_signed_path() {
     )
     .unwrap();
     let state = AppState::load(store).await.unwrap();
+    let state_for_check = state.clone();
     let app = local_router::gateway::router(local_router::gateway::Gateway::new(state));
 
     let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -861,6 +865,67 @@ async fn the_gateway_routes_a_qwenwork_provider_through_the_signed_path() {
     assert!(
         bs.iter().all(|b| !b.contains("\"messages\"")),
         "the wire body must be encoded"
+    );
+    drop(hs);
+    drop(bs);
+
+    // A whole (non-streaming) QwenWork reply must leave a complete ledger
+    // row: tokens, a real status, the account slot, and the budget windows.
+    // Before the fix this path wrote only a trace span — no usage at all.
+    let usage_path = home.join("usage.jsonl");
+    let records: Vec<Value> = std::fs::read_to_string(&usage_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let rec = &records[0];
+    assert_eq!(rec["provider"], "qwenwork");
+    assert_eq!(rec["status"], 200);
+    assert_eq!(rec["ok"], true);
+    assert_eq!(rec["input_tokens"], 7);
+    assert_eq!(rec["output_tokens"], 3);
+    assert!(!rec["key_id"].as_str().unwrap_or_default().is_empty());
+    let windows = state_for_check.rate_limits.snapshot();
+    let window = windows
+        .iter()
+        .find(|r| r.scope == "provider:qwenwork")
+        .expect("the budget window must exist");
+    assert_eq!(window.tokens_today, 10, "{windows:?}");
+
+    // The streaming shape of the same special channel goes through the
+    // other ledger sink (UsageGuard). It must also carry a real status
+    // instead of the historical 0, and feed the budget windows.
+    let streamed = client
+        .post(format!("http://{gw_addr}/v1/chat/completions"))
+        .header("authorization", "Bearer gw-key")
+        .json(&json!({
+            "model": "qwenwork/flash",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(streamed.status().as_u16(), 200);
+    let _ = streamed.bytes().await.unwrap();
+    let records: Vec<Value> = std::fs::read_to_string(&usage_path)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2, "{records:?}");
+    assert!(records.iter().all(|r| r["status"] == 200), "{records:?}");
+    let windows = state_for_check.rate_limits.snapshot();
+    let window = windows
+        .iter()
+        .find(|r| r.scope == "provider:qwenwork")
+        .unwrap();
+    assert_eq!(
+        window.tokens_today, 20,
+        "both replies must reach the budget window: {windows:?}"
     );
 
     server2.abort();

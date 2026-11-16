@@ -60,6 +60,74 @@ total_tokens = input_tokens + output_tokens + cache_read_tokens + cache_write_to
 `Totals`。`GET /v1/local-router/usage` 与 `/v1/local-router/usage/requests`
 额外返回 `total_tokens`，其 `per_provider[]` 也带缓存与推理 token。
 
+## 按凭据统计（每个供应商 × 每把 API key / 每个账号）
+
+`/api/usage` 的 `credentials[]`（网关侧 `/v1/local-router/usage` 的
+`per_credential[]`）用**同一套 `Totals` 口径**按 `(provider, key_id)` 分桶：
+
+- 凭据来自实时配置：普通供应商的每把 `keys[]`（id / label / enabled），
+  登录态供应商（WorkBuddy / QwenWork / Trae CN）的账号池每个 slot；
+  账号昵称一律在服务端掩码。
+- **空闲凭据也有一行**（全零、`seen=false`），所以「每个供应商花了多少」
+  不需要二次查询；账本里出现过、但配置里已删除的 key 仍以
+  `enabled=false` 保留，消耗不会凭空消失。整家供应商已从配置移除时
+  （测试桩、旧上游）合并为一行「已移除的凭据（N）」——数字不丢，
+  但压测留下的几百个随机 key id 不会淹没表格。
+- 每行带：`total_tokens`（= 输入 + 输出 + 缓存读 + 缓存写）、各 token 分列、
+  `cost_usd` / `credits`、请求数 / 失败数 / 成功率、`tokens_per_sec` /
+  `output_tokens_per_sec`、TTFT 样本数与 avg/p50/p95、`last_seen`、以及该
+  凭据占其供应商总 token 的 `share_of_provider`。
+- 登录态供应商额外带 `quota`（厂商额度窗口的 used / remaining / resets_at，
+  与 Quota 页同源）；配了 `daily_tokens` 的供应商额外带 `budget`
+  （今日已用 / 上限 / 剩余，按 UTC 自然日从 `usage.db` 统计）。
+- 控制台 **Usage → 凭据** 把这些行按供应商分组展示，含 token 构成条、
+  额度进度条、搜索与排序。
+
+### 每日 token 额度
+
+`Provider.daily_tokens`（控制台 provider 卡片的输入框、PATCH `daily_tokens`、
+`local-router provider limit <id> --daily-tokens N`，0 关闭）是**本地策略**：
+按 UTC 零点翻日，超过额度后该 provider 的目标会被跳过（换下一个路由成员），
+与 `rpm` / `tpm` 同纪律，**不触发 429 冷却**。执行用的是进程内滚动计数器；
+控制台显示的 `budget.used` 读的是 `usage.db`（长期账本），所以进程重启后
+两者可能短暂不一致，以账本为准。计数口径是上面的 `total_tokens`（缓存 token
+也算消耗），否则缓存密集的 agent 会绕过额度。
+
+**两条账本出口都要喂窗口**：整段回复与失败走 `persist_usage`，流式成功走
+`UsageGuard::finish`。两者共用 `record_usage_windows()`，所以流式请求（agent
+的主要形态）同样计入 TPM、每日额度与调用方月度预算；此前只有前者会记，
+流式请求会悄悄绕过额度。QwenWork / Trae CN 的专用通道整段回复此前连
+usage 记录都不写，现已与通用通道一致。
+
+## 速率（token/s）
+
+两个速率随每个维度的 `Totals` 一起返回；控制台 **Usage → Token 消耗**
+底部的「每供应商 × 每 API 密钥的 token 速率」表把 key 拆开
+（`/api/usage` 的 `by_key_speed[]`，网关侧 `per_key[]`）。
+
+- **`tokens_per_sec` = 总 token ÷ 请求耗时合计**。并发请求按串行计
+  （把每条请求的 `latency_ms` 加起来当分母），这样并发度不同的供应商
+  之间才有可比性；它衡量「这台 key 实际吐 token 的吞吐」，不是墙上
+  时钟的实时速率（实时速率在 `/metrics` 上用 `rate()` 算）。
+- **`output_tokens_per_sec` = 输出 token ÷ 生成耗时**。生成耗时 =
+  请求耗时 − 首 token 等待，所以**只有流式请求有样本**；它是对比
+  供应商 / 线路快慢最直接的数字。
+- 失败请求不计入两个速率的分子与分母。
+
+## 首 token 延迟（TTFT）
+
+每个维度（总量 / 按天 / 按供应商 / 按模型…）都带四个 TTFT 字段：
+`ttft_samples`、`ttft_avg_ms`、`ttft_p50_ms`、`ttft_p95_ms`。控制台
+**Usage → Token 消耗**底部的「按供应商」表把它们和请求量、token 放在一起。
+
+- **只有流式响应才有首 token**：非流式回复没有可测的「第一个字」，
+  所以 `ttft_samples` 是分母，不要拿它除以 `requests`。覆盖率天然
+  <100%，看速度时要同时看样本数。
+- **失败请求不计 TTFT**（与 token 口径一致）。
+- 实时出口是 `/metrics` 的 `local_router_ttft_seconds` 直方图
+  （`api` + `provider` label，分位数）；长期账本仍是 `usage.db` 的
+  `ttft_ms` 列（CSV 导出同名列）。
+
 ## 账单的三个维度
 
 `/api/usage` 返回 `by_provider_key`、`by_caller_key` 与 `recent` 明细；
@@ -88,7 +156,8 @@ curl -H "Authorization: Bearer <key>" \
 控制台：
 
 - **Usage → Token 消耗**：token 总量、逐小时 / 逐天堆叠图、按模型与平台的
-  消耗排行、最耗 token 的请求明细（口径见上节）。
+  消耗排行、按供应商的请求 / token / 首 token 速度表、最耗 token 的请求
+  明细（口径见上节）。
 - **Usage → Bills**：按上游 key / 调用方 key / agent 三个维度分账。
 - **Overview**：顶部指标含总 token 与缓存读取；请求时间线、每日图可在
   请求数与 token 间切换；每平台 / 每模型横条带 token 总量；模型占比甜甜圈；

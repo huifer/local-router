@@ -615,9 +615,24 @@ async fn usage_summary(
                 "cost_usd": totals.cost_usd,
                 "credits": totals.credits,
                 "unpriced": totals.unpriced,
+                "ttft_samples": totals.ttft_samples,
+                "ttft_avg_ms": totals.ttft_avg_ms,
+                "ttft_p50_ms": totals.ttft_p50_ms,
+                "ttft_p95_ms": totals.ttft_p95_ms,
+                "tokens_per_sec": totals.tokens_per_sec,
+                "output_tokens_per_sec": totals.output_tokens_per_sec,
             })
         })
         .collect();
+    // One row per provider × upstream key: that key's volume and speed.
+    let per_key = usage::by_provider_key(&recent);
+    // Every configured key / account, with its volume, cost, success rate,
+    // TTFT and share. Idle credentials are included, so this endpoint can
+    // answer "what did every provider spend?" without a second lookup.
+    let per_credential = {
+        let config = g.state.config.read().await;
+        usage::by_credential(&recent, &usage::CredentialSpec::from_config(&config))
+    };
     Json(json!({
         "period": period,
         "since": cutoff.to_rfc3339(),
@@ -633,7 +648,15 @@ async fn usage_summary(
         "cost_usd": totals.cost_usd,
         "credits": totals.credits,
         "unpriced": totals.unpriced,
+        "ttft_samples": totals.ttft_samples,
+        "ttft_avg_ms": totals.ttft_avg_ms,
+        "ttft_p50_ms": totals.ttft_p50_ms,
+        "ttft_p95_ms": totals.ttft_p95_ms,
+        "tokens_per_sec": totals.tokens_per_sec,
+        "output_tokens_per_sec": totals.output_tokens_per_sec,
         "per_provider": per_provider,
+        "per_key": per_key,
+        "per_credential": per_credential,
         "by_model": by_model,
         "by_provider": by_provider,
         "by_provider_key": by_provider_key,
@@ -1969,6 +1992,7 @@ async fn handle(
 
     let mut last_error: ApiError = ApiError::Upstream("no target could answer".into());
     for (index, target) in plan.targets.clone().into_iter().enumerate() {
+        let mut target = target;
         let attempt_started = Instant::now();
         // Every attempt at a vendor hangs under this request's span.
         let link = TraceLink {
@@ -1981,6 +2005,22 @@ async fn handle(
             Some(p) => p.clone(),
             None => continue,
         };
+        // WorkBuddy rotates between saved accounts. Pick the account ONCE,
+        // here, and put its slot name on the target: the ledger, the 429
+        // cooldown, the concurrency permit, the affinity and the trace then
+        // all name the same account that actually signed this attempt. A
+        // session provider with no pool keeps the generic "session" id.
+        if matches!(provider.auth, Some(crate::config::AuthKind::WorkBuddy)) {
+            if let Ok((name, session)) = crate::workbuddy::rotating_account() {
+                let label = crate::mask::person(&session.account.nickname);
+                target.key_label = Some(if label.is_empty() {
+                    name.clone()
+                } else {
+                    label
+                });
+                target.key_id = name;
+            }
+        }
         // A provider that asked to be held back while its quota is empty
         // waits here instead of getting a request it cannot serve.
         if provider.hold_when_exhausted && provider.uses_session() {
@@ -2044,23 +2084,18 @@ async fn handle(
         // The provider's own RPM/TPM throttle. It is a local limit, not a
         // vendor 429, so skipping the target must not start a cooldown: the
         // next target answers instead.
-        if let rate_limit::Decision::Limited { .. } = g.state.rate_limits.check(
+        if let rate_limit::Decision::Limited { reason, .. } = g.state.rate_limits.check(
             &rate_limit::provider_scope(&target.provider_id),
             provider.rpm,
             provider.tpm,
-            None,
+            provider.daily_tokens,
             None,
         ) {
-            last_error = ApiError::RateLimited(format!(
-                "the provider {} has hit its local rate limit; try again shortly",
-                target.provider_id
-            ));
-            note_skipped(
-                &g,
-                &link,
-                &target,
-                "the provider's local rate limit is full",
-            );
+            // Say which limit fired: a spent daily token budget and a full
+            // RPM window are different things to fix.
+            last_error =
+                ApiError::RateLimited(format!("{reason} for provider {}", target.provider_id));
+            note_skipped(&g, &link, &target, &reason);
             continue;
         }
         let started = Instant::now();
@@ -2312,14 +2347,21 @@ async fn note_route_trace(
         .await;
 }
 
-/// Write one usage record to its sinks: SQLite when it is on, and the
-/// JSONL log for anyone tailing it.
-fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::UsageRecord) {
-    metrics::record_request(rec);
-    // The rate-limit windows learn the request's true token cost here: the
-    // success and failure paths of every upstream attempt come through, and
-    // only the attempt that actually saw tokens carries any.
-    let tokens = rec.input_tokens.saturating_add(rec.output_tokens);
+/// Feed the local rate-limit / budget windows from a finished request.
+///
+/// Both ledger sinks call this: `persist_usage` for whole replies and
+/// failures, `UsageGuard::finish` for streaming replies. Streaming used to
+/// skip it, which meant TPM and the daily token budget never saw the
+/// traffic that makes up most agent calls.
+fn record_usage_windows(state: &AppState, rec: &usage::UsageRecord) {
+    // Cached prompt tokens are consumption too — the same billable volume
+    // the usage page reports — otherwise a cache-heavy agent would slip
+    // past its TPM and daily budgets.
+    let tokens = rec
+        .input_tokens
+        .saturating_add(rec.output_tokens)
+        .saturating_add(rec.cache_read_tokens)
+        .saturating_add(rec.cache_write_tokens);
     // Priced requests also feed the caller key's monthly USD budget. A
     // scope with no configured limit has no window, so recording is a
     // no-op for it (the same discipline as the token windows).
@@ -2370,6 +2412,14 @@ fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::U
             }
         }
     }
+}
+
+/// Write one usage record to its sinks: SQLite when it is on, and the
+/// JSONL log for anyone tailing it.
+fn persist_usage(state: &AppState, sqlite: &Option<store::Store>, rec: &usage::UsageRecord) {
+    metrics::record_request(rec);
+    state.sys.record(rec);
+    record_usage_windows(state, rec);
     if let Some(store) = sqlite {
         store.record(rec);
     }
@@ -2395,6 +2445,33 @@ fn human_duration(secs: u64) -> String {
 
 /// Record an attempt that was never sent: the provider was skipped, so the
 /// request carried on without it. The trace says why the request moved on.
+/// The daily token budget for the special QwenWork / Trae CN channels.
+/// They bypass the generic attempt loop (and its rate-limit gate), so the
+/// budget must be checked here too — otherwise the console would show a
+/// budget that the gateway never enforced.
+async fn special_daily_budget(g: &Gateway, provider_id: &str) -> Option<ApiError> {
+    let limit = g
+        .state
+        .config
+        .read()
+        .await
+        .provider(provider_id)?
+        .daily_tokens
+        .filter(|n| *n > 0)?;
+    match g.state.rate_limits.check(
+        &rate_limit::provider_scope(provider_id),
+        None,
+        None,
+        Some(limit),
+        None,
+    ) {
+        rate_limit::Decision::Limited { reason, .. } => Some(ApiError::RateLimited(format!(
+            "{reason} for provider {provider_id}"
+        ))),
+        rate_limit::Decision::Allow => None,
+    }
+}
+
 fn note_skipped(g: &Gateway, link: &TraceLink, target: &Target, reason: &str) {
     let mut span = trace::Span::start(
         trace::SpanKind::Upstream,
@@ -2449,17 +2526,22 @@ async fn target_headers(
     trace: Option<&client::TraceHeaders>,
 ) -> Result<BTreeMap<String, String>, ApiError> {
     if provider.uses_session() {
-        // Several WorkBuddy accounts can live side by side; the requests
-        // take turns so the load is shared instead of one account taking
-        // all of it.
-        let session = match crate::workbuddy::session_rotating().await {
-            Ok((_, session)) => session,
-            Err(err) => {
-                // A pool of one (or none) falls back to the plain reader.
-                crate::workbuddy::session()
-                    .await
-                    .map_err(|_| ApiError::Unauthorized(err.to_string()))?
-            }
+        // The attempt already picked an account and wrote its slot name to
+        // target.key_id. Sign with THAT account (and refresh its token if
+        // needed), so the recorded identity can never disagree with the
+        // headers. Media tasks have no resolved slot, so they fall back to
+        // the rotating/active session.
+        let session = match crate::workbuddy::session_for(&target.key_id).await {
+            Ok(session) => session,
+            Err(_) => match crate::workbuddy::session_rotating().await {
+                Ok((_, session)) => session,
+                Err(err) => {
+                    // A pool of one (or none) falls back to the plain reader.
+                    crate::workbuddy::session()
+                        .await
+                        .map_err(|_| ApiError::Unauthorized(err.to_string()))?
+                }
+            },
         };
         return Ok(client::session_headers(
             target.protocol,
@@ -2579,6 +2661,9 @@ async fn trae_attempt(
     context: &usage::ContextBreakdown,
     link: Option<&TraceLink>,
 ) -> Result<Response, ApiError> {
+    if let Some(err) = special_daily_budget(g, "trae-cn").await {
+        return Err(err);
+    }
     let (account_name, session) = match crate::trae::session_rotating().await {
         Ok(pair) => pair,
         Err(err) => return Err(ApiError::Unauthorized(err.to_string())),
@@ -2604,8 +2689,17 @@ async fn trae_attempt(
     trae_request.model = target.model.clone();
     let mut rec = usage::UsageRecord::new(&request.model, "trae-cn");
     rec.provider = "trae-cn".to_string();
-    rec.key_id = Some(account_name.clone());
-    rec.key_label = Some(session.account.nickname.clone());
+    rec.key_id = Some(if account_name.is_empty() {
+        "session".to_string()
+    } else {
+        account_name.clone()
+    });
+    let trae_label = crate::mask::person(&session.account.nickname);
+    rec.key_label = Some(if trae_label.is_empty() {
+        "登录态".to_string()
+    } else {
+        trae_label
+    });
     rec.caller_key_id = request.caller_key_id.clone();
     rec.caller_key_label = request.caller_key_label.clone();
     rec.group = plan.group_id.clone();
@@ -2628,6 +2722,12 @@ async fn trae_attempt(
                 g.cooldowns.penalize("trae-cn", Some(&account_name)).await;
             }
             rec.ok = false;
+            rec.status =
+                if text.contains("429") || text.contains("限流") || text.contains("rate limit") {
+                    429
+                } else {
+                    502
+                };
             rec.error = Some(err.to_string());
             rec.latency_ms = started.elapsed().as_millis() as u64;
             if record {
@@ -2643,6 +2743,10 @@ async fn trae_attempt(
     for event in &events {
         rec.note_usage(event);
     }
+    // The special channels have no HTTP status of their own: a successful
+    // signed chat is a 200 for the ledger. Without this the usage page
+    // shows status 0 for every QwenWork / Trae CN reply.
+    rec.status = 200;
     if request.stream {
         Ok(events_to_stream(
             events,
@@ -2654,10 +2758,19 @@ async fn trae_attempt(
             started,
             sqlite,
             link.cloned(),
+            g.state.sys.clone(),
+            g.state.clone(),
         ))
     } else {
         let parsed = ChatResponse::from_events(&events);
+        rec.latency_ms = started.elapsed().as_millis() as u64;
+        crate::pricing::price_record(&mut rec);
+        // A caller that asked for one whole reply used to leave NO ledger
+        // row at all on these special channels. Write it through the same
+        // sink as every other attempt so the credential stats, metrics,
+        // sysmon and the daily budget all see it.
         if record {
+            persist_usage(&g.state, &g.sqlite, &rec);
             if let Some(link) = link {
                 persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
             }
@@ -2686,6 +2799,9 @@ async fn qwen_attempt(
     context: &usage::ContextBreakdown,
     link: Option<&TraceLink>,
 ) -> Result<Response, ApiError> {
+    if let Some(err) = special_daily_budget(g, "qwenwork").await {
+        return Err(err);
+    }
     // Several QwenWork accounts can live side by side; the requests take
     // turns so the load is shared instead of one account taking all of it.
     let (account_name, session) = match crate::qwen::login::session_rotating().await {
@@ -2723,8 +2839,20 @@ async fn qwen_attempt(
 
     let mut rec = usage::UsageRecord::new(&request.model, "qwenwork");
     rec.provider = "qwenwork".to_string();
-    rec.key_id = Some(target.key_id.clone());
-    rec.key_label = target.key_label.clone();
+    // The account that signed the COSY request, not the generic "session"
+    // target: several accounts can share this provider and each has its
+    // own quota and its own token consumption.
+    rec.key_id = Some(if account_name.is_empty() {
+        "session".to_string()
+    } else {
+        account_name.clone()
+    });
+    let qwen_label = crate::mask::person(&session.account.nickname);
+    rec.key_label = Some(if qwen_label.is_empty() {
+        "登录态".to_string()
+    } else {
+        qwen_label
+    });
     rec.caller_key_id = request.caller_key_id.clone();
     rec.caller_key_label = request.caller_key_label.clone();
     rec.group = plan.group_id.clone();
@@ -2749,14 +2877,14 @@ async fn qwen_attempt(
             }
             let mut rec = rec;
             rec.ok = false;
+            rec.status = if rate_limited { 429 } else { 502 };
             rec.error = Some(err.to_string());
             rec.latency_ms = started.elapsed().as_millis() as u64;
             if record {
                 crate::pricing::price_record(&mut rec);
-                if let Some(store) = &sqlite {
-                    store.record(&rec);
-                }
-                usage::record(&usage_path, &rec);
+                // The same sink as every other attempt: metrics, sysmon and
+                // the rate-limit windows must see failed QwenWork calls too.
+                persist_usage(&g.state, &g.sqlite, &rec);
                 if let Some(link) = link {
                     persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
                 }
@@ -2769,6 +2897,7 @@ async fn qwen_attempt(
     for ev in &events {
         rec.note_usage(ev);
     }
+    rec.status = 200;
 
     if request.stream {
         Ok(events_to_stream(
@@ -2781,11 +2910,16 @@ async fn qwen_attempt(
             started,
             sqlite,
             link.cloned(),
+            g.state.sys.clone(),
+            g.state.clone(),
         ))
     } else {
         let parsed = ChatResponse::from_events(&events);
         g.router.note_used(&request.model).await;
+        rec.latency_ms = started.elapsed().as_millis() as u64;
+        crate::pricing::price_record(&mut rec);
         if record {
+            persist_usage(&g.state, &g.sqlite, &rec);
             if let Some(link) = link {
                 persist_span(&g.state, &g.sqlite, &upstream_span(link, &rec));
             }
@@ -3308,6 +3442,8 @@ async fn stream_attempt(
                 g.sqlite.clone(),
                 concurrency_permit,
                 link.cloned(),
+                g.state.sys.clone(),
+                g.state.clone(),
             ))
         }
         UpstreamReply::Whole { status, body, .. } => {
@@ -3421,6 +3557,8 @@ async fn stream_attempt(
                 started,
                 g.sqlite.clone(),
                 link.cloned(),
+                g.state.sys.clone(),
+                g.state.clone(),
             ))
         }
     }
@@ -3466,6 +3604,13 @@ struct UsageGuard {
     trace_path: PathBuf,
     /// The trace this attempt belongs to.
     link: Option<TraceLink>,
+    /// The process monitor: the stream's own success only lands here, not
+    /// in `persist_usage`, so the System page counts streaming replies too.
+    monitor: Arc<crate::sysmon::Monitor>,
+    /// Shared state: the rate-limit / budget windows live here. Streaming
+    /// replies must feed them too, or a daily token budget would only ever
+    /// count whole (non-streaming) calls.
+    state: AppState,
 }
 
 impl UsageGuard {
@@ -3479,10 +3624,18 @@ impl UsageGuard {
             // Pricing runs at write time: the tokens only arrived with the
             // stream's last events.
             crate::pricing::price_record(&mut self.rec);
+            record_usage_windows(&self.state, &self.rec);
             if let Some(store) = &self.sqlite {
                 store.record(&self.rec);
             }
             usage::record(&self.path, &self.rec);
+            // The ledger write above does not go through `persist_usage`
+            // (that is the whole-reply and failure path), so the live
+            // metrics must be fed here too — otherwise every streaming
+            // success would vanish from `/metrics`, and the TTFT samples
+            // would never reach their histogram.
+            crate::metrics::record_request(&self.rec);
+            self.monitor.record(&self.rec);
             // The stream is over, so the attempt is over: the span says
             // which vendor answered, what it cost and how long it took.
             if let Some(link) = &self.link {
@@ -3514,6 +3667,8 @@ fn events_to_stream(
     started: Instant,
     sqlite: Option<store::Store>,
     link: Option<TraceLink>,
+    monitor: Arc<crate::sysmon::Monitor>,
+    state: AppState,
 ) -> Response {
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let trace_path = trace_path_of(&usage_path);
@@ -3527,6 +3682,8 @@ fn events_to_stream(
             sqlite,
             trace_path,
             link,
+            monitor,
+            state,
         };
         let mut renderer = make_renderer(caller_protocol, id.clone(), asked_model.clone());
         for ev in &events {
@@ -3574,6 +3731,8 @@ fn build_stream(
     sqlite: Option<store::Store>,
     concurrency_permit: Option<tokio::sync::OwnedSemaphorePermit>,
     link: Option<TraceLink>,
+    monitor: Arc<crate::sysmon::Monitor>,
+    state: AppState,
 ) -> Response {
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
     let trace_path = trace_path_of(&usage_path);
@@ -3588,6 +3747,8 @@ fn build_stream(
             sqlite,
             trace_path,
             link,
+            monitor,
+            state,
         };
         let mut collector: Box<dyn client::StreamCollector> = match upstream_protocol {
             Protocol::OpenAiChat => Box::new(openai_chat::Collector::new()),
@@ -3687,12 +3848,138 @@ fn make_renderer(protocol: Protocol, id: String, model: String) -> Rendered {
 }
 
 /// The message a vendor's error carries.
+/// What an empty quota window means for a session provider that asked to
+/// be held back. `Pause` fires once and marks the provider; `Resume` only
+/// ever undoes that mark, so a provider the user disabled by hand stays
+/// disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaHold {
+    Pause,
+    Resume,
+    Leave,
+}
+
+/// The decision, as a pure function so the state machine is testable
+/// without touching a quota endpoint.
+fn quota_hold_decision(empty: bool, enabled: bool, auto_paused: bool) -> QuotaHold {
+    if empty && enabled && !auto_paused {
+        QuotaHold::Pause
+    } else if !empty && !enabled && auto_paused {
+        QuotaHold::Resume
+    } else {
+        QuotaHold::Leave
+    }
+}
+
+/// Pause session providers that asked to be held back while their quota is
+/// empty, and resume them when the window comes back.
+///
+/// Pausing is a real config write (`enabled = false`, marked with
+/// `auto_disabled_at`), not a per-request skip: an exhausted account stops
+/// receiving requests entirely until its window resets. Runs on a timer;
+/// each pass reads the quota once and only touches providers carrying the
+/// `hold_when_exhausted` flag.
+pub async fn enforce_quota_holds(state: &AppState) {
+    let targets: Vec<String> = {
+        let config = state.config.read().await;
+        config
+            .providers
+            .iter()
+            .filter(|p| {
+                p.hold_when_exhausted
+                    && p.uses_session()
+                    && p.kind == "workbuddy"
+                    && (p.enabled || p.auto_disabled_at.is_some())
+            })
+            .map(|p| p.id.clone())
+            .collect()
+    };
+    for id in targets {
+        // The request path checks the same pool view (`exhausted`), so the
+        // pause decision can never disagree with a hold that just fired.
+        let Ok(quota) = crate::workbuddy::quota().await else {
+            continue;
+        };
+        let empty = quota
+            .windows
+            .iter()
+            .all(|w| !w.unlimited() && w.remaining <= 0.0);
+        let resets = quota
+            .windows
+            .iter()
+            .find_map(|w| w.resets_at.clone())
+            .unwrap_or_else(|| "the next window".to_string());
+        let action = {
+            let config = state.config.read().await;
+            let Some(p) = config.provider(&id) else {
+                continue;
+            };
+            quota_hold_decision(empty, p.enabled, p.auto_disabled_at.is_some())
+        };
+        if action == QuotaHold::Leave {
+            continue;
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = state
+            .update(|config| {
+                let Some(p) = config.provider_mut(&id) else {
+                    return Err("the provider vanished".to_string());
+                };
+                // Re-decide inside the write lock: the config may have
+                // moved between the read above and here.
+                match quota_hold_decision(empty, p.enabled, p.auto_disabled_at.is_some()) {
+                    QuotaHold::Pause => {
+                        p.enabled = false;
+                        p.auto_disabled_at = Some(now.clone());
+                    }
+                    QuotaHold::Resume => {
+                        p.enabled = true;
+                        p.auto_disabled_at = None;
+                    }
+                    QuotaHold::Leave => {}
+                }
+                Ok(())
+            })
+            .await;
+        if changed.is_err() {
+            continue;
+        }
+        let endpoint = state.config.read().await.settings.alert_webhook.clone();
+        match action {
+            QuotaHold::Pause => {
+                let message = format!(
+                    "{id} paused: its quota is empty; it resumes when the window resets ({resets})"
+                );
+                tracing::warn!("{message}");
+                state.alerts.emit(
+                    endpoint.as_deref(),
+                    "quota-pause",
+                    &message,
+                    &format!("quota-pause:{id}"),
+                );
+            }
+            QuotaHold::Resume => {
+                let message = format!("{id} resumed: its quota window has credits again");
+                tracing::info!("{message}");
+                state.alerts.emit(
+                    endpoint.as_deref(),
+                    "quota-resume",
+                    &message,
+                    &format!("quota-resume:{}:{now}", id),
+                );
+            }
+            QuotaHold::Leave => {}
+        }
+    }
+}
+
 fn error_message(payload: &Value) -> String {
     payload
         .get("error")
         .and_then(|e| {
             e.get("message")
                 .and_then(Value::as_str)
+                .or_else(|| e.get("msg").and_then(Value::as_str))
                 .or_else(|| e.as_str())
         })
         .map(|s| s.to_string())
@@ -3700,7 +3987,28 @@ fn error_message(payload: &Value) -> String {
             payload
                 .get("message")
                 .and_then(Value::as_str)
-                .map(|s| s.to_string())
+                .map(str::to_string)
+        })
+        // WorkBuddy and friends answer with `msg` / `displayMsg` rather
+        // than OpenAI's `error.message`; keep their wording (and any reset
+        // time it contains) instead of flattening it to a generic string.
+        .or_else(|| {
+            payload
+                .get("msg")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/displayMsg/zh")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            payload
+                .pointer("/displayMsg/en")
+                .and_then(Value::as_str)
+                .map(str::to_string)
         })
         .unwrap_or_else(|| "the vendor refused the request".into())
 }
@@ -3736,6 +4044,22 @@ fn error_response(err: &ApiError) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_quota_pause_only_ever_resumes_itself() {
+        // Empty window on a live provider: pause once, mark it.
+        assert_eq!(quota_hold_decision(true, true, false), QuotaHold::Pause);
+        // Still empty after the pause: do nothing (no flapping).
+        assert_eq!(quota_hold_decision(true, false, true), QuotaHold::Leave);
+        // Window back: resume exactly the auto-paused ones.
+        assert_eq!(quota_hold_decision(false, false, true), QuotaHold::Resume);
+        // A provider the user disabled by hand is never auto-resumed.
+        assert_eq!(quota_hold_decision(false, false, false), QuotaHold::Leave);
+        // A manual enable cleared the mark, so an empty window pauses again.
+        assert_eq!(quota_hold_decision(true, true, true), QuotaHold::Leave);
+        // Credits on a live provider: nothing to do.
+        assert_eq!(quota_hold_decision(false, true, false), QuotaHold::Leave);
+    }
 
     #[test]
     fn prefixed_api_keys_are_masked() {

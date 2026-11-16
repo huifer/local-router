@@ -231,9 +231,11 @@ async fn world_with(hold_when_exhausted: bool) -> (String, Seen, String) {
         chat_path: Some("/v2/chat/completions".into()),
         stream_only: true,
         hold_when_exhausted,
+        auto_disabled_at: None,
         max_concurrency: None,
         rpm: None,
         tpm: None,
+        daily_tokens: None,
         timeout_secs: None,
         connect_timeout_secs: None,
         first_byte_timeout_secs: None,
@@ -301,6 +303,88 @@ async fn a_non_streaming_caller_gets_a_whole_reply_from_a_stream_only_vendor() {
             .join("config-0.json"),
     );
     let _ = config;
+    std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_SESSION");
+    std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_ENDPOINT");
+}
+
+/// Two saved WorkBuddy accounts must show up as two different credentials
+/// in the ledger: the account that signed the request is the one that gets
+/// billed, cooled down and counted — not a single anonymous "session".
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_accounts_are_attributed_per_credential() {
+    let _turn = env_guard().await;
+    let (gateway_addr, seen, session_path) = world().await;
+    let account = |uid: &str, nickname: &str, token: &str| {
+        json!({
+            "account": {"uid": uid, "nickname": nickname, "type": "personal", "lastLogin": true},
+            "auth": {
+                "accessToken": token,
+                "refreshToken": "rt",
+                "tokenType": "Bearer",
+                "expiresAt": 9_999_999_999_999_i64,
+                "domain": "www.codebuddy.cn"
+            }
+        })
+    };
+    std::fs::write(
+        &session_path,
+        serde_json::to_string(&json!({
+            "active": "acct-a",
+            "accounts": {
+                "acct-a": account("u-a", "Alice", "at-a"),
+                "acct-b": account("u-b", "Bob", "at-b"),
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    for _ in 0..2 {
+        let response = reqwest::Client::new()
+            .post(format!("{gateway_addr}/v1/messages"))
+            .header("authorization", "Bearer local-router")
+            .header("content-type", "application/json")
+            .json(&json!({
+                "model": "workbuddy/hy3",
+                "max_tokens": 32,
+                "messages": [{"role": "user", "content": "hi"}]
+            }))
+            .send()
+            .await
+            .expect("the gateway answers");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    // The vendor saw both accounts, in rotation.
+    let user_ids = seen.user_ids.lock().unwrap().clone();
+    assert_eq!(user_ids.len(), 2, "{user_ids:?}");
+    assert!(user_ids.contains(&"u-a".to_string()));
+    assert!(user_ids.contains(&"u-b".to_string()));
+
+    // The ledger names the same two account slots, with masked holders.
+    let usage_path = std::path::Path::new(&session_path)
+        .parent()
+        .unwrap()
+        .join("usage.jsonl");
+    let records: Vec<Value> = std::fs::read_to_string(&usage_path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|r: &Value| r["ok"] == true)
+        .collect();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let mut slots: Vec<String> = records
+        .iter()
+        .map(|r| r["key_id"].as_str().unwrap().to_string())
+        .collect();
+    slots.sort();
+    assert_eq!(slots, vec!["acct-a".to_string(), "acct-b".to_string()]);
+    for record in &records {
+        assert_eq!(record["provider"], "workbuddy");
+        assert!(record["key_label"].as_str().unwrap().contains('*'));
+    }
+
     std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_SESSION");
     std::env::remove_var("LOCAL_ROUTER_WORKBUDDY_ENDPOINT");
 }

@@ -105,6 +105,51 @@
           "legendFormat": "429s / min"
         }
       ]
+    },
+    {
+      "id": 8,
+      "title": "Process CPU (% of one core)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 0, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "fillOpacity": 10 } } },
+      "description": "top semantics: 100 = one core fully busy, 200 = two cores",
+      "targets": [
+        {
+          "expr": "local_router_process_cpu_percent{job=~\"$job\"}",
+          "legendFormat": "cpu"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Process memory (RSS)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 8, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "local_router_process_resident_bytes{job=~\"$job\"}",
+          "legendFormat": "rss"
+        }
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Requests / minute (sampled)",
+      "type": "timeseries",
+      "gridPos": { "h": 7, "w": 8, "x": 16, "y": 18 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "expr": "local_router_requests_per_minute{job=~\"$job\"}",
+          "legendFormat": "rpm"
+        },
+        {
+          "expr": "local_router_process_threads{job=~\"$job\"}",
+          "legendFormat": "threads",
+          "hide": true
+        }
+      ]
     }
   ]
 }

@@ -7,8 +7,8 @@
 pub(crate) mod console;
 
 use local_router::{
-    config, gateway, metrics, presets, pricing, protocol, qwen, server, store, telemetry, trace,
-    trae, web, workbuddy,
+    config, gateway, metrics, presets, pricing, protocol, qwen, server, store, sysmon, telemetry,
+    trace, trae, web, workbuddy,
 };
 
 use std::collections::BTreeMap;
@@ -411,6 +411,9 @@ enum ProviderCmd {
         /// The most tokens per minute (0 disables).
         #[arg(long, default_value = None)]
         tpm: Option<u64>,
+        /// A daily token budget, rolling at UTC midnight (0 disables).
+        #[arg(long, default_value = None)]
+        daily_tokens: Option<u64>,
     },
     /// Add a key to a provider.
     Key { id: String, key: String },
@@ -596,6 +599,8 @@ async fn serve(args: ServeArgs) -> anyhow::Result<()> {
         start_auto_checkin();
     }
     start_retention(state.clone());
+    sysmon::spawn_sampler(state.clone());
+    start_quota_holds(state.clone());
 
     // `--port 0` lets the system pick a free port: handy when another
     // gateway (magpie, an older local-router) already holds 3435.
@@ -637,6 +642,7 @@ async fn web_only(args: WebArgs) -> anyhow::Result<()> {
     if settings.workbuddy_auto_checkin {
         start_auto_checkin();
     }
+    sysmon::spawn_sampler(state.clone());
 
     let web_addr = format!("{}:{}", settings.gateway_addr, args.port);
     let listener = tokio::net::TcpListener::bind(&web_addr)
@@ -687,6 +693,27 @@ async fn shutdown() {
     println!("\nstopping");
 }
 
+/// Every few minutes, pause session providers whose quota ran out and
+/// resume them when the window comes back. Only providers carrying
+/// `hold_when_exhausted` are ever touched; see
+/// `gateway::enforce_quota_holds`.
+fn start_quota_holds(state: config::AppState) {
+    tokio::spawn(async move {
+        let mut first = true;
+        loop {
+            let wait = if first {
+                first = false;
+                // At boot the session file may not be readable yet.
+                std::time::Duration::from_secs(90)
+            } else {
+                std::time::Duration::from_secs(10 * 60)
+            };
+            tokio::time::sleep(wait).await;
+            gateway::enforce_quota_holds(&state).await;
+        }
+    });
+}
+
 /// Once a day, drop usage records and trace spans past the configured
 /// retention window. The check is one indexed DELETE; with no
 /// `retention_days` the task simply keeps sleeping. This is what keeps a
@@ -703,10 +730,10 @@ fn start_retention(state: config::AppState) {
             };
             let cutoff = (chrono::Utc::now() - chrono::Duration::days(days as i64)).to_rfc3339();
             if let Some(store) = state.sqlite.clone() {
-                let (usage, spans) = store.prune_older_than(&cutoff);
-                if usage > 0 || spans > 0 {
+                let (usage, spans, sys) = store.prune_older_than(&cutoff);
+                if usage > 0 || spans > 0 || sys > 0 {
                     tracing::info!(
-                        "retention: removed {usage} usage records and {spans} trace spans older than {days} days"
+                        "retention: removed {usage} usage records, {spans} trace spans and {sys} process samples older than {days} days"
                     );
                 }
             }
@@ -963,9 +990,14 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
             save_config(&config)?;
             println!("{id}/{key_id} max concurrency: {display}");
         }
-        ProviderCmd::Limit { id, rpm, tpm } => {
-            if rpm.is_none() && tpm.is_none() {
-                anyhow::bail!("pass --rpm and/or --tpm (0 disables a limit)");
+        ProviderCmd::Limit {
+            id,
+            rpm,
+            tpm,
+            daily_tokens,
+        } => {
+            if rpm.is_none() && tpm.is_none() && daily_tokens.is_none() {
+                anyhow::bail!("pass --rpm, --tpm and/or --daily-tokens (0 disables a limit)");
             }
             let mut shown = Vec::new();
             {
@@ -984,6 +1016,15 @@ async fn provider_cmd(cmd: ProviderCmd) -> anyhow::Result<()> {
                     shown.push(format!(
                         "tpm {}",
                         provider.tpm.map_or_else(|| "off".into(), |v| v.to_string())
+                    ));
+                }
+                if let Some(n) = daily_tokens {
+                    provider.daily_tokens = (n > 0).then_some(n);
+                    shown.push(format!(
+                        "daily tokens {}",
+                        provider
+                            .daily_tokens
+                            .map_or_else(|| "off".into(), |v| v.to_string())
                     ));
                 }
             }

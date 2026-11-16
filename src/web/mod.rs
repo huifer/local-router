@@ -65,6 +65,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/providers/{id}/test", post(api_test_provider))
         .route("/api/cooldowns", get(api_cooldowns))
         .route("/api/rate-limits", get(api_rate_limits))
+        .route("/api/system", get(api_system))
+        .route("/api/system/series", get(api_system_series))
         .route("/api/schedules", get(api_schedules))
         .route("/api/providers/{id}/oauth", post(api_oauth_start))
         .route("/api/providers/{id}/login", post(api_session_login_start))
@@ -578,6 +580,10 @@ struct UpdateProvider {
     auto_include: Option<Vec<String>>,
     #[serde(default)]
     group_only: Option<bool>,
+    /// Hold the provider back while its subscription quota is empty, so an
+    /// exhausted account is not asked again until its window resets.
+    #[serde(default)]
+    hold_when_exhausted: Option<bool>,
     #[serde(default)]
     headers: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -594,6 +600,9 @@ struct UpdateProvider {
     rpm: Option<Option<u64>>,
     #[serde(default, deserialize_with = "de_optional_optional")]
     tpm: Option<Option<u64>>,
+    /// Daily token budget (UTC). `null` (or 0) clears it.
+    #[serde(default, deserialize_with = "de_optional_optional")]
+    daily_tokens: Option<Option<u64>>,
     /// Rename the vendor's real model ids to public ones. `null` clears
     /// the whole map; absent leaves it alone.
     #[serde(default, deserialize_with = "de_optional_optional")]
@@ -637,6 +646,7 @@ async fn api_update_provider(
         models: None,
         auto_include: None,
         group_only: None,
+        hold_when_exhausted: None,
         headers: None,
         user_agent: None,
         forward_headers: None,
@@ -644,6 +654,7 @@ async fn api_update_provider(
         header_order: None,
         rpm: None,
         tpm: None,
+        daily_tokens: None,
         model_map: None,
         timeout_secs: None,
         connect_timeout_secs: None,
@@ -660,6 +671,11 @@ async fn api_update_provider(
             }
             if let Some(v) = input.enabled {
                 p.enabled = v;
+                if v {
+                    // A manual enable is the user's say-so: drop the quota
+                    // pause marker so the timer does not fight them.
+                    p.auto_disabled_at = None;
+                }
             }
             if let Some(v) = input.base_url {
                 p.base_url = Some(v.trim_end_matches('/').to_string());
@@ -678,6 +694,9 @@ async fn api_update_provider(
             }
             if let Some(v) = input.group_only {
                 p.group_only = v;
+            }
+            if let Some(v) = input.hold_when_exhausted {
+                p.hold_when_exhausted = v;
             }
             if let Some(v) = input.headers {
                 p.headers = v;
@@ -700,6 +719,9 @@ async fn api_update_provider(
             }
             if let Some(v) = input.tpm {
                 p.tpm = v.filter(|n| *n > 0);
+            }
+            if let Some(v) = input.daily_tokens {
+                p.daily_tokens = v.filter(|n| *n > 0);
             }
             if let Some(v) = input.model_map {
                 p.model_map = v.unwrap_or_default();
@@ -1822,6 +1844,50 @@ async fn api_rate_limits(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"rate_limits": state.rate_limits.snapshot()}))
 }
 
+/// The gateway's own vitals: CPU, memory, threads and the answer-rate
+/// windows the process sampler keeps. Sampled every ten seconds; the
+/// percentiles cover successful replies only.
+async fn api_system(State(state): State<AppState>) -> Json<Value> {
+    let in_flight = state.in_flight.load(std::sync::atomic::Ordering::Relaxed);
+    Json(serde_json::to_value(state.sys.snapshot(in_flight)).unwrap_or_else(|_| Value::Null))
+}
+
+/// The process vitals as one time series, ready for a chart. Samples come
+/// from `usage.db` (so a restart does not erase the day) and are merged into
+/// fixed-width buckets, so any range is a few hundred points.
+async fn api_system_series(
+    State(state): State<AppState>,
+    Query(query): Query<SystemSeriesQuery>,
+) -> Json<Value> {
+    use crate::sysmon;
+    let minutes = query.minutes.unwrap_or(60).clamp(5, 1440);
+    let since = chrono::Utc::now().timestamp_millis() - (minutes as i64) * 60_000;
+    // About 180 points per range, never finer than one sample.
+    let bucket_ms = ((minutes as i64 * 60_000) / 180).max(sysmon::SAMPLE_SECS as i64 * 1000);
+    let mut samples = match &state.sqlite {
+        Some(store) => store.sys_samples_since(since),
+        None => Vec::new(),
+    };
+    if samples.is_empty() {
+        // SQLite off (or nobody has sampled yet): the live ring still has
+        // something to draw.
+        samples = state.sys.series(since);
+    }
+    let points = sysmon::bucketize(&samples, bucket_ms);
+    Json(json!({
+        "minutes": minutes,
+        "bucket_secs": bucket_ms / 1000,
+        "interval_secs": sysmon::SAMPLE_SECS,
+        "sampling": state.sys.is_sampling(),
+        "points": points,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SystemSeriesQuery {
+    minutes: Option<u64>,
+}
+
 async fn api_test_provider(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2782,6 +2848,17 @@ async fn api_usage(
             .filter(|r| r.time.as_str() >= cutoff.as_str())
             .collect()
     };
+    // Today's ledger, only for the daily token budget gauge. A separate
+    // read because a custom `from`/`to` window might not contain today.
+    let today_start = format!("{}T00:00:00+00:00", chrono::Utc::now().format("%Y-%m-%d"));
+    let today_records: Vec<usage::UsageRecord> = if let Some(store) = &state.sqlite {
+        store.all_since(&today_start)
+    } else {
+        usage::read_all(&state.usage_path())
+            .into_iter()
+            .filter(|r| r.time.as_str() >= today_start.as_str())
+            .collect()
+    };
     // Reuse the legacy `recent` order (newest first) for the request log.
     let recent: Vec<Value> = records
         .iter()
@@ -2945,6 +3022,12 @@ async fn api_usage(
         "cost_usd": totals.cost_usd,
         "credits": totals.credits,
         "unpriced": totals.unpriced,
+        "ttft_samples": totals.ttft_samples,
+        "ttft_avg_ms": totals.ttft_avg_ms,
+        "ttft_p50_ms": totals.ttft_p50_ms,
+        "ttft_p95_ms": totals.ttft_p95_ms,
+        "tokens_per_sec": totals.tokens_per_sec,
+        "output_tokens_per_sec": totals.output_tokens_per_sec,
     });
     let map_to_array = |rows: Vec<(String, usage::Totals)>| {
         rows.into_iter()
@@ -2962,6 +3045,12 @@ async fn api_usage(
                         "cost_usd": t.cost_usd,
                         "credits": t.credits,
                         "unpriced": t.unpriced,
+                        "ttft_samples": t.ttft_samples,
+                        "ttft_avg_ms": t.ttft_avg_ms,
+                        "ttft_p50_ms": t.ttft_p50_ms,
+                        "ttft_p95_ms": t.ttft_p95_ms,
+                        "tokens_per_sec": t.tokens_per_sec,
+                        "output_tokens_per_sec": t.output_tokens_per_sec,
                     }
                 ])
             })
@@ -2978,6 +3067,41 @@ async fn api_usage(
     // between requests and any token kind without a second code path.
     let by_day_json = map_to_array(by_day);
 
+    // Credentials: every configured API key / account slot gets a row, even
+    // when it served nothing in this period, so no provider is missing from
+    // the accounting. The config is read in a short scope because
+    // quota_summary does network calls and takes the same read lock.
+    let (specs, budgets, provider_meta) = {
+        let config = state.config.read().await;
+        let meta: BTreeMap<String, (String, bool)> = config
+            .providers
+            .iter()
+            .map(|p| (p.id.clone(), (p.name.clone(), p.enabled)))
+            .collect();
+        let budgets = provider_budgets(&config, &today_records);
+        (credential_specs(&config), budgets, meta)
+    };
+    let quota = quota_summary(&state).await;
+    let quota_rows = quota_by_credential(&quota);
+    let credentials: Vec<Value> = usage::by_credential(&records, &specs)
+        .into_iter()
+        .map(|row| {
+            let mut value = serde_json::to_value(&row).unwrap_or(json!({}));
+            let key = (row.provider.clone(), row.credential.clone());
+            if let Some(window) = quota_rows.get(&key) {
+                value["quota"] = window.clone();
+            }
+            if let Some(budget) = budgets.get(&row.provider) {
+                value["budget"] = budget.clone();
+            }
+            if let Some((name, enabled)) = provider_meta.get(&row.provider) {
+                value["provider_name"] = json!(name);
+                value["provider_enabled"] = json!(enabled);
+            }
+            value
+        })
+        .collect();
+
     Json(json!({
         "storage": if use_sqlite { "sqlite" } else { "jsonl" },
         "currency": currency,
@@ -2985,6 +3109,8 @@ async fn api_usage(
         "by_model": by_model_json,
         "by_provider": by_provider_json,
         "by_provider_costs": by_provider_costs,
+        "by_key_speed": usage::by_provider_key(&records),
+        "credentials": credentials,
         "by_agent": by_agent_json,
         "by_key": by_key_json,
         "by_provider_key": by_provider_key_json,
@@ -2994,7 +3120,7 @@ async fn api_usage(
         "by_session": by_session_json,
         "requests_timeline": requests_timeline,
         "context": context,
-        "quota": quota_summary(&state).await,
+        "quota": quota,
         "recent": recent,
     }))
 }
@@ -3138,6 +3264,86 @@ async fn quota_summary(state: &AppState) -> Value {
         }
     }
     json!(accounts)
+}
+
+/// Every credential the live config can spend through: each stored API key
+/// of a key-based provider, and each saved account slot of a session-backed
+/// one. The shared implementation lives in `usage` so the gateway's own
+/// usage endpoint and the console cannot disagree about who a credential is.
+fn credential_specs(config: &Config) -> Vec<usage::CredentialSpec> {
+    usage::CredentialSpec::from_config(config)
+}
+
+/// Join the vendor's live quota windows onto credentials by (provider,
+/// account slot). Token-billed providers have no window and get no entry.
+fn quota_by_credential(quota: &Value) -> BTreeMap<(String, String), Value> {
+    let mut out = BTreeMap::new();
+    let Some(rows) = quota.as_array() else {
+        return out;
+    };
+    for row in rows {
+        let provider = row["provider"].as_str().unwrap_or_default();
+        let account = row["account"].as_str().unwrap_or_default();
+        let windows = row["windows"].as_array().cloned().unwrap_or_default();
+        let Some(window) = windows
+            .iter()
+            .find(|w| !w["unlimited"].as_bool().unwrap_or(false))
+        else {
+            continue;
+        };
+        let used = window["used"].as_f64().unwrap_or(0.0);
+        let remaining = window["remaining"].as_f64().unwrap_or(0.0);
+        out.insert(
+            (provider.to_string(), account.to_string()),
+            json!({
+                "used": used,
+                "remaining": remaining,
+                "capacity": used + remaining,
+                "unit": window["unit"].as_str().unwrap_or("credits"),
+                "display": window["display"].as_str().unwrap_or(""),
+                "resets_at": window["resets_at"],
+                "window": window["name"].as_str().unwrap_or("quota"),
+                "windows": windows.len(),
+                "error": row["error"],
+            }),
+        );
+    }
+    out
+}
+
+/// The provider's daily token budget, spent from `usage.db` today (UTC).
+/// The display reads the ledger (the durable truth); enforcement uses the
+/// in-process rolling counter, so a restart can make the two differ until
+/// the next request — the ledger is the number the console shows.
+fn provider_budgets(config: &Config, today: &[usage::UsageRecord]) -> BTreeMap<String, Value> {
+    let by_provider = usage::group_by(today, |r| r.provider.clone());
+    let spent: BTreeMap<String, u64> = by_provider
+        .iter()
+        .map(|(id, t)| {
+            (
+                id.clone(),
+                t.input_tokens + t.output_tokens + t.cache_read_tokens + t.cache_write_tokens,
+            )
+        })
+        .collect();
+    config
+        .providers
+        .iter()
+        .filter_map(|p| {
+            let limit = p.daily_tokens.filter(|n| *n > 0)?;
+            let used = spent.get(&p.id).copied().unwrap_or(0);
+            Some((
+                p.id.clone(),
+                json!({
+                    "limit": limit,
+                    "used": used,
+                    "remaining": limit.saturating_sub(used),
+                    "used_pct": (used as f64 / limit as f64).min(1.0),
+                    "exhausted": used >= limit,
+                }),
+            ))
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------- projects --

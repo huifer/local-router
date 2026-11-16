@@ -17,6 +17,7 @@ pub mod server;
 pub mod session_logins;
 pub mod sessions;
 pub mod store;
+pub mod sysmon;
 pub mod telemetry;
 #[cfg(test)]
 pub(crate) mod testenv;

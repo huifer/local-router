@@ -177,12 +177,13 @@ fn put(
     retry_after: Option<Duration>,
 ) {
     let strikes = map.get(&key).map(|e| e.strikes + 1).unwrap_or(1);
-    // Our own backoff is the floor. A vendor's explicit Retry-After wins
-    // when it asks for longer (a quota window that outlives our max), but
-    // is capped at a day so a malformed header cannot park a provider.
+    // Our own backoff is the floor. A vendor's explicit reset time wins
+    // when it asks for longer — a quota window may last until tomorrow or
+    // the end of a billing cycle. Cap it at 30 days so one malformed value
+    // cannot park a provider forever.
     let backoff = (base().as_secs().saturating_mul(1 << (strikes - 1).min(4))).min(max().as_secs());
     let secs = match retry_after {
-        Some(d) => d.as_secs().min(86_400).max(backoff),
+        Some(d) => d.as_secs().min(30 * 86_400).max(backoff),
         None => backoff,
     };
     map.insert(
@@ -266,6 +267,41 @@ mod tests {
         let rows = registry.snapshot().await;
         let row = rows.iter().find(|r| r.key == "vendor-short").unwrap();
         assert!(row.seconds_left >= base().as_secs() - 1);
+    }
+
+    #[tokio::test]
+    async fn a_reset_time_is_honoured_but_cannot_park_forever() {
+        // A billing-cycle reset can be days away; one malformed value must
+        // not park a provider for years.
+        let registry = Registry::default();
+        registry
+            .penalize_after("vendor-cycle", None, Some(Duration::from_secs(7 * 86_400)))
+            .await;
+        let week = registry
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|r| r.key == "vendor-cycle")
+            .unwrap()
+            .seconds_left;
+        assert!(week >= 7 * 86_400 - 1, "{week}");
+
+        let registry = Registry::default();
+        registry
+            .penalize_after(
+                "vendor-bogus",
+                None,
+                Some(Duration::from_secs(10 * 365 * 86_400)),
+            )
+            .await;
+        let capped = registry
+            .snapshot()
+            .await
+            .into_iter()
+            .find(|r| r.key == "vendor-bogus")
+            .unwrap()
+            .seconds_left;
+        assert!(capped <= 30 * 86_400, "{capped}");
     }
 
     #[tokio::test]

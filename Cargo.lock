@@ -430,6 +430,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "98b0cc327b5bc766e7fda9c9260cc0fa81b43a8e240440422dff70788e3f9ef1"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-epoch"
 version = "0.9.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1207,9 +1216,11 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "clap",
+ "crossbeam-channel",
  "dirs",
  "futures-util",
  "hex",
+ "libc",
  "md-5",
  "metrics",
  "metrics-exporter-prometheus",

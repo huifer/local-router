@@ -92,6 +92,9 @@ hex = "0.4"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 chrono-tz = "0.10"
+crossbeam-channel = "0.5.17"
+# Process self-monitoring (getrusage / proc_pidinfo / /proc helpers).
+libc = "0.2"
 
 [features]
 # OTLP tracing export is opt-in and hand-rolled (see src/telemetry.rs): no

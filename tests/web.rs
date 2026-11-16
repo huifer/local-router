@@ -295,11 +295,48 @@ async fn get_json(state: AppState, path: &str) -> (StatusCode, Value) {
         .await
         .unwrap();
     let status = response.status();
-    let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+    let body = axum::body::to_bytes(response.into_body(), 20 * 1024 * 1024)
         .await
         .unwrap_or_default();
     let value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     (status, value)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_system_endpoints_expose_process_vitals() {
+    let state = state_at("127.0.0.1").await;
+    // Two ticks: the first is only the CPU baseline, the second closes a
+    // window and persists a sample. The gateway's own gauge says two
+    // requests are in flight right now.
+    assert!(state.sys.sample(0).is_none());
+    state
+        .in_flight
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    let sample = state
+        .sys
+        .sample(2)
+        .expect("the second sample must close a window");
+    assert!(sample.cpu_pct >= 0.0);
+
+    let (status, body) = get_json(state.clone(), "/api/system").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["interval_secs"].as_u64(), Some(10));
+    assert_eq!(body["in_flight"].as_u64(), Some(2));
+    assert_eq!(body["total_requests"], body["total_requests"]);
+    let windows = body["windows"].as_array().expect("summary windows");
+    assert_eq!(windows.len(), 3);
+
+    let (status, body) = get_json(state.clone(), "/api/system/series?minutes=60").await;
+    assert_eq!(status, StatusCode::OK);
+    let points = body["points"].as_array().expect("series points");
+    assert!(!points.is_empty(), "the persisted sample must be chartable");
+    assert_eq!(points[0]["requests"].as_u64(), Some(sample.requests));
+    // One hour across ~180 points: a 20-second bucket.
+    assert_eq!(body["bucket_secs"].as_i64(), Some(20));
+
+    // An absurd range is clamped, not an error.
+    let (status, _) = get_json(state.clone(), "/api/system/series?minutes=99999").await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -355,6 +392,76 @@ async fn the_preset_list_includes_the_local_session_vendors() {
     assert!(protocols.contains(&"qwenwork".to_string()));
 }
 
+/// Every configured provider — and every one of its keys — has a credential
+/// row even when it served no requests. That is what makes the accounting
+/// complete rather than a top-N of busy keys.
+///
+/// The usage store is process-global, so this test does not move the env:
+/// it uses unique provider ids and checks its own rows exist inside whatever
+/// else the ledger happens to hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn credentials_cover_idle_providers_and_their_budgets() {
+    let state = state_at("127.0.0.1").await;
+    let tag = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let keyed_id = format!("credtest-keyed-{tag}");
+    let keyless_id = format!("credtest-keyless-{tag}");
+    let mut keyed = local_router::config::Provider {
+        id: keyed_id.clone(),
+        name: "Keyed".into(),
+        ..Default::default()
+    };
+    keyed.keys = vec![
+        local_router::config::ProviderKey {
+            id: "key-a".into(),
+            key: "sk-a".into(),
+            enabled: true,
+            label: Some("primary".into()),
+            max_concurrency: None,
+        },
+        local_router::config::ProviderKey {
+            id: "key-b".into(),
+            key: "sk-b".into(),
+            enabled: false,
+            label: None,
+            max_concurrency: None,
+        },
+    ];
+    keyed.daily_tokens = Some(500);
+    let keyless = local_router::config::Provider {
+        id: keyless_id.clone(),
+        name: "Keyless".into(),
+        ..Default::default()
+    };
+    let _ = state
+        .update(|config| {
+            config.providers.push(keyed);
+            config.providers.push(keyless);
+            Ok::<(), String>(())
+        })
+        .await;
+    let (status, body) = get_json(state, "/api/usage?period=7d").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body["credentials"].as_array().expect("credentials array");
+    let mine: Vec<&Value> = rows
+        .iter()
+        .filter(|r| r["provider"] == keyed_id || r["provider"] == keyless_id)
+        .collect();
+    assert_eq!(mine.len(), 3, "{mine:?}");
+    let a = mine.iter().find(|r| r["credential"] == "key-a").unwrap();
+    assert_eq!(a["kind"], "key");
+    assert_eq!(a["enabled"], true);
+    assert_eq!(a["seen"], false);
+    assert_eq!(a["total_tokens"], 0);
+    assert_eq!(a["label"], "primary");
+    assert_eq!(a["budget"]["limit"], 500);
+    assert_eq!(a["budget"]["used"], 0);
+    assert_eq!(a["provider_name"], "Keyed");
+    let b = mine.iter().find(|r| r["credential"] == "key-b").unwrap();
+    assert_eq!(b["enabled"], false);
+    let keyless_row = mine.iter().find(|r| r["provider"] == keyless_id).unwrap();
+    assert_eq!(keyless_row["credential"], "default");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_usage_endpoint_carries_every_panel_shape() {
     let state = state_at("127.0.0.1").await;
@@ -374,6 +481,7 @@ async fn the_usage_endpoint_carries_every_panel_shape() {
         "requests_timeline",
         "context",
         "quota",
+        "credentials",
         "recent",
     ] {
         assert!(
@@ -393,6 +501,10 @@ async fn the_usage_endpoint_carries_every_panel_shape() {
         "cost_usd",
         "credits",
         "unpriced",
+        "ttft_samples",
+        "ttft_avg_ms",
+        "ttft_p50_ms",
+        "ttft_p95_ms",
     ] {
         assert!(totals.get(field).is_some(), "totals.{field} missing");
     }
@@ -761,6 +873,38 @@ async fn a_group_alias_can_be_set_and_bad_ones_are_refused() {
 }
 
 // ---------------------------------------------------- usage windows --
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_can_be_held_back_while_its_quota_is_empty() {
+    let state = state_at("127.0.0.1").await;
+    {
+        let mut config = state.config.write().await;
+        config.providers.push(local_router::config::Provider {
+            id: "held".into(),
+            name: "Held".into(),
+            models: vec!["m1".into()],
+            keys: vec![ProviderKey::new("sk-held".to_string())],
+            ..Default::default()
+        });
+    }
+    assert!(!state.config.read().await.providers[0].hold_when_exhausted);
+    let app = console(state.clone());
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/providers/held")
+                .header("content-type", "application/json")
+                .header("host", "127.0.0.1:3425")
+                .header("origin", "http://127.0.0.1:3425")
+                .body(Body::from(r#"{"hold_when_exhausted":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(state.config.read().await.providers[0].hold_when_exhausted);
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_schedule_can_be_set_and_bad_ones_are_refused() {

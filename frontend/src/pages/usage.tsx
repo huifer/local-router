@@ -17,7 +17,7 @@ import {
 import { RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import type { AppData } from "@/App";
-import type { ProjectRow, QuotaAccount, UsageData, UsageRecord, UsageTotals } from "@/types";
+import type { CredentialRow, ProjectRow, QuotaAccount, UsageData, UsageRecord, UsageTotals } from "@/types";
 import { api, getProjects, getUsage, mergeProjects, updateProject } from "@/api";
 import {
   Badge, Button, Card, CardContent, CardDescription, CardHeader, CardTitle, Dialog,
@@ -27,7 +27,7 @@ import {
 import { SectionToolbar, StatusDot, formatTime, formatTokens } from "@/components/shared/bits";
 import { useT } from "@/i18n";
 
-const views = ["overview", "tokens", "sessions", "projects", "context", "quota", "bills"] as const;
+const views = ["overview", "tokens", "credentials", "sessions", "projects", "context", "quota", "bills"] as const;
 type View = (typeof views)[number];
 const viewLabels: Record<View, string> = {
   overview: "Overview",
@@ -36,6 +36,7 @@ const viewLabels: Record<View, string> = {
   projects: "Projects",
   context: "Context",
   quota: "Quota",
+  credentials: "Credentials",
   bills: "Bills",
 };
 const periods = [
@@ -119,6 +120,7 @@ export default function UsagePage() {
           {view === "projects" && <ProjectsPanel projects={projects} onChanged={reloadUsage} />}
           {view === "context" && <ContextPanel usage={usage} />}
           {view === "quota" && <QuotaPanel usage={usage} />}
+          {view === "credentials" && <CredentialsPanel usage={usage} />}
           {view === "bills" && <BillsPanel usage={usage} />}
         </>
       )}
@@ -1004,7 +1006,408 @@ function TokensPanel({ usage }: { usage: UsageData }) {
           <EmptyState title={t("usage.noTokens")} detail={t("usage.noTokensDetail")} />
         )}
       </Card>
+
+      <ProviderSpeedCard usage={usage} />
+
+      <KeySpeedCard usage={usage} />
     </>
+  );
+}
+
+const speedCols =
+  "grid grid-cols-[minmax(0,1.6fr)_90px_70px_110px_90px_90px_90px_90px] items-center gap-2.5";
+
+/** Per-provider requests, token volume and first-token latency in one table. */
+function ProviderSpeedCard({ usage }: { usage: UsageData }) {
+  const { t } = useT();
+  const rows = useMemo(
+    () =>
+      usage.by_provider
+        .filter(([, v]) => (v.ttft_samples ?? 0) > 0 || billableTokens(v) > 0)
+        .sort((a, b) => billableTokens(b[1]) - billableTokens(a[1]))
+        .slice(0, 12),
+    [usage.by_provider],
+  );
+  const ms = (value?: number | null) => (value == null ? "—" : `${value} ms`);
+  return (
+    <Card>
+      <CardHeader>
+        <CardDescription className="eyebrow">{t("usage.perProviderSpeedEyebrow")}</CardDescription>
+        <CardTitle>{t("usage.perProviderSpeed")}</CardTitle>
+      </CardHeader>
+      {rows.length ? (
+        <div className="overflow-auto">
+          <div className="min-w-[760px]">
+            <div className={`${speedCols} border-b border-border px-5 py-3`}>
+              <span className="eyebrow">{t("usage.providerCol")}</span>
+              <span className="eyebrow">{t("usage.requests")}</span>
+              <span className="eyebrow">{t("usage.failed")}</span>
+              <span className="eyebrow">{t("usage.totalTokens")}</span>
+              <span className="eyebrow">{t("usage.ttftSamples")}</span>
+              <span className="eyebrow">{t("usage.ttftAvg")}</span>
+              <span className="eyebrow">{t("usage.ttftP50")}</span>
+              <span className="eyebrow">{t("usage.ttftP95")}</span>
+            </div>
+            {rows.map(([name, v]) => (
+              <div
+                key={name}
+                className={`${speedCols} border-b border-border/70 px-5 py-2.5 last:border-b-0`}
+              >
+                <strong className="truncate font-mono text-[11px]" title={name}>{name}</strong>
+                <span className="font-mono text-[10px] text-muted-foreground">{v.requests}</span>
+                <span className="font-mono text-[10px] text-muted-foreground">{v.failed}</span>
+                <strong className="usage-number text-[12px]">{formatTokens(billableTokens(v))}</strong>
+                <span className="font-mono text-[10px] text-muted-foreground">{v.ttft_samples ?? 0}</span>
+                <span className="font-mono text-[10px] text-muted-foreground">
+                  {v.ttft_samples ? `${v.ttft_avg_ms} ms` : "—"}
+                </span>
+                <span className="font-mono text-[10px] text-muted-foreground">{ms(v.ttft_p50_ms)}</span>
+                <span className="font-mono text-[10px] text-muted-foreground">{ms(v.ttft_p95_ms)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <EmptyState title={t("usage.noTokens")} detail={t("usage.noTokensDetail")} />
+      )}
+      <p className="px-5 pb-4 pt-3 font-mono text-[10px] leading-relaxed text-muted-foreground">
+        {t("usage.ttftNote")}
+      </p>
+    </Card>
+  );
+}
+
+const keySpeedCols =
+  "grid grid-cols-[minmax(0,1.4fr)_minmax(0,1.2fr)_70px_100px_90px_100px_80px_90px] items-center gap-2.5";
+
+/** Per provider × upstream API key: volume and token rate in one table. */
+function KeySpeedCard({ usage }: { usage: UsageData }) {
+  const { t } = useT();
+  const rows = useMemo(
+    () =>
+      (usage.by_key_speed ?? [])
+        .slice()
+        .sort((a, b) => b.total_tokens - a.total_tokens)
+        .slice(0, 15),
+    [usage.by_key_speed],
+  );
+  const rate = (value: number) => (value > 0 ? value.toFixed(1) : "—");
+  return (
+    <Card>
+      <CardHeader>
+        <CardDescription className="eyebrow">{t("usage.perKeySpeedEyebrow")}</CardDescription>
+        <CardTitle>{t("usage.perKeySpeed")}</CardTitle>
+      </CardHeader>
+      {rows.length ? (
+        <div className="overflow-auto">
+          <div className="min-w-[760px]">
+            <div className={`${keySpeedCols} border-b border-border px-5 py-3`}>
+              <span className="eyebrow">{t("usage.providerCol")}</span>
+              <span className="eyebrow">{t("usage.keyCol")}</span>
+              <span className="eyebrow">{t("usage.requests")}</span>
+              <span className="eyebrow">{t("usage.totalTokens")}</span>
+              <span className="eyebrow">{t("usage.tokPerSec")}</span>
+              <span className="eyebrow">{t("usage.outTokPerSec")}</span>
+              <span className="eyebrow">{t("usage.ttftSamples")}</span>
+              <span className="eyebrow">{t("usage.ttftAvg")}</span>
+            </div>
+            {rows.map((row) => (
+              <div
+                key={`${row.provider}/${row.key_id}`}
+                className={`${keySpeedCols} border-b border-border/70 px-5 py-2.5 last:border-b-0`}
+              >
+                <strong className="truncate font-mono text-[11px]" title={row.provider}>{row.provider}</strong>
+                <span className="truncate font-mono text-[10px] text-muted-foreground" title={row.key_label ?? row.key_id}>
+                  {row.key_label || row.key_id}
+                </span>
+                <span className="font-mono text-[10px] text-muted-foreground">{row.requests}</span>
+                <strong className="usage-number text-[12px]">{formatTokens(row.total_tokens)}</strong>
+                <strong className="usage-number text-[12px]">{rate(row.tokens_per_sec)}</strong>
+                <span className="font-mono text-[10px] text-muted-foreground">{rate(row.output_tokens_per_sec)}</span>
+                <span className="font-mono text-[10px] text-muted-foreground">{row.ttft_samples}</span>
+                <span className="font-mono text-[10px] text-muted-foreground">
+                  {row.ttft_samples ? `${row.ttft_avg_ms} ms` : "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : (
+        <EmptyState title={t("usage.noTokens")} detail={t("usage.noTokensDetail")} />
+      )}
+      <p className="px-5 pb-4 pt-3 font-mono text-[10px] leading-relaxed text-muted-foreground">
+        {t("usage.speedNote")}
+      </p>
+    </Card>
+  );
+}
+
+const credCols =
+  "grid grid-cols-[minmax(0,1.6fr)_76px_72px_120px_88px_84px_92px_100px_130px] items-center gap-2.5";
+
+/** Per provider × API key / account: the complete token accounting.
+ * Every configured credential has a row here, including idle ones, so no
+ * provider is missing from the answer to "what did everyone spend?". */
+function CredentialsPanel({ usage }: { usage: UsageData }) {
+  const { t } = useT();
+  const [query, setQuery] = useState("");
+  const [showIdle, setShowIdle] = useState(true);
+  const [sort, setSort] = useState<"tokens" | "requests" | "recent">("tokens");
+  const rows = usage.credentials ?? [];
+
+  const filtered = useMemo(
+    () =>
+      rows.filter((row) => {
+        if (!showIdle && !row.seen) return false;
+        const haystack = `${row.provider} ${row.provider_name ?? ""} ${row.credential} ${row.label}`.toLowerCase();
+        return haystack.includes(query.trim().toLowerCase());
+      }),
+    [rows, query, showIdle],
+  );
+
+  const groups = useMemo(() => {
+    const byProvider = new Map<string, CredentialRow[]>();
+    for (const row of filtered) {
+      const list = byProvider.get(row.provider) ?? [];
+      list.push(row);
+      byProvider.set(row.provider, list);
+    }
+    return [...byProvider.entries()]
+      .map(([provider, list]) => {
+        const sorted = [...list].sort((a, b) => {
+          if (sort === "requests") return b.requests - a.requests;
+          if (sort === "recent") return (b.last_seen ?? "").localeCompare(a.last_seen ?? "");
+          return b.total_tokens - a.total_tokens;
+        });
+        return {
+          provider,
+          name: list[0]?.provider_name ?? provider,
+          enabled: list.some((r) => r.provider_enabled ?? r.enabled),
+          rows: sorted,
+          totalTokens: list.reduce((n, r) => n + r.total_tokens, 0),
+          requests: list.reduce((n, r) => n + r.requests, 0),
+          failed: list.reduce((n, r) => n + r.failed, 0),
+          cost: list.reduce((n, r) => n + r.cost_usd, 0),
+          accounts: list.filter((r) => r.kind === "account").length,
+          budget: list.find((r) => r.budget)?.budget ?? null,
+          quotaAccounts: list.filter((r) => r.quota).length,
+        };
+      })
+      .sort((a, b) => b.totalTokens - a.totalTokens);
+  }, [filtered, sort]);
+
+  const totals = useMemo(
+    () => ({
+      providers: groups.length,
+      credentials: filtered.length,
+      active: filtered.filter((r) => r.enabled).length,
+      tokens: filtered.reduce((n, r) => n + r.total_tokens, 0),
+      alerts: filtered.filter(
+        (r) =>
+          (r.budget && (r.budget.exhausted || r.budget.used_pct >= 0.8)) ||
+          (r.quota && r.quota.remaining <= 0),
+      ).length,
+    }),
+    [groups, filtered],
+  );
+
+  return (
+    <>
+      <div className="grid grid-cols-4 gap-3 max-[900px]:grid-cols-2">
+        <Metric label={t("usage.credProviders")} value={String(totals.providers)} />
+        <Metric label={t("usage.credKeys")} value={`${totals.credentials} · ${t("usage.credKeysDetail", { n: totals.active })}`} />
+        <Metric label={t("usage.credTokens")} value={formatTokens(totals.tokens)} />
+        <Metric label={t("usage.credAlerts")} value={String(totals.alerts)} danger={totals.alerts > 0} />
+      </div>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardDescription className="eyebrow">{t("usage.credEyebrow")}</CardDescription>
+          <CardTitle>{t("usage.credTitle")}</CardTitle>
+        </CardHeader>
+        <div className="flex flex-wrap items-center gap-2 px-5 pb-4">
+          <Input
+            aria-label={t("usage.credSearch")}
+            placeholder={t("usage.credSearch")}
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+            className="h-8 w-64 font-mono text-[11px]"
+          />
+          <div className="flex gap-0.5">
+            {(["tokens", "requests", "recent"] as const).map((key) => (
+              <button
+                key={key}
+                onClick={() => setSort(key)}
+                className={`cursor-pointer rounded-sm border px-2.5 py-1.5 font-mono text-[10px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
+                  sort === key
+                    ? "border-primary/30 bg-primary/5 text-primary"
+                    : "border-transparent text-muted-foreground hover:border-border hover:text-foreground"
+                }`}
+              >
+                {t(`usage.credSort${key === "tokens" ? "Tokens" : key === "requests" ? "Requests" : "Recent"}`)}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={() => setShowIdle((v) => !v)}
+            className={`ml-auto cursor-pointer rounded-sm border px-2.5 py-1.5 font-mono text-[10px] transition-colors outline-none focus-visible:ring-2 focus-visible:ring-ring/60 ${
+              showIdle ? "border-primary/30 bg-primary/5 text-primary" : "border-border text-muted-foreground"
+            }`}
+          >
+            {t("usage.credShowIdle")}
+          </button>
+        </div>
+        <p className="px-5 pb-4 font-mono text-[10px] leading-relaxed text-muted-foreground">
+          {t("usage.credNote")}
+        </p>
+      </Card>
+
+      {groups.length ? groups.map((group) => (
+        <Card key={group.provider}>
+          <CardHeader className="pb-3">
+            <div className="flex flex-wrap items-baseline justify-between gap-2">
+              <div className="min-w-0">
+                <CardDescription className="eyebrow">
+                  {group.enabled ? t("usage.credProviderActive") : t("usage.credProviderPaused")}
+                  {" · "}{t("usage.credCount", { n: group.rows.length })}
+                  {group.accounts ? ` · ${t("usage.credAccounts", { n: group.accounts })}` : ""}
+                </CardDescription>
+                <CardTitle className="truncate font-mono text-sm" title={group.provider}>{group.name}</CardTitle>
+                <span className="font-mono text-[9px] text-muted-foreground">{group.provider}</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 font-mono text-[10px] text-muted-foreground">
+                <span>{t("usage.requests")} <strong className="usage-number">{group.requests}</strong></span>
+                <span>{t("usage.failed")} {group.failed}</span>
+                <span>{t("usage.totalTokens")} <strong className="usage-number">{formatTokens(group.totalTokens)}</strong></span>
+                <span>{t("usage.cost")} <strong className="usage-number">${group.cost.toFixed(4)}</strong></span>
+              </div>
+            </div>
+            {group.budget ? (
+              <div className="grid gap-1.5 pt-3">
+                <div className="flex items-baseline justify-between font-mono text-[10px]">
+                  <span className="text-muted-foreground">{t("usage.credBudget")}</span>
+                  <strong className={group.budget.exhausted ? "text-destructive" : "usage-number"}>
+                    {formatTokens(group.budget.used)} / {formatTokens(group.budget.limit)}{" · "}
+                    {t("usage.credRemaining")} {formatTokens(group.budget.remaining)}
+                  </strong>
+                </div>
+                <div className="budget-track">
+                  <i
+                    className={group.budget.exhausted || group.budget.used_pct >= 0.8 ? "budget-fill budget-hot" : "budget-fill"}
+                    style={{ width: `${Math.min(100, group.budget.used_pct * 100)}%` }}
+                  />
+                </div>
+              </div>
+            ) : null}
+          </CardHeader>
+          <div className="overflow-auto">
+            <div className="min-w-[1080px]">
+              <div className={`${credCols} border-y border-border bg-muted/20 px-5 py-2.5`}>
+                <span className="eyebrow">{t("usage.credCol")}</span>
+                <span className="eyebrow">{t("usage.requests")}</span>
+                <span className="eyebrow">{t("usage.credSuccess")}</span>
+                <span className="eyebrow">{t("usage.totalTokens")}</span>
+                <span className="eyebrow">{t("usage.cost")}</span>
+                <span className="eyebrow">{t("usage.tokPerSec")}</span>
+                <span className="eyebrow">{t("usage.ttftP50")}</span>
+                <span className="eyebrow">{t("usage.credLastSeen")}</span>
+                <span className="eyebrow">{t("usage.credQuota")}</span>
+              </div>
+              {group.rows.map((row) => (
+                <div
+                  key={`${row.provider}/${row.credential}`}
+                  className={`${credCols} border-b border-border/70 px-5 py-2.5 last:border-b-0`}
+                >
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-1.5">
+                      <StatusDot active={row.enabled} />
+                      <strong className="truncate font-mono text-[11px]" title={row.credential}>{row.label || row.credential}</strong>
+                      <Badge variant={row.kind === "account" ? "primary" : "default"}>
+                        {row.kind === "account" ? t("usage.credAccount") : t("usage.credKey")}
+                      </Badge>
+                      {!row.seen ? <Badge>{t("usage.credIdle")}</Badge> : null}
+                    </div>
+                    <span className="block truncate font-mono text-[9px] text-muted-foreground" title={row.credential}>
+                      {row.credential}{" · "}{t("usage.credShare", { n: Math.round(row.share_of_provider * 100) })}
+                    </span>
+                  </div>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {row.requests}{row.failed ? <span className="text-destructive"> / −{row.failed}</span> : null}
+                  </span>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {row.requests ? `${(row.success_rate * 100).toFixed(0)}%` : "—"}
+                  </span>
+                  <div className="grid gap-1">
+                    <strong className="usage-number text-[12px]">{formatTokens(row.total_tokens)}</strong>
+                    <TokenMix row={row} />
+                    <span className="font-mono text-[9px] text-muted-foreground">
+                      {t("usage.cacheLabel")} {formatTokens(row.cache_read_tokens + row.cache_write_tokens)}
+                      {row.reasoning_tokens ? ` · ${t("usage.reasoning")} ${formatTokens(row.reasoning_tokens)}` : ""}
+                    </span>
+                  </div>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    ${row.cost_usd.toFixed(4)}{row.credits ? <span className="block text-[9px]">{row.credits.toFixed(1)} cr</span> : null}
+                  </span>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {row.tokens_per_sec > 0 ? row.tokens_per_sec.toFixed(1) : "—"}
+                    {row.output_tokens_per_sec > 0 ? <span className="block text-[9px]">out {row.output_tokens_per_sec.toFixed(1)}</span> : null}
+                  </span>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {row.ttft_p50_ms != null ? `${row.ttft_p50_ms} ms` : "—"}
+                    <span className="block text-[9px]">n={row.ttft_samples}</span>
+                  </span>
+                  <span className="font-mono text-[9px] text-muted-foreground">
+                    {row.last_seen ? formatTime(row.last_seen).slice(5, 16) : t("usage.credNever")}
+                  </span>
+                  <CredentialQuota row={row} />
+                </div>
+              ))}
+            </div>
+          </div>
+        </Card>
+      )) : (
+        <Card><EmptyState title={t("usage.credEmpty")} detail={t("usage.credEmptyDetail")} /></Card>
+      )}
+    </>
+  );
+}
+
+function TokenMix({ row }: { row: CredentialRow }) {
+  const total = row.total_tokens || 1;
+  const parts = [
+    { value: row.input_tokens, color: tokenColors.input },
+    { value: row.cache_read_tokens + row.cache_write_tokens, color: tokenColors.cache },
+    { value: row.output_tokens, color: tokenColors.output },
+  ];
+  return (
+    <div className="flex h-1 w-full overflow-hidden rounded-sm bg-muted">
+      {parts.map((part, index) => (
+        <span key={index} style={{ width: `${(part.value / total) * 100}%`, background: part.color }} />
+      ))}
+    </div>
+  );
+}
+
+function CredentialQuota({ row }: { row: CredentialRow }) {
+  const { t } = useT();
+  const quota = row.quota;
+  if (!quota) {
+    return <span className="font-mono text-[9px] text-muted-foreground/70">{t("usage.tokenBilled")}</span>;
+  }
+  const capacity = quota.capacity || quota.used + quota.remaining || 1;
+  const usedPct = Math.min(100, (quota.used / capacity) * 100);
+  return (
+    <div className="grid gap-1">
+      <span className={`truncate font-mono text-[10px] ${quota.remaining <= 0 ? "text-destructive" : "usage-number"}`} title={quota.display}>
+        {quota.display || `${quota.remaining} ${quota.unit}`}
+      </span>
+      <div className="budget-track">
+        <i className={quota.remaining <= 0 ? "budget-fill budget-hot" : "budget-fill"} style={{ width: `${usedPct}%` }} />
+      </div>
+      <span className="truncate font-mono text-[9px] text-muted-foreground">
+        {quota.window}{quota.resets_at ? ` · ${formatTime(quota.resets_at).slice(5, 16)}` : ""}
+      </span>
+    </div>
   );
 }
 
