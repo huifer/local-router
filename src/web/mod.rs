@@ -3132,138 +3132,162 @@ async fn api_usage(
 /// Every other provider bills by token (no window to run out of) and is
 /// listed as unlimited.
 async fn quota_summary(state: &AppState) -> Value {
-    let config = state.config.read().await;
-    let mut accounts: Vec<Value> = Vec::new();
-    for provider in &config.providers {
-        if !provider.uses_session() {
-            accounts.push(json!({
-                "provider": provider.id,
-                "name": provider.name,
-                "kind": "token",
-                "windows": [],
-                "unlimited": true,
-            }));
-            continue;
-        }
-        // The accounts the pool holds, by slot name: the vendor's quota is
-        // per account, so every one of them gets its own row.
-        let pool: Vec<(String, String)> = match provider.auth {
-            Some(crate::config::AuthKind::WorkBuddy) => crate::workbuddy::read_pool()
-                .map(|p| {
-                    p.accounts
-                        .into_iter()
-                        .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Some(crate::config::AuthKind::QwenWork) => crate::qwen::login::read_pool()
-                .map(|p| {
-                    p.accounts
-                        .into_iter()
-                        .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        if pool.is_empty() {
-            accounts.push(json!({
-                "provider": provider.id,
-                "name": provider.name,
-                "kind": "token",
-                "windows": [],
-                "unlimited": true,
-                "error": "no account signed in",
-            }));
-            continue;
-        }
-        for (name, holder) in pool {
-            match provider.auth {
-                Some(crate::config::AuthKind::WorkBuddy) => {
-                    match crate::workbuddy::quota_for(&name).await {
-                        Ok(q) => accounts.push(json!({
-                            "provider": provider.id,
-                            "account": name,
-                            "name": q.name,
-                            "kind": q.kind,
-                            "user": holder,
-                            "windows": q.windows.iter().map(|w| json!({
-                                "name": w.name,
-                                "used": w.used,
-                                "remaining": w.remaining,
-                                "resets_at": w.resets_at,
-                                "display": w.display,
-                                "unit": w.unit,
-                                "unlimited": w.unlimited(),
-                                "holds_why": w.holds_why,
-                            })).collect::<Vec<_>>(),
-                            "unlimited": false,
-                            "read_at": q.read_at,
-                        })),
-                        Err(err) => accounts.push(json!({
-                            "provider": provider.id,
-                            "account": name,
-                            "name": provider.name,
-                            "kind": "token",
-                            "user": holder,
-                            "windows": [],
-                            "unlimited": true,
-                            "error": err.to_string(),
-                        })),
-                    }
-                }
-                Some(crate::config::AuthKind::QwenWork) => {
-                    match crate::qwen::login::session_of(&name) {
-                        Ok(session) => {
-                            match crate::qwen::client::account_quota(&session).await {
-                                Ok(q) => accounts.push(json!({
-                                    "provider": provider.id,
-                                    "account": name,
-                                    "name": "QwenWork（千问办公）",
-                                    "kind": "subscription",
-                                    "user": holder,
-                                    "windows": [{
-                                        "name": "Credits",
-                                        "used": Value::Null,
-                                        "remaining": q.pools.iter().map(|p| p.balance).sum::<f64>(),
-                                        "resets_at": q.resets_at,
-                                        "display": q.display,
-                                        "unit": "credits",
-                                        "unlimited": false,
-                                        "holds_why": if q.empty { Some("balance is zero".to_string()) } else { None },
-                                    }],
-                                    "unlimited": false,
-                                    "read_at": chrono::Utc::now().to_rfc3339(),
-                                })),
-                                Err(err) => accounts.push(json!({
-                                    "provider": provider.id,
-                                    "account": name,
-                                    "name": provider.name,
-                                    "kind": "token",
-                                    "user": holder,
-                                    "windows": [],
-                                    "unlimited": true,
-                                    "error": err.to_string(),
-                                })),
-                            }
-                        }
-                        Err(err) => accounts.push(json!({
-                            "provider": provider.id,
-                            "account": name,
-                            "name": provider.name,
-                            "kind": "token",
-                            "user": holder,
-                            "windows": [],
-                            "unlimited": true,
-                            "error": err.to_string(),
-                        })),
-                    }
-                }
-                _ => {}
+    /// Which vendor endpoint a pool account's quota comes from.
+    #[derive(Clone, Copy)]
+    enum Vendor {
+        WorkBuddy,
+        QwenWork,
+    }
+
+    struct Slot {
+        row: usize,
+        provider: String,
+        provider_name: String,
+        account: String,
+        user: String,
+        vendor: Vendor,
+    }
+
+    // Collect first, fetch later: the fetches hit the vendors over the
+    // network, so they run concurrently and outside the config lock. Rows
+    // are emitted in provider order; each account's row is reserved here as
+    // a placeholder and patched once its fetch lands.
+    let mut rows: Vec<Value> = Vec::new();
+    let mut slots: Vec<Slot> = Vec::new();
+    {
+        let config = state.config.read().await;
+        for provider in &config.providers {
+            if !provider.uses_session() {
+                rows.push(json!({
+                    "provider": provider.id,
+                    "name": provider.name,
+                    "kind": "token",
+                    "windows": [],
+                    "unlimited": true,
+                }));
+                continue;
+            }
+            // The accounts the pool holds, by slot name: the vendor's quota is
+            // per account, so every one of them gets its own row.
+            let pool: Vec<(String, String)> = match provider.auth {
+                Some(crate::config::AuthKind::WorkBuddy) => crate::workbuddy::read_pool()
+                    .map(|p| {
+                        p.accounts
+                            .into_iter()
+                            .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                Some(crate::config::AuthKind::QwenWork) => crate::qwen::login::read_pool()
+                    .map(|p| {
+                        p.accounts
+                            .into_iter()
+                            .map(|(name, f)| (name, crate::mask::person(&f.account.nickname)))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                _ => Vec::new(),
+            };
+            if pool.is_empty() {
+                rows.push(json!({
+                    "provider": provider.id,
+                    "name": provider.name,
+                    "kind": "token",
+                    "windows": [],
+                    "unlimited": true,
+                    "error": "no account signed in",
+                }));
+                continue;
+            }
+            let vendor = match provider.auth {
+                Some(crate::config::AuthKind::WorkBuddy) => Some(Vendor::WorkBuddy),
+                Some(crate::config::AuthKind::QwenWork) => Some(Vendor::QwenWork),
+                _ => None,
+            };
+            let Some(vendor) = vendor else { continue };
+            for (name, holder) in pool {
+                rows.push(Value::Null);
+                slots.push(Slot {
+                    row: rows.len() - 1,
+                    provider: provider.id.clone(),
+                    provider_name: provider.name.clone(),
+                    account: name,
+                    user: holder,
+                    vendor,
+                });
             }
         }
     }
-    json!(accounts)
+    let fetches = slots.iter().map(|slot| async move {
+        let error_row = |err: String| {
+            json!({
+                "provider": slot.provider,
+                "account": slot.account,
+                "name": slot.provider_name,
+                "kind": "token",
+                "user": slot.user,
+                "windows": [],
+                "unlimited": true,
+                "error": err,
+            })
+        };
+        match slot.vendor {
+            Vendor::WorkBuddy => match crate::workbuddy::quota_for(&slot.account).await {
+                Ok(q) => json!({
+                    "provider": slot.provider,
+                    "account": slot.account,
+                    "name": q.name,
+                    "kind": q.kind,
+                    "user": slot.user,
+                    "windows": q.windows.iter().map(|w| json!({
+                        "name": w.name,
+                        "used": w.used,
+                        "remaining": w.remaining,
+                        "resets_at": w.resets_at,
+                        "display": w.display,
+                        "unit": w.unit,
+                        "unlimited": w.unlimited(),
+                        "holds_why": w.holds_why,
+                    })).collect::<Vec<_>>(),
+                    "unlimited": false,
+                    "read_at": q.read_at,
+                }),
+                Err(err) => error_row(err.to_string()),
+            },
+            Vendor::QwenWork => match crate::qwen::login::session_of(&slot.account) {
+                Ok(session) => match crate::qwen::client::account_quota(&session).await {
+                    Ok(q) => json!({
+                        "provider": slot.provider,
+                        "account": slot.account,
+                        "name": "QwenWork（千问办公）",
+                        "kind": "subscription",
+                        "user": slot.user,
+                        "windows": [{
+                            "name": "Credits",
+                            "used": Value::Null,
+                            "remaining": q.pools.iter().map(|p| p.balance).sum::<f64>(),
+                            "resets_at": q.resets_at,
+                            "display": q.display,
+                            "unit": "credits",
+                            "unlimited": false,
+                            "holds_why": if q.empty { Some("balance is zero".to_string()) } else { None },
+                        }],
+                        "unlimited": false,
+                        "read_at": chrono::Utc::now().to_rfc3339(),
+                    }),
+                    Err(err) => error_row(err.to_string()),
+                },
+                Err(err) => error_row(err.to_string()),
+            },
+        }
+    });
+    for (slot, value) in slots
+        .iter()
+        .zip(futures_util::future::join_all(fetches).await)
+    {
+        rows[slot.row] = value;
+    }
+    json!(rows)
 }
 
 /// Every credential the live config can spend through: each stored API key
