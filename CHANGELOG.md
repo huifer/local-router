@@ -8,6 +8,10 @@
 
 ### Added
 
+- **`scripts/probe_providers.py`**：批量探测上游可用性——对每个启用的
+  provider 发一个最小对话，把「可用 / 4xx 上游拒绝 / 5xx 与超时」分开列出；
+  支持 `--provider` 过滤、`--cascade` 探测 magpie 级联的每个上游前缀、
+  `--header` 附加请求头。读 `/api/config`（密钥已掩码），不打印密钥、不改配置。
 - **每个供应商 × 每把 API key / 每个账号的 token 消耗额度统计**：
   - 新增 `credentials[]`（`/api/usage`）与 `per_credential[]`
     （`/v1/local-router/usage`）：按 `(provider, key_id)` 分桶，复用同一套

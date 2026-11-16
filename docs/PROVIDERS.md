@@ -108,6 +108,22 @@ Cloud-IDE 登录态，存 `trae-session.json`），浏览器登录尚未接通�
 | `LOCAL_ROUTER_QWEN_SESSION` | QwenWork 会话文件路径 |
 | `LOCAL_ROUTER_QWEN_ENDPOINT` | 换用别的 QwenWork 端点（测试） |
 
+## 验证上游能不能用
+
+`local-router provider test <id>` 一次测一家。从 Magpie 这类聚合器整批导入
+几十个上游之后，用 `scripts/probe_providers.py` 一次看清哪些真能对话：
+
+```sh
+LOCAL_ROUTER_KEY=… python3 scripts/probe_providers.py               # 所有启用的 provider
+python3 scripts/probe_providers.py --provider zhipu --provider qwen  # 只看几家
+python3 scripts/probe_providers.py --cascade --timeout 90           # 顺带测 magpie 级联的每个上游前缀
+```
+
+脚本读 `/api/config`（密钥已掩码），对每家发一个 `max_tokens=16` 的最小请求，
+把结果分成「可用 / 4xx 上游拒绝 / 5xx 与超时」，不打印密钥、不改配置。
+4xx 多是凭证或额度（换 key、等额度窗口）；5xx 与超时多是网络（给该 provider
+配 `proxy`，或调大 `timeout_secs` / `connect_timeout_secs`）。
+
 ## 相关文档
 
 - 登录 / 多账号 / 签到的日常操作：[USAGE.md § 2.7](../USAGE.md#27-workbuddy登录与多账号)
